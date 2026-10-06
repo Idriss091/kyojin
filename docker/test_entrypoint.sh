@@ -86,8 +86,10 @@ mkdir -p "$T/home.c3"; run c3 KYOJIN_CACHE_DIR="$T/mycache" -- --rc 0
 check "KYOJIN_CACHE_DIR forces the folder" "[ \"\$(readlink $T/home.c3/.cache)\" = $T/mycache ] && [ -d $T/mycache ]"
 mkdir -p "$T/home.c4/.cache/old"; echo x >"$T/home.c4/.cache/old/f"; run c4 -- --rc 0
 check "a non-empty ~/.cache is kept and reported" "[ -d $T/home.c4/.cache/old ] && grep -q 'cannot use' $T/out.c4 && [ $(rc c4) = 0 ]"
+if [ "$(id -u)" != 0 ]; then
 mkdir -p "$T/home.c5"; chmod 555 "$T/models"; run c5 -- --rc 0; chmod 755 "$T/models"
 check "read-only models mount: the container's own ~/.cache is used" "[ ! -L $T/home.c5/.cache ] && grep -q 'kernel cache: $T/home.c5/.cache' $T/out.c5 && [ $(rc c5) = 0 ]"
+else echo "skip read-only models mount test (running as root)"; fi
 mkdir -p "$T/home.c6/.cache" "$T/fakebin"; printf '#!/bin/sh\nexit 0\n' >"$T/fakebin/mountpoint"; chmod +x "$T/fakebin/mountpoint"
 PATH="$T/fakebin:$PATH" run c6 -- --rc 0
 check "a volume mounted on ~/.cache wins" "[ ! -L $T/home.c6/.cache ] && grep -q 'kernel cache: $T/home.c6/.cache' $T/out.c6"
