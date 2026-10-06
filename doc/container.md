@@ -1,108 +1,144 @@
 # Running Kyojin in a container (docker / podman)
 
-One image serves one model. Every setting is an environment variable. The model folder is mounted, never baked in. The GPU is passed in as `/dev/kfd` and `/dev/dri`. Host requirements: a gfx1151 machine (Strix Halo, 128 GB) with the `amdgpu` kernel driver. No ROCm install is needed on the host.
+One image per model: `kyojin-qwen`, `kyojin-glm`, `kyojin-mimo`. The three share every heavy layer (14.4 GB each on disk, one copy of the layers); only the last layer differs, and it only sets which defaults the image starts with. The model is never baked in: mount it on `/models`, or mount an empty folder and the image downloads the pack from the hub. The GPU is passed in as `/dev/kfd` and `/dev/dri`. Host requirements: a gfx1151 machine (Strix Halo, 128 GB) and the `amdgpu` kernel driver. No ROCm install is needed on the host.
 
-## Build
+Status of each line below: "tested" means run on a Strix Halo machine with docker 29 on 06/10/2026 (Qwen pack, GLM pack, MiMo pack, local copies). "Untested" lines are marked.
+
+## What the image contains
+
+ROCm torch and `rocm-sdk-devel` from AMD's gfx1151 nightly index, the Kyojin tree with its extension built by `build.sh`, and the compilers the servers need at run time. It sets `EXL3_ROCM_SDK`, `EXL3_HSA_LIB` (the SDK's HSA runtime, there is no `/opt/rocm`) and `EXL3_HIPCC` (Qwen's gated-residual and QSA prefill kernels compile with it at first start). Nothing of this has to be set by you.
+
+## Build (tested)
 
 ```bash
-docker build -f docker/Dockerfile -t kyojin .       # or: podman build -f docker/Dockerfile -t kyojin .
+docker build -f docker/Dockerfile --build-arg MODEL=qwen -t kyojin-qwen .
+docker build -f docker/Dockerfile --build-arg MODEL=glm  -t kyojin-glm  .   # cached heavy layer: seconds
+docker build -f docker/Dockerfile --build-arg MODEL=mimo -t kyojin-mimo .
 ```
 
-The build follows the README Quickstart: ROCm torch and `rocm-sdk-devel` from AMD's gfx1151 index, `requirements.txt`, `rocm-sdk init`, `tools/strix_halo/env.sh`, `build.sh`. It needs no GPU. The SDK tree is dropped in the final stage. The torch wheel comes from AMD's nightly index, so two builds on different days can carry different torch versions.
+No GPU needed. First build: 22 minutes on a 32-thread machine at 18 MB/s download (about 14 GB of wheels); the other two tags take 17 s. The torch wheel is a nightly, so two builds on different days can carry different versions. `podman build -f docker/Dockerfile` is untested.
 
-## Run
+## Run with docker (tested)
 
 ```bash
-docker run --rm --name kyojin \
+docker run --rm --name kyojin-qwen \
+  --device /dev/kfd --device /dev/dri \
+  --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
+  --ipc=host --ulimit memlock=-1:-1 \
+  -v /path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro \
+  -v kyojin-cache:/root/.cache \
+  -p 8731:8731 \
+  kyojin-qwen
+```
+
+The image has no `video` or `render` group by name, so docker needs the numeric ids of the host. With no `-e` at all the server starts with 131072 tokens of context, the sampling of the model card and the port 8731. The port opens when the model is loaded and warmed up; then `curl http://localhost:8731/v1/models` and `python tools/bench.py --base http://localhost:8731/v1` work from the host.
+
+Measured (Qwen pack, 89 GB, 131072 context, docker 29, nothing else on the GPU):
+
+| Start | Time to ready |
+|---|---|
+| First start, empty cache volume | 370 s (kernels are compiled and cached) |
+| Second start, same cache volume | 93 s |
+| GLM pack, first start | 1213 s (dense GEMM tuning alone is 411 s) |
+| MiMo pack, first start | 130 s |
+
+A chat completion and a tool call (`tools` in the request, the answer carries `tool_calls`) worked on Qwen; GLM and MiMo were loaded and answered one completion. `docker stop` returns in 1 s (Qwen), 7 s (GLM), 2 s (MiMo); the exit code is 143 (SIGTERM) for Qwen and 0 for GLM and MiMo.
+
+### Keep the cache
+
+The cache holds compiled HIP/Triton kernels and, for GLM, the dense GEMM tuning table. It must outlive the container, or every start pays the full first-start time again, and GLM's 20 minutes may exceed a supervisor timeout. In order: a volume on `/root/.cache` (as above); else a hidden folder `.kyojin-cache` inside `/models` if it is mounted writable; `KYOJIN_CACHE_DIR=/some/folder` forces a folder. Warm the cache once by hand before you put the model behind a supervisor.
+
+### No pack yet
+
+Mount an empty writable folder on `/models`. The image downloads the pack of its model from the hub (95 to 106 GB) into it, checks the free space first, resumes after an interrupt and logs the size. `-e KYOJIN_DOWNLOAD=0` forbids it, `-e KYOJIN_HF_REPO=owner/name` picks another repository. Tested here with the packs already on disk; the download path itself is covered by the CPU tests with a fake hub and by a real download of a tiny public repository, not by a 95 GB pull.
+
+## Run as your own user, rootless podman (docker part tested, podman untested)
+
+Podman with `--userns=keep-id` (or docker with `--user`) runs the server as your host user, who cannot write the image's `/root`. The entrypoint then uses a container-local home and prints `HOME not writable`. Put the cache on a folder you own:
+
+```bash
+docker run --rm --name kyojin-qwen --user "$(id -u):$(id -g)" \
   --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
-  --security-opt seccomp=unconfined --ipc=host \
-  -v /path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro \
-  -e KYOJIN_MODEL=qwen -e CONTEXT=32768 -e PORT=8000 -p 8000:8000 \
-  kyojin
+  --ipc=host --ulimit memlock=-1:-1 \
+  -v /path/to/pack:/models:ro -v /path/to/cache:/cache -e KYOJIN_CACHE_DIR=/cache \
+  -p 8731:8731 kyojin-qwen
 ```
 
-Not tested (no podman on the build machine):
+Tested with docker and `--user 1000:1000`: ready in 392 s cold, 95 s warm from that cache. The podman line is the same idea and is untested (no podman on the test machine):
 
 ```bash
-podman run --rm --name kyojin \
-  --device /dev/kfd --device /dev/dri --group-add keep-groups \
-  --security-opt label=disable --ipc=host \
-  -v /path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro \
-  -e KYOJIN_MODEL=qwen -e CONTEXT=32768 -e PORT=8000 -p 8000:8000 \
-  kyojin
+podman run --rm --replace --name kyojin-qwen --http-proxy=false --userns=keep-id \
+  --device /dev/kfd --device /dev/dri --group-add keep-groups --ipc=host --ulimit memlock=-1 \
+  -v /path/to/pack:/models -v /path/to/cache:/cache -e KYOJIN_CACHE_DIR=/cache \
+  -p 8731:8731 localhost/kyojin-qwen
 ```
 
-Then `curl http://localhost:8000/health` and `python tools/bench.py --base http://localhost:8000/v1` from the host. The port stays closed while the model loads. First start of a new container: about 6 minutes for Qwen (measured 370 s), because the dense GEMM kernels are compiled and cached under `/root/.cache` and a fresh container has an empty cache. The same start on bare metal with a warm cache takes about 1 minute. Keep the cache between runs with a named volume, `-v kyojin-cache:/root/.cache` (not yet measured). GLM tunes its kernels for about 10 minutes on a first launch (see README); keep the container, or mount a volume on `/root/.cache`, between runs if you want that kept.
+`--http-proxy=false` stops podman from copying the host's `http_proxy` variables into the container, where they break calls to `127.0.0.1` (the health check and the hub download). With docker, do not pass proxy variables to the container.
 
-The image has no `video` or `render` group by name, so docker needs the numeric group ids of the host (`getent group video render`). In the llama-swap example below, replace `${VIDEO_GID}` and `${RENDER_GID}` by those numbers.
+## Behind llama-swap
 
-## Variables
+The container port must be the port llama-swap picked (`-p ${PORT}:${PORT}`), so give the server `-e PORT=${PORT}` (`--port ${PORT}` after the image name works too). Arguments after the image name are appended to the server command line and win over the defaults, as in `-c 262144` below. Shape taken from a user's working setup, with the image's own entrypoint instead of a wrapper script. The `docker` form was run by hand with these arguments (port 8099, `-c 262144`, `--model-id`, `--default-reasoning-effort medium`, `--user`); llama-swap itself and podman were not run:
+
+```yaml
+  "Kyojin-Qwen3.8-Flash-Next":
+    useModelName: "Kyojin-Qwen3.8-Flash-Next"
+    cmd: |
+      podman run
+      --rm --replace --name kyojin-qwen
+      --http-proxy=false --userns=keep-id
+      --device /dev/kfd --device /dev/dri --group-add keep-groups
+      --ipc=host --ulimit memlock=-1
+      -p 0.0.0.0:${PORT}:${PORT}
+      -e PORT=${PORT}
+      -v /path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models
+      -v /path/to/kyojin-cache:/cache -e KYOJIN_CACHE_DIR=/cache
+      localhost/kyojin-qwen
+      -c 262144
+      --default-reasoning-effort medium
+      --model-id Kyojin-Qwen3.8-Flash-Next
+    checkEndpoint: /v1/models
+    cmdStop: podman stop -t 30 kyojin-qwen
+    unloadTimeout: 120
+    healthCheckTimeout: 900
+    filters:
+      setParamsByID:
+        "${MODEL_ID}-Instruct":
+          chat_template_kwargs:
+            enable_thinking: false
+```
+
+- `healthCheckTimeout`: llama-swap waits this long for `checkEndpoint`. Qwen needs 370 s the first time and 95 s afterwards, GLM about 1200 s the first time. Set 900 for Qwen and MiMo, 1800 for GLM, and warm the cache by hand once so that later starts are short.
+- `checkEndpoint: /v1/models` answers once the model is loaded.
+- `cmdStop`: SIGTERM stops the server in 1 to 7 s here; `-t 30` leaves room for a slower free of the GPU.
+- Context: `-c 262144` ran on the Qwen pack. GLM at 262144 is not tested. MiMo's memory is tight at 262144 on 128 GB and is not tested; its tested value is the default 131072.
+- GLM and MiMo entries differ in the image name, the model id and `-c`.
+
+## Variables (all optional; the tested runs above used the defaults)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `KYOJIN_MODEL` | `auto` | `qwen`, `glm`, `mimo`, or `auto` (read from `config.json` of the pack) |
-| `MODEL_DIR` | `/models` | The pack folder, or a folder holding exactly one pack |
+| `KYOJIN_MODEL` | set by the image | `qwen`, `glm`, `mimo` |
+| `MODEL_DIR` | `/models` | The pack folder, or a folder holding one pack of the family |
+| `PORT` | `8731` | Listen port (also used by the health check) |
 | `HOST` | `0.0.0.0` | Listen address inside the container |
-| `PORT` | `8000` | Listen port (also used by the health check) |
-| `CONTEXT` | server default | KV cache size in tokens (`-c`) |
-| `KYOJIN_MODEL_ID` | server default | Id shown by `/v1/models` and expected in requests |
-| `KYOJIN_DEFAULT_TEMPERATURE`, `_TOP_P`, `_TOP_K`, `_MIN_P` | server default | Sampling used when a request omits it (`TOP_K` and `MIN_P`: Qwen only) |
+| `CONTEXT` | `131072` | KV cache size in tokens (`-c`) |
+| `KYOJIN_MODEL_ID` | server default | Id shown by `/v1/models` (or `--model-id`) |
+| `KYOJIN_DEFAULT_TEMPERATURE`, `_TOP_P`, `_TOP_K`, `_MIN_P` | model card | Sampling when a request omits it (`TOP_K`, `MIN_P`: Qwen only) |
 | `KYOJIN_REASONING_EFFORT` | server default | `low`, `medium`, `xhigh` (Qwen, GLM) |
-| `KYOJIN_DRAFT_TOKENS` | server default | Draft tokens per round (`--ndt`, or `--num-draft` on GLM) |
-| `KYOJIN_DRAFT_POLICY` | server default | `mix`, `mtp`, `off` (Qwen) |
-| `KYOJIN_NO_VISION`, `KYOJIN_NO_THINKING` | off | Set `1` to enable (Qwen) |
-| `KYOJIN_NO_UNCENSOR` | off | Set `1` to enable (Qwen, GLM) |
-| `KYOJIN_SLOT_SAVE_PATH` | `~/cache/llama-slots` | Prompt-slot save folder; mount a volume to keep it |
-| `KYOJIN_EXTRA_ARGS` | empty | Extra `serve.py` arguments, shell-quoted: `--default-max-tokens 512` |
-| `EXL3_*` | unset | Any engine variable is passed through unchanged |
+| `KYOJIN_DRAFT_TOKENS`, `KYOJIN_DRAFT_POLICY` | server default | Speculative decoding settings |
+| `KYOJIN_ENABLE_VISION`, `_THINKING`, `_UNCENSOR` | on | `0` switches the feature off (Qwen; uncensor also GLM) |
+| `KYOJIN_CACHE_DIR` | see "Keep the cache" | Folder for the kernel cache |
+| `KYOJIN_DOWNLOAD`, `KYOJIN_HF_REPO` | on, the model's repo | Pack download control |
+| `KYOJIN_EXTRA_ARGS` | empty | Extra server arguments, shell-quoted |
+| `EXL3_*` | unset | Engine variables pass through unchanged |
 
-Arguments after the image name are appended too: `docker run ... kyojin --default-max-tokens 512`. An option the chosen server does not have is an error at start, not silently ignored. `docker run ... kyojin shell` opens a shell and `... kyojin check` runs `tools/strix_halo/env.sh --check`. To see the command a configuration produces without a GPU: `docker run --rm -e KYOJIN_MODEL=glm -v ...:/models:ro --entrypoint python kyojin docker/kyojin_args.py`.
+`docker run ... IMAGE shell` opens a shell and `... IMAGE check` runs `tools/strix_halo/env.sh --check`. An option the chosen server does not have is an error at start. A wrong-family pack on `/models` is a clear error that exits 2.
 
-## Compose, behind llama-swap
+## Tests that need no GPU
 
-Not tested: the compose file and the llama-swap entry below were written from the tested `docker run` line above.
-
-```yaml
-services:
-  kyojin-qwen:
-    image: kyojin
-    devices: ["/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"]
-    group_add: ["${VIDEO_GID}", "${RENDER_GID}"]   # numeric ids from: getent group video render
-    security_opt: ["seccomp=unconfined"]
-    ipc: host
-    volumes: ["/path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro"]
-    environment:
-      KYOJIN_MODEL: qwen
-      CONTEXT: "65536"
-      KYOJIN_MODEL_ID: qwen38
-    ports: ["8101:8000"]
-    stop_grace_period: 30s
-    restart: "no"
-```
-
-llama-swap config entry (it starts and stops the container itself; `cmd` runs in the foreground, `cmdStop` is optional because llama-swap sends SIGTERM to the `docker run` process, which forwards it):
-
-```yaml
-models:
-  qwen38:
-    cmd: >
-      docker run --rm --name kyojin-qwen --device /dev/kfd --device /dev/dri --group-add ${VIDEO_GID} --group-add ${RENDER_GID}
-      --security-opt seccomp=unconfined --ipc=host -v /path/to/pack:/models:ro
-      -e KYOJIN_MODEL=qwen -e CONTEXT=65536 -p 8101:8000 kyojin
-    cmdStop: docker stop kyojin-qwen
-    proxy: http://127.0.0.1:8101
-    checkEndpoint: /health
-    ttl: 600
-```
-
-`/health` answers 200 once the port is open, which is after the model is loaded and warmed up. Docker's own `HEALTHCHECK` uses the same endpoint, with a 15-minute start period.
-
-## Stopping
-
-The entrypoint runs the server as a child and forwards SIGTERM to it. Measured on the Qwen pack: `docker stop` returns in about a second, exit code 143, the same as SIGTERM on a bare-metal server. A GPU-memory-heavy server can take some seconds to free the device; keep `stop_grace_period` at 30 s or more.
+`docker/test_kyojin_args.py` (60 tests, `python -m pytest docker/test_kyojin_args.py`, needs pytest on the host) and `docker/test_entrypoint.sh` (every branch of the entrypoint with a stub server; also runs inside the image: `docker run --rm --entrypoint bash IMAGE docker/test_entrypoint.sh`, the two permission tests skip as root). Both passed.
 
 ## Notes
 
-- One container, one model, one GPU. Two containers on the same GPU will not both fit in 128 GB.
-- The image holds no model and no secrets. `hf download` the pack on the host first.
-- `--ipc=host` and `seccomp=unconfined` are the usual ROCm container flags; test without them on your host if you prefer a tighter setup.
+- One container, one model, one GPU: two models do not fit in 128 GB together.
+- `--ipc=host` and `--ulimit memlock` are the flags of the tested runs. No `seccomp=unconfined` and no `label=disable` were needed with docker. SELinux hosts (Fedora, with podman) may need `--security-opt label=disable`: untested.
