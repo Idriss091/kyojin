@@ -14,7 +14,7 @@ The build follows the README Quickstart: ROCm torch and `rocm-sdk-devel` from AM
 
 ```bash
 docker run --rm --name kyojin \
-  --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+  --device /dev/kfd --device /dev/dri --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
   --security-opt seccomp=unconfined --ipc=host \
   -v /path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro \
   -e KYOJIN_MODEL=qwen -e CONTEXT=32768 -e PORT=8000 -p 8000:8000 \
@@ -31,6 +31,8 @@ podman run --rm --name kyojin \
 ```
 
 Then `curl http://localhost:8000/health` and `python tools/bench.py --base http://localhost:8000/v1` from the host. The port stays closed while the model loads (about a minute for Qwen). GLM tunes its kernels for about 10 minutes on a first launch (see README); keep the container, or mount a volume on `/root/.cache`, between runs if you want that kept.
+
+The image has no `video` or `render` group by name, so docker needs the numeric group ids of the host (`getent group video render`). In the llama-swap example below, replace `${VIDEO_GID}` and `${RENDER_GID}` by those numbers.
 
 ## Variables
 
@@ -61,7 +63,7 @@ services:
   kyojin-qwen:
     image: kyojin
     devices: ["/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"]
-    group_add: ["video", "render"]
+    group_add: ["${VIDEO_GID}", "${RENDER_GID}"]   # numeric ids from: getent group video render
     security_opt: ["seccomp=unconfined"]
     ipc: host
     volumes: ["/path/to/Qwen3.8-Flash-Next-EXL3-Yamz:/models:ro"]
@@ -80,7 +82,7 @@ llama-swap config entry (it starts and stops the container itself; `cmd` runs in
 models:
   qwen38:
     cmd: >
-      docker run --rm --name kyojin-qwen --device /dev/kfd --device /dev/dri --group-add video --group-add render
+      docker run --rm --name kyojin-qwen --device /dev/kfd --device /dev/dri --group-add ${VIDEO_GID} --group-add ${RENDER_GID}
       --security-opt seccomp=unconfined --ipc=host -v /path/to/pack:/models:ro
       -e KYOJIN_MODEL=qwen -e CONTEXT=65536 -p 8101:8000 kyojin
     cmdStop: docker stop kyojin-qwen

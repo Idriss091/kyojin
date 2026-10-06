@@ -14,7 +14,8 @@ RUN python3 -m venv .venv
 ENV PATH=/opt/kyojin/.venv/bin:$PATH
 COPY requirements.txt .
 COPY . .
-# One layer on purpose: the 12 GB SDK tree (needed only to compile) never reaches an image layer.
+# One layer on purpose: the pip downloads and the unpruned SDK tree never reach an image layer.
+# The SDK (hipcc, headers) stays in the image: the servers compile a few HIP kernels on first start.
 RUN pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ \
     && pip install -r requirements.txt \
     && rocm-sdk init \
@@ -22,16 +23,17 @@ RUN pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.am
     && source tools/strix_halo/env.sh \
     && ./build.sh \
     && python -c "import torch, exllamav3_ext" \
-    && rm -rf "$EXL3_ROCM_SDK" build .rebuild.* .sdk-deps /root/.cache
+    && rm -rf build .rebuild.* .sdk-deps /root/.cache \
+    && cd "$EXL3_ROCM_SDK" && rm -rf clients share/rocprofiler-sdk share/hipblaslt share/rocdecode share/rocsparse bin/*gtest* bin/*-test bin/*-bench bin/*-gemm-tune bin/*test*
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y --no-install-recommends python3 libnuma1 libatomic1 libgomp1 libdrm2 libelf1 curl ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 g++ libc6-dev python3-dev libnuma1 libatomic1 libgomp1 libdrm2 libelf1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/kyojin /opt/kyojin
 WORKDIR /opt/kyojin
 ENV PATH=/opt/kyojin/.venv/bin:$PATH \
-    EXL3_HSA_LIB=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1
+    EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel
 ENV MODEL_DIR=/models PORT=8000 HOME=/root
 EXPOSE 8000
 VOLUME ["/models"]
