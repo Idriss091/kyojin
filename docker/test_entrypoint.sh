@@ -92,4 +92,12 @@ mkdir -p "$T/home.c6/.cache" "$T/fakebin"; printf '#!/bin/sh\nexit 0\n' >"$T/fak
 PATH="$T/fakebin:$PATH" run c6 -- --rc 0
 check "a volume mounted on ~/.cache wins" "[ ! -L $T/home.c6/.cache ] && grep -q 'kernel cache: $T/home.c6/.cache' $T/out.c6"
 
+# 7 unwritable HOME (podman --userns=keep-id): needs a non-root uid, root ignores permissions
+if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$T/home.ro"; chmod 555 "$T/home.ro"; run ro -- --rc 0; chmod 755 "$T/home.ro"
+    check "unwritable HOME: a container-local home is used and the server still starts" "[ $(rc ro) = 0 ] && grep -q 'HOME not writable' $T/out.ro && grep -q 'STUB args' $T/out.ro"
+else
+    echo "skip unwritable HOME test (running as root)"
+fi
+
 [ "$FAIL" = 0 ] && echo "ALL ENTRYPOINT TESTS PASSED" || { echo "SOME ENTRYPOINT TESTS FAILED"; exit 1; }

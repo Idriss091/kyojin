@@ -5,6 +5,12 @@
 set -u
 ROOT=${KYOJIN_ROOT:-/opt/kyojin}
 cd "$ROOT"
+# `podman run --userns=keep-id` (or `--user`) runs as the host user, who cannot write the image's HOME=/root: fall back
+# to a container-local home so that Triton, torch and the tuning tables still have a place to write.
+if ! { mkdir -p "${HOME:-/root}/.cache" 2>/dev/null && [ -w "${HOME:-/root}" ]; }; then
+    HOME=$(mktemp -d "${TMPDIR:-/tmp}/kyojin-home.XXXXXX") && export HOME
+    echo "[kyojin] HOME not writable for uid $(id -u): using $HOME" >&2
+fi
 source tools/strix_halo/env.sh >/dev/null
 
 case "${1:-}" in

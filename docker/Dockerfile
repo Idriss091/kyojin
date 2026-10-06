@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
 # g++, libc6-dev, python3-dev stay: the servers compile a few HIP kernels (hipcc) and Triton kernels at start.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-dev gcc g++ libc6-dev make git ca-certificates \
-        libnuma1 libatomic1 libgomp1 libdrm2 libelf1 curl \
+        libnuma1 libatomic1 libgomp1 libdrm2 libdrm-amdgpu1 libelf1 curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/kyojin
 RUN python3 -m venv .venv
@@ -30,7 +30,9 @@ RUN pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.am
     && python -c "import torch, exllamav3_ext" \
     && rm -rf build .rebuild.* .sdk-deps /root/.cache \
     && cd "$EXL3_ROCM_SDK" && rm -rf clients share/rocprofiler-sdk share/hipblaslt share/rocdecode share/rocsparse bin/*gtest* bin/*-test bin/*-bench bin/*-gemm-tune bin/*test*
-ENV EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel \
+    EXL3_HIPCC=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc \
+    EXL3_HSA_LIB=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1
 # Last on purpose: the only layer that differs between the qwen, glm and mimo images. Defaults per model live in
 # docker/kyojin_args.py (context, sampling, hub repository); MODEL only picks which set the image starts with.
 ARG MODEL=qwen
