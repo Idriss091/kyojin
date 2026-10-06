@@ -21,6 +21,8 @@ docker run --rm --name kyojin \
   kyojin
 ```
 
+Not tested (no podman on the build machine):
+
 ```bash
 podman run --rm --name kyojin \
   --device /dev/kfd --device /dev/dri --group-add keep-groups \
@@ -30,7 +32,7 @@ podman run --rm --name kyojin \
   kyojin
 ```
 
-Then `curl http://localhost:8000/health` and `python tools/bench.py --base http://localhost:8000/v1` from the host. The port stays closed while the model loads (about a minute for Qwen). GLM tunes its kernels for about 10 minutes on a first launch (see README); keep the container, or mount a volume on `/root/.cache`, between runs if you want that kept.
+Then `curl http://localhost:8000/health` and `python tools/bench.py --base http://localhost:8000/v1` from the host. The port stays closed while the model loads. First start of a new container: about 6 minutes for Qwen (measured 370 s), because the dense GEMM kernels are compiled and cached under `/root/.cache` and a fresh container has an empty cache. The same start on bare metal with a warm cache takes about 1 minute. Keep the cache between runs with a named volume, `-v kyojin-cache:/root/.cache` (not yet measured). GLM tunes its kernels for about 10 minutes on a first launch (see README); keep the container, or mount a volume on `/root/.cache`, between runs if you want that kept.
 
 The image has no `video` or `render` group by name, so docker needs the numeric group ids of the host (`getent group video render`). In the llama-swap example below, replace `${VIDEO_GID}` and `${RENDER_GID}` by those numbers.
 
@@ -57,6 +59,8 @@ The image has no `video` or `render` group by name, so docker needs the numeric 
 Arguments after the image name are appended too: `docker run ... kyojin --default-max-tokens 512`. An option the chosen server does not have is an error at start, not silently ignored. `docker run ... kyojin shell` opens a shell and `... kyojin check` runs `tools/strix_halo/env.sh --check`. To see the command a configuration produces without a GPU: `docker run --rm -e KYOJIN_MODEL=glm -v ...:/models:ro --entrypoint python kyojin docker/kyojin_args.py`.
 
 ## Compose, behind llama-swap
+
+Not tested: the compose file and the llama-swap entry below were written from the tested `docker run` line above.
 
 ```yaml
 services:
@@ -95,7 +99,7 @@ models:
 
 ## Stopping
 
-The entrypoint runs the server as a child and turns SIGTERM into SIGINT, which the servers handle. `docker stop` ends the container as soon as the server exits. A GPU-memory-heavy server can take some seconds to free the device; keep `stop_grace_period` at 30 s or more.
+The entrypoint runs the server as a child and forwards SIGTERM to it. Measured on the Qwen pack: `docker stop` returns in about a second, exit code 143, the same as SIGTERM on a bare-metal server. A GPU-memory-heavy server can take some seconds to free the device; keep `stop_grace_period` at 30 s or more.
 
 ## Notes
 
