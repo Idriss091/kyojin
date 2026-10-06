@@ -1,5 +1,7 @@
 # Kyojin server image for AMD Strix Halo (gfx1151). Works with docker and podman.
-#   docker build -f docker/Dockerfile -t kyojin .
+#   docker build -f docker/Dockerfile -t kyojin-qwen .                       # default model: qwen
+#   docker build -f docker/Dockerfile --build-arg MODEL=glm  -t kyojin-glm .  # same layers, other baked defaults
+#   docker build -f docker/Dockerfile --build-arg MODEL=mimo -t kyojin-mimo .
 # Follows the README Quickstart: ROCm torch + rocm-sdk-devel from AMD's gfx1151 index, requirements.txt,
 # `rocm-sdk init`, tools/strix_halo/env.sh, build.sh. The models are NOT in the image: mount them.
 
@@ -29,10 +31,13 @@ RUN pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.am
     && rm -rf build .rebuild.* .sdk-deps /root/.cache \
     && cd "$EXL3_ROCM_SDK" && rm -rf clients share/rocprofiler-sdk share/hipblaslt share/rocdecode share/rocsparse bin/*gtest* bin/*-test bin/*-bench bin/*-gemm-tune bin/*test*
 ENV EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel
-ENV MODEL_DIR=/models PORT=8000 HOME=/root
-EXPOSE 8000
+# Last on purpose: the only layer that differs between the qwen, glm and mimo images. Defaults per model live in
+# docker/kyojin_args.py (context, sampling, hub repository); MODEL only picks which set the image starts with.
+ARG MODEL=qwen
+ENV KYOJIN_MODEL=$MODEL MODEL_DIR=/models PORT=8731 HOME=/root
+EXPOSE 8731
 VOLUME ["/models"]
 HEALTHCHECK --start-period=900s --interval=30s --timeout=5s --retries=3 \
-    CMD curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
+    CMD curl -sf "http://127.0.0.1:${KYOJIN_PORT:-$PORT}/health" >/dev/null || exit 1
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/opt/kyojin/docker/entrypoint.sh"]

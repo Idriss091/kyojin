@@ -4,3 +4,4 @@ build
 *.safetensors
 *.st
 __pycache__
+doc/container.md
