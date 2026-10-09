@@ -101,6 +101,7 @@ class VisionTower:
         self.sinks = bool(cfg.get("use_sink", False))
         self.eps = 1e-6
         self.min_pixels = 8192
+        self.attn_impl = os.environ.get("MIMO_TOWER_ATTN", "band")   # band | chunked (old reference path)
         w = {}
         with safe_open(path, framework="pt", device="cpu") as f:
             for k in f.keys():
@@ -133,6 +134,40 @@ class VisionTower:
         xf = x.float()
         return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)).to(x.dtype) * w
 
+    @staticmethod
+    def _scores(q, k):
+        """q [H,R,D] @ k [H,D,K] -> fp32 scores. bf16 inputs with an fp32 result: the products are exact and the sums fp32,
+        the same numbers as casting both to fp32 first, on the matrix units instead of the slow fp32 path."""
+        try:
+            return torch.bmm(q, k, out_dtype=torch.float32)
+        except (RuntimeError, TypeError, NotImplementedError):
+            return torch.matmul(q.float(), k.float())
+
+    def _attn_core(self, q, k, v, sink, win, S, device):
+        """q, k, v [H,S,D] -> [H,S,D]. Softmax over fp32 scores. Query rows in chunks. A window block reads only the keys
+        within `win` of each chunk (the rest is -inf in the reference, exp = 0): same result, a fraction of the work.
+        MIMO_TOWER_ATTN=chunked runs the old full-width reference path for comparison."""
+        scale = self.head_dim ** -0.5
+        out = torch.empty_like(q)
+        kt = k.transpose(1, 2)
+        banded = bool(win) and self.attn_impl != "chunked"
+        blk = 256 if banded else max(64, int(2**27 // max(S, 1) // self.heads))   # rows per chunk (bounded scores buffer)
+        for a in range(0, S, blk):
+            b = min(S, a + blk)
+            lo, hi = (max(0, a - win), min(S, b + win)) if banded else (0, S)
+            if self.attn_impl == "chunked":
+                sc = torch.matmul(q[:, a:b].float(), kt[:, :, lo:hi].float()) * scale   # reference: plain fp32 matmul
+            else:
+                sc = self._scores(q[:, a:b], kt[:, :, lo:hi]) * scale                   # H R K
+            if win:
+                rows = torch.arange(a, b, device=device).unsqueeze(1)
+                cols = torch.arange(lo, hi, device=device).unsqueeze(0)
+                sc = sc.masked_fill(((rows - cols).abs() > win).unsqueeze(0), float("-inf"))
+            if sink is not None and lo == 0:
+                sc[:, :, 0] += sink.float().view(-1, 1)                                # bias on key 0 (-inf stays -inf)
+            out[:, a:b] = torch.matmul(torch.softmax(sc, dim=-1).to(v.dtype), v[:, lo:hi])
+        return out
+
     def _attn(self, x, i, cos, sin, full_attn):
         W, S = self.w, x.shape[0]
         p = f"visual.blocks.{i}.attn."
@@ -150,19 +185,7 @@ class VisionTower:
         q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)           # H S D
         sink = W.get(p + "sinks") if (self.sinks and not full_attn) else None
         win = self.window if (not full_attn and self.window > 0) else 0
-        scale = self.head_dim ** -0.5
-        out = torch.empty_like(q)
-        cols = torch.arange(S, device=x.device)
-        blk = max(64, int(2**27 // max(S, 1) // self.heads))            # query rows per chunk (bounded scores buffer)
-        for a in range(0, S, blk):
-            b = min(S, a + blk)
-            sc = torch.matmul(q[:, a:b].float(), k.float().transpose(1, 2)) * scale        # H R S
-            if win:
-                rows = torch.arange(a, b, device=x.device).unsqueeze(1)
-                sc = sc.masked_fill(((rows - cols).abs() > win).unsqueeze(0), float("-inf"))
-            if sink is not None:
-                sc[:, :, 0] += sink.float().view(-1, 1)
-            out[:, a:b] = torch.matmul(torch.softmax(sc, dim=-1).to(v.dtype), v)
+        out = self._attn_core(q, k, v, sink, win, S, x.device)
         o = out.transpose(0, 1).reshape(S, -1)
         return F.linear(o, W[p + "proj.weight"], W[p + "proj.bias"])
 
