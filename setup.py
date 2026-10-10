@@ -67,6 +67,14 @@ if torch and torch_version.hip:
         extra_cflags += ["-I" + dev_include]
         extra_cuda_cflags += ["-I" + dev_include]
 
+if torch and torch_version.hip:
+    # HIP's host_defines.h empties __host__/__device__/__noinline__ for host
+    # compilation, which breaks libstdc++16's <format> ([[__gnu__::__noinline__]]
+    # parses as an empty attribute name). Force <format> to parse first, before
+    # any HIP header can poison the macro state (pragma once protects later
+    # includes). Host-only: device TUs don't hit this path.
+    extra_cflags += ["-include", "format"]
+
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
@@ -105,9 +113,12 @@ _get_sources = _load_get_sources()
 
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from exllamav3.util.arch_list import maybe_set_arch_list_env
-    maybe_set_arch_list_env()
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from exllamav3.util.arch_list import maybe_set_arch_list_env
+        maybe_set_arch_list_env()
+    except (ImportError, RuntimeError):
+        pass
 if _get_sources is not None:
     sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 else:
