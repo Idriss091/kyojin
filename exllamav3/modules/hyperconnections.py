@@ -472,13 +472,10 @@ _gr_hip_mod = []
 
 
 def _gr_hip():
-    # hand-written HIP WMMA gated-residual GEMMs (gr/gr_mix_hip.py), opt-in with EXL3_GR_HIP=1; None on failure
+    # hand-written HIP WMMA gated-residual GEMMs (modules/gr_fn/gr_mix_hip.py), opt-in with EXL3_GR_HIP=1; None on failure
     if not _gr_hip_mod:
         try:
-            import sys
-            d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "gr")
-            if d not in sys.path: sys.path.insert(0, d)
-            import gr_mix_hip
+            from exllamav3.modules.gr_fn import gr_mix_hip
             _gr_hip_mod.append(gr_mix_hip)
         except Exception as e:
             print(f" ! EXL3_GR_HIP unavailable: {e}")

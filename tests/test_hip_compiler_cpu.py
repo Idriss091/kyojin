@@ -7,7 +7,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 _PKGS = ["exllamav3", "exllamav3.util", "exllamav3.vendor", "exllamav3.vendor.fla", "exllamav3.vendor.fla.hip",
-         "exllamav3.modules", "exllamav3.modules.ple_fn", "gr"]
+         "exllamav3.modules", "exllamav3.modules.ple_fn", "exllamav3.modules.gr_fn"]
 _added = []
 for _n in _PKGS:
     if _n not in sys.modules:
@@ -16,7 +16,7 @@ for _n in _PKGS:
 try:
     hip_compiler = importlib.import_module("exllamav3.util.hip_compiler")
     LOADERS = {n: importlib.import_module(n) for n in (
-        "gr.gr_mix_hip", "exllamav3.vendor.fla.hip.gdn_fused_h_hip", "exllamav3.vendor.fla.hip.kda_fused_h_hip",
+        "exllamav3.modules.gr_fn.gr_mix_hip", "exllamav3.vendor.fla.hip.gdn_fused_h_hip", "exllamav3.vendor.fla.hip.kda_fused_h_hip",
         "exllamav3.modules.ple_fn.ple_hip")}
 finally:
     for _n in _added:
@@ -124,7 +124,7 @@ def test_warning_text(env, monkeypatch):
 
 
 @pytest.mark.parametrize("modname,call", [
-    ("gr.gr_mix_hip", lambda m: m.compile_hsaco()),
+    ("exllamav3.modules.gr_fn.gr_mix_hip", lambda m: m.compile_hsaco()),
     ("exllamav3.vendor.fla.hip.gdn_fused_h_hip", lambda m: m._compile("", "gfx1151")),
     ("exllamav3.vendor.fla.hip.kda_fused_h_hip", lambda m: m._compile("", "gfx1151")),
     ("exllamav3.modules.ple_fn.ple_hip", lambda m: m.compile_hsaco()),
@@ -148,7 +148,7 @@ def test_cache_key_includes_compiler(env, monkeypatch, modname, call):
 
 def test_old_cache_name_not_reused(env, monkeypatch):
     import hashlib
-    m = LOADERS["gr.gr_mix_hip"]
+    m = LOADERS["exllamav3.modules.gr_fn.gr_mix_hip"]
     log = env / "calls.log"
     a = fake_hipcc(env / "a" / "hipcc", "clang version 22", log)
     monkeypatch.setenv("EXL3_HIPCC", str(a))
@@ -186,12 +186,12 @@ def test_compiler_health_fields(env, monkeypatch):
 
 
 def test_every_jit_site_uses_the_resolver():
-    sites = ["gr/gr_mix_hip.py", "exllamav3/vendor/fla/hip/gdn_fused_h_hip.py", "exllamav3/vendor/fla/hip/kda_fused_h_hip.py",
+    sites = ["exllamav3/modules/gr_fn/gr_mix_hip.py", "exllamav3/vendor/fla/hip/gdn_fused_h_hip.py", "exllamav3/vendor/fla/hip/kda_fused_h_hip.py",
              "exllamav3/modules/ple_fn/ple_hip.py", "exllamav3/modules/attention_fn/qsa_prefill_hip.py"]
     for f in sites:
         s = (ROOT / f).read_text()
         assert "hip_compiler.hipcc()" in s and "hip_compiler.key()" in s and "EXL3_ROCM_SDK" not in s, f
     import subprocess
-    out = subprocess.run(["grep", "-rl", "--include=*.py", "-e", "--genco", str(ROOT / "exllamav3"), str(ROOT / "gr")],
+    out = subprocess.run(["grep", "-rl", "--include=*.py", "-e", "--genco", str(ROOT / "exllamav3")],
                          capture_output=True, text=True).stdout.split()
     assert sorted(Path(o).relative_to(ROOT).as_posix() for o in out) == sorted(sites)
