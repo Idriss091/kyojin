@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 
 from setuptools import setup
@@ -67,7 +69,33 @@ if torch and torch_version.hip:
         extra_cflags += ["-I" + dev_include]
         extra_cuda_cflags += ["-I" + dev_include]
 
-if torch and torch_version.hip:
+def _host_cxx_has_format():
+    # Probe whether the host C++ compiler ships a <format> header (GCC 13+).
+    # Older toolchains have no such header, where -include would itself be a
+    # fatal error, so the pre-include below only opts in when it exists.
+    # Harmless on toolchains whose <format> predates the __noinline__
+    # attribute use; required on libstdc++16+. Same compiler selection as
+    # torch's cpp_extension (CXX or the default); on any detection failure
+    # keep today's behavior (no flag).
+    cxx = os.environ.get("CXX", "c++")
+    if shutil.which(cxx) is None:
+        cxx = "g++"
+        if shutil.which(cxx) is None:
+            return False
+    try:
+        probe = subprocess.run(
+            [cxx, "-xc++", "-E", "-fsyntax-only", "-"],
+            input="#include <format>\n",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+if torch and torch_version.hip and _host_cxx_has_format():
     # HIP's host_defines.h empties __host__/__device__/__noinline__ for host
     # compilation, which breaks libstdc++16's <format> ([[__gnu__::__noinline__]]
     # parses as an empty attribute name). Force <format> to parse first, before
