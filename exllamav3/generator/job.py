@@ -44,6 +44,16 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
     return concat_strings, offsets
 
 
+_TT = bool(os.environ.get("KYO_TURN_TRACE"))
+def _ttrace_begin():
+    if not _TT: return 0.0
+    torch.cuda.synchronize()
+    return time.perf_counter()
+def _ttrace_end(what, t):
+    if not _TT: return
+    torch.cuda.synchronize()
+    print(f"trace:   {what}: {(time.perf_counter() - t) * 1000:.1f} ms", flush=True)
+
 class Job:
 
     def __init__(
@@ -1237,6 +1247,12 @@ class Job:
             if seq.prefill_complete:
                 continue
 
+            restored = self._tail_restore(seq)
+            if restored:
+                progress += restored
+                if seq.prefill_complete:
+                    continue
+
             cp_pos = self.recurrent_state.position if self.recurrent_state is not None else -1
 
             prefill_start = seq.kv_position
@@ -1318,7 +1334,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or getattr(self, '_unaligned_start', False)
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1382,7 +1398,12 @@ class Job:
                 elif big_tail and prefill_start < last_page_b < prefill_end and prefill_start % PAGE_SIZE == 0 and \
                         prefill_end - prefill_start >= 512 and os.environ.get("EXL3_PF_NO_TAIL", "0") == "1":
                     no_tail_row = last_page_b - prefill_start
-                elif prefill_start < last_page_b <= prefill_end:
+                elif prefill_start < last_page_b <= prefill_end and not (
+                        prefill_end > last_page_b and self._tail_ok(seq) and seqlen % PAGE_SIZE != 0 and
+                        last_page_b - self.cached_pages * PAGE_SIZE < int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))):
+                    # (a prompt-end tail checkpoint, see _tail_stash, replaces this separate pass; it is still taken
+                    # when the last full-page checkpoint is EXL3_TAIL_MAXGAP tokens behind, which bounds the replay
+                    # after a restart from the disk slot)
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
@@ -1493,7 +1514,9 @@ class Job:
                     # from the following decode round -- so the 1-row lm_head is dead work
                     if os.environ.get("EXL3_PF_SKIP", "0") == "1":
                         params["skip_logits"] = True
+                    _tt = _ttrace_begin()
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
+                    _ttrace_end(f"target fwd rows={prefill_ids.shape[-1]} start={prefill_start}", _tt)
                 else:
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
@@ -1544,10 +1567,12 @@ class Job:
                         self.mtp_defer_end = prefill_end
                         self.mtp_defer_carry = seq.mtp_carry_hidden
                     else:
+                        _tt = _ttrace_begin()
                         self.generator.draft_model.prefill(
                             input_ids = prefill_ids,
                             params = draft_params
                         )
+                        _ttrace_end(f"draft prefill rows={prefill_ids.shape[-1]}", _tt)
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
@@ -1587,6 +1612,7 @@ class Job:
                 progress += prefill_end - prefill_start
                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    self._tail_stash(seq)
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
@@ -1850,6 +1876,116 @@ class Job:
             if stashed is not None and stashed["position"] == (pi + 1) * PAGE_SIZE:
                 return stashed
         return None
+
+
+    def _tail_ok(self, seq) -> bool:
+        g = self.generator
+        return (
+            g.tail_ckpt_max > 0 and g.recurrent_cache is not None and self.recurrent_state is not None
+            and not self.embeddings and len(self.sequences) == 1 and not g.model.loaded_tp
+            and getattr(g.cache.recurrent_state_cls, "__name__", "") == "GDNState"   # sliding-window states (MiMo) are not covered
+        )
+
+
+    def _tail_stash(self, seq):
+        """
+        Exact prompt-end checkpoint. Recurrent checkpoints sit on page boundaries, so a follow-up request replays
+        the prompt tail after the last full page (up to 255 tokens, each turn). Keep the recurrent state at the very
+        end of the prefill too (position len - 1), with the tokens of the partial last page. The partial page's K/V
+        stays valid in the page table (its first tokens are never overwritten), so _tail_restore can resume there.
+        Keyed by content (hash of the last full page + token ids), never by job.
+        """
+        if not self._tail_ok(seq):
+            return
+        end = seq.kv_position
+        if end != len(seq.sequence_ids) - 1 or end % PAGE_SIZE == 0 or self.recurrent_state.position != end:
+            return
+        g = self.generator
+        p0 = end // PAGE_SIZE
+        if len(seq.allocated_pages) <= p0 or (p0 > 0 and seq.allocated_pages[p0 - 1].kv_position != PAGE_SIZE):
+            return
+        prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
+        ids = seq.sequence_ids.torch_slice(p0 * PAGE_SIZE, end).clone()
+        for e in g.tail_ckpts:
+            if e["prev_hash"] == prev_hash and e["ids"].shape == ids.shape and torch.equal(e["ids"], ids):
+                g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
+                g.tail_ckpts.append(e)
+                return
+        t = _ttrace_begin()
+        carry = seq.mtp_carry_hidden
+        if _TT: print(f"trace:   tail checkpoint size {self.recurrent_state.checkpoint_size / 2**20:.0f} MiB", flush=True)
+        g.tail_ckpts.append({
+            "prev_hash": prev_hash, "ids": ids, "stashed": self.recurrent_state.stash(),
+            "carry": None if carry is None else carry.clone(), "page": seq.allocated_pages[p0],
+        })
+        while len(g.tail_ckpts) > g.tail_ckpt_max:
+            g.tail_ckpts.pop(0)
+        _ttrace_end("tail checkpoint stash", t)
+
+
+    def _tail_restore(self, seq) -> int:
+        """
+        Resume a prompt exactly at the end of an earlier prompt's prefill when the new prompt starts with the same
+        tokens (see _tail_stash): copy the partial page's K/V, restore the recurrent state and the MTP carry.
+        Allocation revives every hashed prompt page whose K/V is still resident, but only the pages up to the last
+        full-page checkpoint count as cached; the restore may jump over the revived pages that follow, so a tail
+        checkpoint taken several turns after the last page checkpoint is still usable.
+        Returns the number of tokens skipped (0 = nothing done, the normal path runs).
+        """
+        if not self._tail_ok(seq):
+            return 0
+        g = self.generator
+        start = seq.kv_position
+        if not g.tail_ckpts or start % PAGE_SIZE != 0:
+            return 0
+        total = len(seq.sequence_ids) - 1
+        pages = seq.allocated_pages
+        valid = 0                                       # leading pages holding complete, hash-matched K/V
+        while valid < len(pages) and pages[valid].kv_position == PAGE_SIZE:
+            valid += 1
+        first = start // PAGE_SIZE
+        for e in reversed(g.tail_ckpts):
+            L = e["ids"].shape[-1]
+            ph = e["prev_hash"]
+            if ph is None:
+                i = 0
+            else:
+                i = next((k + 1 for k in range(max(first - 1, 0), min(valid, len(pages))) if pages[k].phash == ph), -1)
+            if i < first or i > valid or i >= len(pages):
+                continue
+            pos = i * PAGE_SIZE
+            if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
+                continue
+            dst = pages[i]
+            if dst.kv_position != PAGE_SIZE:            # a complete revived page already holds this K/V
+                src = e["page"]
+                if src is dst or src.prev_hash != ph or src.kv_position < L or \
+                        not torch.equal(src.sequence[:, :L], e["ids"]):
+                    if _TT: print(f"trace: tail ckpt found but source page unusable (same={src is dst} kvp={src.kv_position})", flush=True)
+                    continue
+                t = _ttrace_begin()
+                for c in [g.cache] if not g.draft_model else [g.cache, g.draft_cache]:
+                    c.copy_page(c, src.page_index, dst.page_index, L)
+                dst.prev_hash = ph
+                dst.sequence[:, :L].copy_(e["ids"])
+                dst.kv_position = L
+                dst.can_revert = False
+                _ttrace_end(f"tail restore page copy rows={L}", t)
+            self.free_recurrent_state()
+            self.recurrent_state = g.cache.new_from_stashed(e["stashed"], position = pos + L)
+            self.last_recurrent_checkpoint_pos = pos + L
+            if e["carry"] is not None:
+                seq.mtp_carry_hidden = e["carry"].clone()
+                self.mtp_last_hidden = seq.mtp_carry_hidden
+            seq.kv_position = pos + L
+            seq.prefill_complete = seq.kv_position >= total
+            self._unaligned_start = True
+            skipped = pos + L - start
+            self.cached_tokens += skipped
+            g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
+            g.tail_ckpts.append(e)
+            return skipped
+        return 0
 
 
     def free_recurrent_state(self):

@@ -298,6 +298,10 @@ class Generator:
         # Defrag
         self.enable_defrag = enable_defrag
 
+        # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
+        self.tail_ckpts = []
+        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8"))
+
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
@@ -604,19 +608,29 @@ class Generator:
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
+        from .job import _ttrace_begin, _ttrace_end
         results = []
+        _t0 = _ttrace_begin()
         self.iterate_start_jobs(results)
+        _ttrace_end("start_jobs (alloc pages/restore ckpt)", _t0)
 
         # Perform one round of prefill
+        _t0 = _ttrace_begin()
         for job in list(self.active_jobs):
             try:
                 job.prefill(results)
             except Exception as e:
+                if os.environ.get("KYO_TURN_TRACE"):
+                    import traceback; traceback.print_exc()
                 self.reap_failed_job(job, e, results)
+        _ttrace_end("prefill total", _t0)
 
         # Recurrent checkpoints
+        _t0 = _ttrace_begin()
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
+        _ttrace_end("recurrent_checkpoint", _t0)
+        _t0 = _ttrace_begin()
 
         # Generation with draft model
         if self.draft_model:
@@ -643,6 +657,7 @@ class Generator:
         else:
             self.iterate_gen(results)
 
+        _ttrace_end("generation round", _t0)
         # Visualization
         if self.visualizer:
             self.update_visualizer()
