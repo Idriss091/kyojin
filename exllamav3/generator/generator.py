@@ -19,7 +19,7 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .job import Job
+from .job import Job, _ttrace_begin, _ttrace_end
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -99,6 +99,7 @@ class Generator:
         num_draft_tokens: int | None = None,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        tail_ckpt: int | None = None,
         cpu_cache_size: int = 0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
@@ -300,7 +301,9 @@ class Generator:
 
         # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
         self.tail_ckpts = []
-        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8"))
+        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8")) if tail_ckpt is None else int(tail_ckpt)
+        # prompts shorter than this never stash (the stash is 20-40 ms of host copy and 142 MiB per entry)
+        self.tail_ckpt_min = int(os.environ.get("EXL3_TAIL_MIN", "512"))
 
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
@@ -608,7 +611,6 @@ class Generator:
         assert self.draft_cache is None or self.draft_cache.initialized, \
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
-        from .job import _ttrace_begin, _ttrace_end
         results = []
         _t0 = _ttrace_begin()
         self.iterate_start_jobs(results)
@@ -797,6 +799,11 @@ class Generator:
             }
 
         return self.draft_ids_pinned[:, :window]
+
+
+    def clear_prompt_ckpts(self):
+        """Drop every prompt-end recurrent checkpoint (host memory, ~142 MiB each)."""
+        self.tail_ckpts.clear()
 
 
     def _flush_mtp_defer(self, job, with_tail: bool):

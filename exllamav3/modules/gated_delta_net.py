@@ -96,6 +96,9 @@ QWD3 = {"skip": 0}   # harness-only kill test: 1 = reuse the last b / a outputs 
 
 class GDNState:
 
+    # Prompt-end checkpoints (Job._tail_stash) are validated for this state class only
+    supports_tail_ckpt = True
+
     def __init__(
         self,
         cache: Cache,

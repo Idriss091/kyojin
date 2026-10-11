@@ -342,6 +342,8 @@ class Job:
         self.mtp_defer_plain = False
         self.mtp_defer_end = 0
         self.mtp_defer_carry = None
+        # set by _tail_restore: this job resumed mid-page, later chunks may start unaligned (reset on requeue)
+        self._unaligned_start = False
 
 
     def get_pinned_logit_mask(self):
@@ -1334,7 +1336,7 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
-            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or getattr(self, '_unaligned_start', False)
+            assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or self._unaligned_start
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
             # Special case for partial last page, check if there's a page anywhere in the cache that
@@ -1883,7 +1885,7 @@ class Job:
         return (
             g.tail_ckpt_max > 0 and g.recurrent_cache is not None and self.recurrent_state is not None
             and not self.embeddings and len(self.sequences) == 1 and not g.model.loaded_tp
-            and getattr(g.cache.recurrent_state_cls, "__name__", "") == "GDNState"   # sliding-window states (MiMo) are not covered
+            and getattr(g.cache.recurrent_state_cls, "supports_tail_ckpt", False)   # opt-in per state class (GDNState only)
         )
 
 
@@ -1901,25 +1903,35 @@ class Job:
         if end != len(seq.sequence_ids) - 1 or end % PAGE_SIZE == 0 or self.recurrent_state.position != end:
             return
         g = self.generator
+        if end < g.tail_ckpt_min:                       # short one-shot prompts: the stash costs more than a replay
+            return
         p0 = end // PAGE_SIZE
         if len(seq.allocated_pages) <= p0 or (p0 > 0 and seq.allocated_pages[p0 - 1].kv_position != PAGE_SIZE):
             return
         prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
         ids = seq.sequence_ids.torch_slice(p0 * PAGE_SIZE, end).clone()
+        carry_now = seq.mtp_carry_hidden
         for e in g.tail_ckpts:
             if e["prev_hash"] == prev_hash and e["ids"].shape == ids.shape and torch.equal(e["ids"], ids):
+                # same content: refresh the page (the old one may be recycled) and the carry, move to MRU
+                e["page"] = seq.allocated_pages[p0]
+                e["draft_ok"] = not self.mtp_defer
+                if carry_now is not None:
+                    e["carry"] = carry_now.clone()
                 g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
                 g.tail_ckpts.append(e)
                 return
+        while len(g.tail_ckpts) >= g.tail_ckpt_max:     # trim before the append: the peak stays at the bound
+            g.tail_ckpts.pop(0)
         t = _ttrace_begin()
         carry = seq.mtp_carry_hidden
         if _TT: print(f"trace:   tail checkpoint size {self.recurrent_state.checkpoint_size / 2**20:.0f} MiB", flush=True)
         g.tail_ckpts.append({
             "prev_hash": prev_hash, "ids": ids, "stashed": self.recurrent_state.stash(),
             "carry": None if carry is None else carry.clone(), "page": seq.allocated_pages[p0],
+            # EXL3_PF_DEFER: the draft K/V of this page is written after the first token, maybe never
+            "draft_ok": not self.mtp_defer,
         })
-        while len(g.tail_ckpts) > g.tail_ckpt_max:
-            g.tail_ckpts.pop(0)
         _ttrace_end("tail checkpoint stash", t)
 
 
@@ -1957,6 +1969,10 @@ class Job:
             if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
                 continue
             dst = pages[i]
+            if dst.kv_position == PAGE_SIZE and dst.prev_hash != ph:   # a complete revived page must follow the entry's chain
+                continue
+            if dst.kv_position != PAGE_SIZE and g.draft_model and not e.get("draft_ok", True):
+                continue
             if dst.kv_position != PAGE_SIZE:            # a complete revived page already holds this K/V
                 src = e["page"]
                 if src is dst or src.prev_hash != ph or src.kv_position < L or \
