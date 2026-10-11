@@ -592,5 +592,43 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(serve.extract_images(msgs), ["a", "b"])
 
 
+
+class ImageEmbeddingReuseTests(unittest.TestCase):
+    """The same picture must come back as the same embedding object, so the prompt keeps its token ids."""
+
+    def make_engine(self):
+        import itertools
+        import torch
+        from image_cache import ImageEmbeddingCache
+        ids, calls = itertools.count(1_000_000_000, 100), []
+
+        class Emb:
+            def __init__(self):
+                self.first_index = next(ids)
+                self.text_alias = f"<$EMB_{self.first_index}$>"
+                self.mm_length = 3
+                self.embeddings = torch.zeros(3, 4, dtype=torch.half)
+                self.deepstack_embeddings = None
+
+        class Tower:
+            def get_image_embeddings(self, *args, **kw):
+                calls.append(1)
+                return Emb()
+
+        eng = object.__new__(serve.ResidentEngine)
+        eng.emb_cache, eng.vision, eng.tokenizer = ImageEmbeddingCache(), Tower(), None
+        return eng, calls
+
+    def test_embed_reuses_ids_and_encodes_once(self):
+        from PIL import Image
+        eng, calls = self.make_engine()
+        img = Image.new("RGB", (64, 64))
+        a = eng._embed([(img, "k1")])
+        b = eng._embed([(img, "k1"), (img, "k2")])
+        self.assertIs(a[0], b[0])
+        self.assertNotEqual(b[0].first_index, b[1].first_index)
+        self.assertEqual(len(calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

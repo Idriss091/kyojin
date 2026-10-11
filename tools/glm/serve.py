@@ -6,8 +6,6 @@ import traceback
 import argparse
 import asyncio
 import base64
-import collections
-import hashlib
 import io
 import json
 import os
@@ -27,6 +25,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
@@ -265,7 +264,6 @@ DEFAULT_SAMPLER_KW: dict = json.loads(os.environ.get("SERVE_SAMPLER_KW", "{}") o
 # which the tokenizer expands to <|begin_of_image|> + one slot per vision token + <|end_of_image|>.
 IMAGE_TRIPLE = "<|begin_of_image|><|image|><|end_of_image|>"
 MAX_IMAGE_BYTES = 32 * 1024**2
-IMAGE_CACHE_SIZE = 8   # decoded embeddings kept by content hash, so a later turn re-sending the image reuses the KV cache
 
 
 def _bad(reason: str) -> web.HTTPBadRequest:
@@ -316,7 +314,7 @@ def load_image(url: str) -> tuple[Any, str]:
     if len(raw) > MAX_IMAGE_BYTES:
         raise _bad("image too large")
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB"), hashlib.sha256(raw).hexdigest()
+        return Image.open(io.BytesIO(raw)).convert("RGB"), digest(raw)
     except Exception as exc:                                          # noqa: BLE001
         raise _bad(f"cannot decode image: {exc}") from exc
 
@@ -351,7 +349,7 @@ class ResidentEngine:
         startup_health.stage("drafter weights")
         self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         self.vision = None
-        self.emb_cache: collections.OrderedDict = collections.OrderedDict()
+        self.emb_cache = ImageEmbeddingCache()
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -390,19 +388,13 @@ class ResidentEngine:
 
     def _embed(self, images: list[tuple[Any, str]]) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache; one prompt never holds an object twice."""
-        out, used = [], set()
-        for image, key in images:
-            emb = self.emb_cache.get(key) if key not in used else None
-            if emb is None:
-                emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
-            self.emb_cache[key] = emb
-            self.emb_cache.move_to_end(key)
-            used.add(key)
-            out.append(emb)
-        while len(self.emb_cache) > IMAGE_CACHE_SIZE:
-            self.emb_cache.popitem(last=False)
-        return out
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        def build(image):
+            t0 = time.perf_counter()
+            emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+            return emb
+        return self.emb_cache.get_many(images, build)
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())

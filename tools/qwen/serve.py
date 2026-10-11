@@ -39,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
 
 
 def _load_mimo():
@@ -298,8 +299,8 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def load_image(url: str):
-    """PIL image from a data: URI or an http(s) URL (size capped)."""
+def load_image_keyed(url: str):
+    """(PIL image, content hash of the encoded bytes) from a data: URI or an http(s) URL (size capped)."""
     from PIL import Image
     if not isinstance(url, str) or not url:
         raise BadRequest("image_url needs a url")
@@ -316,9 +317,14 @@ def load_image(url: str):
     if len(raw) > MAX_IMAGE_BYTES:
         raise BadRequest("image too large")
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        return Image.open(io.BytesIO(raw)).convert("RGB"), image_cache.digest(raw)
     except Exception as exc:                                          # noqa: BLE001
         raise BadRequest(f"cannot decode image: {exc}") from exc
+
+
+def load_image(url: str):
+    """PIL image from a data: URI or an http(s) URL (size capped)."""
+    return load_image_keyed(url)[0]
 
 
 def sampling_from(body: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
@@ -656,6 +662,7 @@ class QwenEngine:
             with Heartbeat("loading MTP drafter"):
                 self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
         self.vision = None
+        self.emb_cache = image_cache.ImageEmbeddingCache()
         if vision:
             try:
                 self.vision = Model.from_config(self.config, component="vision")
@@ -744,10 +751,18 @@ class QwenEngine:
         return ComboSampler(temperature=s["temperature"], top_k=s.get("top_k", 0), top_p=s.get("top_p", 1.0),
                             min_p=s.get("min_p", 0.0))
 
+    def _embed(self, images: list[tuple[Any, str]]) -> list:
+        """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        def build(image):
+            t0 = time.perf_counter()
+            emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            print(f"qserve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+            return emb
+        return self.emb_cache.get_many(images, build)
+
     def _encode(self, prompt: str, image_urls: list[str]):
-        embs = []
-        for url in image_urls:
-            embs.append(self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=load_image(url)))
+        embs = self._embed([load_image_keyed(url) for url in image_urls]) if image_urls else []
         for emb in embs:
             prompt = prompt.replace(IMAGE_PAD, emb.text_alias, 1)
         kw = {"embeddings": embs} if embs else {}

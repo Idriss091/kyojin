@@ -16,8 +16,6 @@ import traceback
 import argparse
 import asyncio
 import base64
-import collections
-import hashlib
 import io
 import json
 import os
@@ -37,6 +35,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
 DEFAULT_MODEL_ID = "MiMo-2.6-EXL3"
@@ -54,7 +53,6 @@ DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 # <|image_pad|> for the embedding's alias, which the tokenizer expands to one slot per vision token.
 IMAGE_PAD = "<|image_pad|>"
 MAX_IMAGE_BYTES = 32 * 1024**2
-IMAGE_CACHE_SIZE = 8   # embeddings kept by content hash: a later turn that re-sends the image reuses the KV cache
 
 
 def _bad(reason: str) -> web.HTTPBadRequest:
@@ -105,7 +103,7 @@ def load_image(url: str) -> tuple[Any, str]:
     if len(raw) > MAX_IMAGE_BYTES:
         raise _bad("image too large")
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB"), hashlib.sha256(raw).hexdigest()
+        return Image.open(io.BytesIO(raw)).convert("RGB"), digest(raw)
     except Exception as exc:                                          # noqa: BLE001
         raise _bad(f"cannot decode image: {exc}") from exc
 
@@ -371,7 +369,7 @@ class ResidentEngine:
         self.ctx = ctx or config_max_position(self.config)
         self.num_draft = self.ndt
         self.vision = None
-        self.emb_cache: collections.OrderedDict = collections.OrderedDict()
+        self.emb_cache = ImageEmbeddingCache()
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -397,21 +395,13 @@ class ResidentEngine:
 
     def _embed(self, images: list[tuple[Any, str]]) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache; one prompt never holds an object twice."""
-        out, used = [], set()
-        for image, key in images:
-            emb = self.emb_cache.get(key) if key not in used else None
-            if emb is None:
-                t0 = time.perf_counter()
-                emb = self.vision.get_image_embeddings(image)
-                print(f"msrv: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
-            self.emb_cache[key] = emb
-            self.emb_cache.move_to_end(key)
-            used.add(key)
-            out.append(emb)
-        while len(self.emb_cache) > IMAGE_CACHE_SIZE:
-            self.emb_cache.popitem(last=False)
-        return out
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        def build(image):
+            t0 = time.perf_counter()
+            emb = self.vision.get_image_embeddings(image)
+            print(f"msrv: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+            return emb
+        return self.emb_cache.get_many(images, build)
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
