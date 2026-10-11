@@ -2,8 +2,10 @@ name: Nix
 run-name: Nix flake check + fmt
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
