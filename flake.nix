@@ -598,10 +598,7 @@
             # Tuning cache (e.g. GLM's dense GEMM tune, ~8 min first launch)
             # must survive container replacement: keep HOME on the volume.
             export HOME="''${KYOJIN_HOME:-/models/home}"
-            # The image layer ships /tmp, but a stale or foreign image must
-            # never take down serve at import time (torch's cuda-shim probe
-            # needs a temp dir): ensure the temp dirs here, every start.
-            mkdir -p /tmp /var/tmp "$HOME" "$model_dir"
+            mkdir -p "$HOME" "$model_dir"
             # One slot per flavor; the marker records which repo filled it so
             # switching repos under the same flavor fails loudly instead of
             # serving a stale pack.
@@ -644,6 +641,10 @@
             # supplies persistence, container /tmp stays ephemeral.
             extraCommands = ''
               mkdir -p tmp var/tmp etc
+              # Real /tmp semantics: the container user is not root
+              # (userNS keep-id), so layer-created tmp dirs must be
+              # world-writable-sticky, or nothing can create temp files.
+              chmod 1777 tmp var/tmp
             '';
             contents = [
               kyojinServe
