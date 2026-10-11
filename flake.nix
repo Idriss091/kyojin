@@ -573,8 +573,32 @@
             };
           };
 
-          # NOTE: pythonSet.torch IS the ROCm torch (swapped in myOverrides
-          # above); packages.torch-rocm aliases it for a stable address.
+          # NOTE: pythonSet.torch IS the ROCm torch (lock resolution);
+          # packages.torch-rocm aliases it for a stable address.
+
+          # 9b. kyojin benchmark runner (house pattern 3: stdenv + makeWrapper).
+          # bench.py is stdlib-only, so plain python3 suffices (no engine
+          # venv), and it runs unmodified: default corpus is the repo's own
+          # Markdown (run it from a checkout, e.g. nix develop), or pass
+          # --corpus explicitly anywhere else.
+          kyojinBench = pkgs.stdenv.mkDerivation {
+            pname = "kyojin-bench";
+            version = "1.5.0";
+            src = ./.;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out/share/kyojin $out/bin
+              cp $src/tools/bench.py $out/share/kyojin/
+              makeWrapper ${pkgs.python312}/bin/python3 $out/bin/kyojin-bench \
+                --add-flags "$out/share/kyojin/bench.py"
+              runHook postInstall
+            '';
+            meta = {
+              description = "kyojin benchmark runner (issue #1 reports)";
+              mainProgram = "kyojin-bench";
+            };
+          };
 
           # 10. Container image + entrypoint. Ships the full SDK + toolchain
           # because serve builds GPU kernels on first use (install.md) with
@@ -770,6 +794,7 @@
             hip-sysroot = hipSysroot;
             kyojin = kyojinServe;
             docker = kyojinImage;
+            bench = kyojinBench;
           };
 
           apps =
@@ -783,6 +808,10 @@
               kyojin-serve-qwen = serveApp "qwen";
               kyojin-serve-glm = serveApp "glm";
               kyojin-serve-mimo = serveApp "mimo";
+              kyojin-bench = {
+                type = "app";
+                program = "${kyojinBench}/bin/kyojin-bench";
+              };
               default = serveApp "glm";
             };
         };

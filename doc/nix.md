@@ -118,6 +118,22 @@ Context size is the memory lever: 262144 was verified on all three packs on
 an otherwise empty 128 GB box (Qwen kept 13.9 GiB free, GLM 10.4, MiMo 6.6).
 Lower it when the machine is shared.
 
+## Benchmark
+
+`tools/bench.py` runs unmodified against any running server (stdlib only).
+From a checkout the default corpus is the repo's own Markdown, so plain
+`nix develop --command python3 tools/bench.py` just works when the server
+is local. Against a remote box, tunnel it and bring a corpus:
+
+```bash
+ssh -L 8000:localhost:8000 <server>   # keep this open in another shell
+nix run .#kyojin-bench -- --base http://localhost:8000/v1 \
+  --corpus <any 8000+ word text file> --json
+```
+
+It prints a Markdown block ready to paste into a benchmark report issue,
+plus a fenced JSON block with `--json` for collecting tables.
+
 ## Test notes
 
 `checks.kyojin-tests` runs `tests/test_*_cpu.py` (95 green). Three tests in
