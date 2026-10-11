@@ -54,14 +54,13 @@
           };
 
           # 2. Overlay: uv.lock -> derivations (wheels preferred).
-          # The cu124-cu132 extras are a uv `conflicts` group: uv2nix demands
-          # exactly one selected branch per declaration (empty leaves all
-          # torch forks in play -> "Non disjoint" solver error). Pin cu132
-          # (newest, torch 2.14.1); the ROCm torch swap lands in 2b.
+          # The lock is ROCm-only (no CUDA extras, no conflicts group),
+          # so selecting the rocm extra pins torch/triton to the AMD
+          # nightly set also pinned in pyproject.toml.
           uvLockedOverlay = workspace.mkPyprojectOverlay {
             sourcePreference = "wheel";
             dependencies = {
-              exllamav3 = [ "cu132" ];
+              exllamav3 = [ "rocm" ];
             };
           };
 
@@ -121,8 +120,42 @@
                 "libpmix.so.2"
               ];
               ignoreCuda = old: {
-                autoPatchelfIgnoreMissingDeps = (old.autoPatchelfIgnoreMissingDeps or [ ]) ++ cudaIgnore;
+                autoPatchelfIgnoreMissingDeps =
+                  (old.autoPatchelfIgnoreMissingDeps or [ ]) ++ cudaIgnore ++ rocmIgnore;
               };
+              # ROCm math/device SONAMEs, patch-time-ignored for torch (whose
+              # own tree IS patched): the wheels NEEDED-link each other
+              # across separate derivations whose lib dirs nest under
+              # site-packages (invisible to auto-patchelf), and all of these
+              # resolve at runtime from rocmLibs' flat lib/ tree plus the
+              # RUNPATHs baked from torch's buildInputs.
+              rocmIgnore = [
+                "libMIOpen.so.1"
+                "libamd_comgr.so.3"
+                "librocblas.so.5"
+                "libamdhip64.so.7"
+                "librocm_sysdeps_sqlite3.so"
+                "libamd_smi.so.27"
+                "libcholmod.so.5"
+                "libhiprtc.so.7"
+                "libhsa-runtime64.so.1"
+                "libomp.so"
+                "librocm-core.so.1"
+                "librocm_sysdeps_bz2.so"
+                "librocm_sysdeps_z.so.1"
+                "librocm_sysdeps_zstd.so.1"
+                "librocprofiler-register.so.0"
+                "libroctx64.so.4"
+                # rocgdb-py3.10 (a debugger for another interpreter, never
+                # executed here) links legacy libcrypt, absent everywhere.
+                "libcrypt.so.1"
+                # Other-interpreter Python bindings shipped in the core
+                # wheel (ours is 3.12 and links fine); never loaded here.
+                "libpython3.10.so.1.0"
+                "libpython3.11.so.1.0"
+                "libpython3.13.so.1.0"
+                "libpython3.14.so.1.0"
+              ];
               cudaSearchHook = old: {
                 preFixup = (old.preFixup or "") + ''
                   # Register nested site-packages lib dirs (NIX_LDFLAGS only
@@ -165,58 +198,72 @@
                 }
               )
             )
+            //
+              lib.genAttrs
+                [
+                  "rocm-sdk-core"
+                  "rocm-sdk-libraries"
+                  "rocm-sdk-device-gfx1151"
+                  "amd-torch-device-gfx1151"
+                  "amd-torch-device-gfx115x"
+                  # Triton ships prebuilt NVIDIA-backend blobs (never loaded
+                  # on AMD) that auto-patchelf chokes on; same treatment.
+                  "triton"
+                ]
+                (
+                  n:
+                  prev.${n}.overrideAttrs (_: {
+                    # AMD's prebuilt binaries are fragile to ELF rewriting:
+                    # patchelf-rewritten ones segfault on load (verified:
+                    # identical wheel, patched tree crashes, pristine tree
+                    # imports clean). Keep them byte-identical; at runtime
+                    # they resolve via AMD's own $ORIGIN-relative RUNPATHs
+                    # plus the venv co-installation, exactly as pip lays
+                    # them out. (torch itself keeps its patch: proven green.)
+                    dontAutoPatchelf = true;
+                    dontStrip = true;
+                  })
+                )
             // {
-              # ROCm torch is the default (kyojin is an AMD-first fork): swap
-              # the wheel + version, link the SDK tree and ROCm math libs.
-              # The CUDA sibling search/ignore from withCudaPatch is inert.
+              # The `rocm` meta sdist builds a trivial registry wheel but
+              # needs setuptools/wheel, unfetchable in the sandbox and (as
+              # a fetched package, unlike workspace members) not wired
+              # into PYTHONPATH: export them explicitly.
+              rocm = prev.rocm.overrideAttrs (old: {
+                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                  pkgs.python312Packages.setuptools
+                  pkgs.python312Packages.wheel
+                ];
+                preBuild = (old.preBuild or "") + ''
+                  export PYTHONPATH="${pkgs.python312Packages.setuptools}/lib/python3.12/site-packages:${pkgs.python312Packages.wheel}/lib/python3.12/site-packages:$PYTHONPATH"
+                '';
+              });
+            }
+            // {
+              # ROCm torch resolves straight from the lock (the AMD nightly
+              # set pinned in pyproject.toml): link the SDK tree and ROCm
+              # math libs. The CUDA sibling search/ignore from withCudaPatch
+              # is inert (no nvidia wheels in scope).
               torch = prev.torch.overrideAttrs (
                 old:
                 (withCudaPatch old)
                 // {
-                  inherit (amdTorch) version;
-                  src = fetchAmdWheel {
-                    inherit (amdTorch) url sha256;
-                    name = "torch-${amdTorch.version}-cp312-cp312-linux_x86_64.whl";
-                  };
                   buildInputs = (old.buildInputs or [ ]) ++ [
                     rocmSdk
                     rocmLibs
                   ];
-                  nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
-                    pkgs.unzip
-                  ];
                   # Merge the gfx1151 (+family) device kernel packs into
                   # torch's tree: torch looks up torch/.kpack/ + aotriton
                   # images relative to itself at runtime (strace-verified).
+                  # Packs come from the lock, so versions always match torch.
                   postFixup = (old.postFixup or "") + ''
-                    for w in "${
-                      fetchAmdWheel {
-                        inherit (amdTorchDevice) url sha256;
-                        name = "amd_torch_device_gfx1151-${amdTorchDevice.version}-cp312-cp312-linux_x86_64.whl";
-                      }
-                    }" "${
-                      fetchAmdWheel {
-                        inherit (amdTorchDeviceFamily) url sha256;
-                        name = "amd_torch_device_gfx115x-${amdTorchDeviceFamily.version}-cp312-cp312-linux_x86_64.whl";
-                      }
-                    }"; do
-                      unzip -q -o "$w" "torch/*" -d $TMPDIR/torch-device
-                      cp -rn $TMPDIR/torch-device/torch/. $out/lib/python3.12/site-packages/torch/
-                    done
+                    cp -rn ${
+                      final."amd-torch-device-gfx1151"
+                    }/lib/python3.12/site-packages/torch/. $out/lib/python3.12/site-packages/torch/
+                    cp -rn ${
+                      final."amd-torch-device-gfx115x"
+                    }/lib/python3.12/site-packages/torch/. $out/lib/python3.12/site-packages/torch/
                   '';
-                }
-              );
-              # ROCm triton for the same reason (torch requires it; the CUDA
-              # build's native lib hangs probing for NVIDIA hardware).
-              triton = prev.triton.overrideAttrs (
-                old:
-                (withCudaPatch old)
-                // {
-                  inherit (amdTriton) version;
-                  src = fetchAmdWheel {
-                    inherit (amdTriton) url sha256;
-                    name = "triton-${amdTriton.version}-cp312-cp312-linux_x86_64.whl";
-                  };
                 }
               );
               # Engine extension build: setup.py imports torch (cpp_extension)
@@ -311,106 +358,11 @@
             ])
           );
 
-          # 5. AMD nightly pins: multi-arch index, ROCm 10.1 bleeding edge
-          # (uv-resolved `--pre` set, 2026-10-10; doc/install.md verifies
-          # torch 2.14.0 on this ROCm, which is what we pin after 2.15.0a0
-          # proved too raw for the ext build. To float torch again, bump
-          # amdTorch only and re-verify `nix build .#exllamav3`).
-          # Bump procedure: re-run the `uv pip compile` from the Chunk-1
-          # notes against https://rocm.nightlies.amd.com/whl-multi-arch/ and
-          # update url+sha256 below (nix-prefetch-url).
-          # NOTE: keep `%2B` (not `+`) in wheel URLs: the index links are
-          # percent-encoded and fetchurl must match byte-identically.
-          amdIndex = "https://rocm.nightlies.amd.com/whl-multi-arch";
-          amdTorch = {
-            version = "2.14.0+rocm10.1.0a20260822";
-            url = "${amdIndex}/torch-2.14.0%2Brocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl";
-            sha256 = "07v42ddqfm9dga0c09lxgmcfmx1zqbg01v9kzdnwl72l9dqq8svy";
-          };
-          # Device kernel packs torch looks up at runtime
-          # (torch/.kpack/torch_gfx1151.kpack + aotriton images); merged
-          # into torch's tree post-install, exactly as pip lays them out.
-          amdTorchDevice = {
-            version = "2.14.0+rocm10.1.0a20260822";
-            url = "${amdIndex}/amd_torch_device_gfx1151-2.14.0%2Brocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl";
-            sha256 = "161a5rk2fwn3f6rv4z73z99ay50hz8r59bn3b8kb8i5v6s47a7k1";
-          };
-          amdTorchDeviceFamily = {
-            version = "2.14.0+rocm10.1.0a20260822";
-            url = "${amdIndex}/amd_torch_device_gfx115x-2.14.0%2Brocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl";
-            sha256 = "0chym3bv8y889cvkrpiv1cj3b8mf90dpw82y43qhnqz8kzn66z24";
-          };
-          # ROCm triton (torch Requires-Dist; the CUDA build hangs probing
-          # for NVIDIA hardware on AMD boxes, and exllamav3 imports it).
-          amdTriton = {
-            version = "3.8.0+git675c5987.rocm10.1.0a20260822";
-            url = "${amdIndex}/triton-3.8.0%2Bgit675c5987.rocm10.1.0a20260822-cp312-cp312-linux_x86_64.whl";
-            sha256 = "06v9v8h0rqmw3jjnxlx434i1v6ml14pf2fqszhkrnq7vs381j6a2";
-          };
-          amdSdkDevel = {
-            version = "10.1.0a20260822";
-            url = "${amdIndex}/rocm_sdk_devel-10.1.0a20260822-py3-none-linux_x86_64.whl";
-            sha256 = "1by8bs60zfn7gxk6yp6wdhzx14nl79rjzs0l6lhqlm97hmjiiqjn";
-          };
-          amdSdkLibraries = {
-            version = "10.1.0a20260822";
-            url = "${amdIndex}/rocm_sdk_libraries-10.1.0a20260822-py3-none-linux_x86_64.whl";
-            sha256 = "1hnqsxqwfbm1ih4g4iv0g771vb0n4md1s9mgdixmbl5i06nbgw31";
-          };
-          amdSdkDevice = {
-            version = "10.1.0a20260822";
-            url = "${amdIndex}/rocm_sdk_device_gfx1151-10.1.0a20260822-py3-none-linux_x86_64.whl";
-            sha256 = "0kk5llm72xdf3iy5wl5fx8nmyymg6l50gpjp1xjb0fqd104qi9in";
-          };
-          amdSdkCore = {
-            version = "10.1.0a20260822";
-            url = "${amdIndex}/rocm_sdk_core-10.1.0a20260822-py3-none-linux_x86_64.whl";
-            sha256 = "0aap59x6l7yyzs7pfmlwszryl6f54j1w07hyb9shrzfgcls6sdyg";
-          };
-          # `rocm` meta sdist: provides the `rocm_sdk` registry module that
-          # torch's _rocm_init imports (preload registry + version check).
-          amdRocmSdist = {
-            version = "10.1.0a20260822";
-            url = "${amdIndex}/rocm-10.1.0a20260822.tar.gz";
-            sha256 = "1k39cnidcn86p33hdiprzyngwj0rmplmnj8yagk1sg008mr0j5m7";
-          };
-          # `rocm-bootstrap`: platform/target detection used by the registry.
-          amdBootstrap = {
-            version = "0.1.0";
-            url = "${amdIndex}/rocm_bootstrap-0.1.0-py3-none-any.whl";
-            sha256 = "0lmn8jkd48vfcw0gz3vm5yvlykc7r8cacjf0dghg1cc6s3dd9qrk";
-          };
-          fetchAmdWheel =
-            {
-              url,
-              sha256,
-              name,
-            }:
-            pkgs.fetchurl { inherit url sha256 name; };
-          develWheel = fetchAmdWheel {
-            inherit (amdSdkDevel) url sha256;
-            name = "rocm_sdk_devel-${amdSdkDevel.version}-py3-none-linux_x86_64.whl";
-          };
-          coreWheel = fetchAmdWheel {
-            inherit (amdSdkCore) url sha256;
-            name = "rocm_sdk_core-${amdSdkCore.version}-py3-none-linux_x86_64.whl";
-          };
-          librariesWheel = fetchAmdWheel {
-            inherit (amdSdkLibraries) url sha256;
-            name = "rocm_sdk_libraries-${amdSdkLibraries.version}-py3-none-linux_x86_64.whl";
-          };
-          deviceWheel = fetchAmdWheel {
-            inherit (amdSdkDevice) url sha256;
-            name = "rocm_sdk_device_gfx1151-${amdSdkDevice.version}-py3-none-linux_x86_64.whl";
-          };
-          bootstrapWheel = fetchAmdWheel {
-            inherit (amdBootstrap) url sha256;
-            name = "rocm_bootstrap-${amdBootstrap.version}-py3-none-any.whl";
-          };
-          rocmSdist = pkgs.fetchurl {
-            inherit (amdRocmSdist) url sha256;
-            name = "rocm-${amdRocmSdist.version}.tar.gz";
-          };
+          # 5. ROCm versions are pinned once, in pyproject.toml (the `rocm`
+          # extra + AMD index): uv.lock carries the wheel URLs/hashes, and
+          # the derivations below consume the locked wheels via pythonSet.
+          # Bump procedure: update the pins in pyproject.toml, re-run
+          # `uv lock`, re-verify `nix build .#exllamav3`.
 
           # 6. ROCm SDK tree (= `rocm-sdk init` output, sandbox-expanded).
           # Layout mirrors pip site-packages, which the wheels assume:
@@ -420,29 +372,23 @@
           # $out IS the SDK root (no `rocm-sdk path` CLI needed).
           rocmSdk = pkgs.stdenv.mkDerivation {
             pname = "rocm-sdk-gfx1151";
-            inherit (amdSdkDevel) version;
-            srcs = [
-              develWheel
-              coreWheel
-            ];
+            version = pythonSet."rocm-sdk-devel".version;
             nativeBuildInputs = with pkgs; [
-              unzip
               gnutar
               patchelf
             ];
             dontUnpack = true;
             installPhase = ''
               runHook preInstall
-              work=$(mktemp -d)
-              unzip -q -o "${develWheel}" -d $work/devel
-              unzip -q -o "${coreWheel}" -d $work/core
+              devel=${pythonSet."rocm-sdk-devel"}/lib/python3.12/site-packages/rocm_sdk_devel
+              core=${pythonSet."rocm-sdk-core"}/lib/python3.12/site-packages/_rocm_sdk_core
               mkdir -p $out
-              tar -xf $work/devel/rocm_sdk_devel/_devel.tar -C $out
+              tar -xf $devel/_devel.tar -C $out
               # core runtime tree as devel's sibling (devel's lib/bin links
               # expect ../../_rocm_sdk_core/); skip its python package bits.
               mkdir -p $out/_rocm_sdk_core
               for d in bin etc include lib libexec share; do
-                [ -e $work/core/_rocm_sdk_core/$d ] && cp -r $work/core/_rocm_sdk_core/$d $out/_rocm_sdk_core/
+                [ -e $core/$d ] && cp -r $core/$d $out/_rocm_sdk_core/
               done
               # Repair AMD's absolute build-env symlinks to our sibling tree.
               find $out -xtype l | while read -r l; do
@@ -502,23 +448,25 @@
           # win on SONAMEs.
           rocmLibs = pkgs.stdenv.mkDerivation {
             pname = "rocm-sdk-libraries-gfx1151";
-            inherit (amdSdkLibraries) version;
-            nativeBuildInputs = [ pkgs.unzip ];
+            version = pythonSet."rocm-sdk-libraries".version;
             dontUnpack = true;
             # Upstream binaries: strip corrupts some (misaligned LOAD
             # segments after strip, e.g. librocsolver). Keep byte-identical.
             dontStrip = true;
             installPhase = ''
               runHook preInstall
-              work=$(mktemp -d)
               mkdir -p $out/lib
-              unzip -q -o "${librariesWheel}" "_rocm_sdk_libraries/lib/*" -d $work
-              cp -r $work/_rocm_sdk_libraries/lib/. $out/lib/
-              unzip -q -o "${deviceWheel}" "_rocm_sdk_libraries/lib/*" -d $work/device
-              cp -rn $work/device/_rocm_sdk_libraries/lib/. $out/lib/
-              unzip -q -o "${coreWheel}" "_rocm_sdk_core/lib/host-math/lib/*" "_rocm_sdk_core/lib/rocm_sysdeps/lib/*" -d $work
-              cp -r $work/_rocm_sdk_core/lib/host-math/lib/. $out/lib/
-              cp -r $work/_rocm_sdk_core/lib/rocm_sysdeps/lib/. $out/lib/
+              libs=${pythonSet."rocm-sdk-libraries"}/lib/python3.12/site-packages/_rocm_sdk_libraries/lib
+              cp -r $libs/. $out/lib/
+              device=${pythonSet."rocm-sdk-device-gfx1151"}/lib/python3.12/site-packages/_rocm_sdk_libraries/lib
+              cp -rn $device/. $out/lib/
+              core=${pythonSet."rocm-sdk-core"}/lib/python3.12/site-packages/_rocm_sdk_core
+              # comgr + hip live only in core's lib/ (not the sidecars
+              # below); device libraries NEEDED-link them, so they join
+              # the flat tree like everything else.
+              cp -r $core/lib/libamd_comgr* $core/lib/libamdhip64* $out/lib/
+              cp -r $core/lib/host-math/lib/. $out/lib/
+              cp -r $core/lib/rocm_sysdeps/lib/. $out/lib/
               runHook postInstall
             '';
           };
@@ -530,32 +478,37 @@
           # Wheels/sdist preserved verbatim; composed via PYTHONPATH.
           rocmProviders = pkgs.stdenv.mkDerivation {
             pname = "rocm-python-providers";
-            inherit (amdRocmSdist) version;
-            nativeBuildInputs = with pkgs; [
-              unzip
-              gnutar
-            ];
+            version = pythonSet.rocm.version;
+            nativeBuildInputs = [ pkgs.gnutar ];
             dontUnpack = true;
             # As in rocmLibs: upstream binaries, keep byte-identical.
             dontStrip = true;
             installPhase = ''
               runHook preInstall
-              work=$(mktemp -d)
+              core=${pythonSet."rocm-sdk-core"}/lib/python3.12/site-packages/_rocm_sdk_core
+              libs=${pythonSet."rocm-sdk-libraries"}/lib/python3.12/site-packages/_rocm_sdk_libraries
+              device=${pythonSet."rocm-sdk-device-gfx1151"}/lib/python3.12/site-packages/_rocm_sdk_libraries
+              bootstrap=${pythonSet."rocm-bootstrap"}/lib/python3.12/site-packages/rocm_bootstrap
               sp=$out/lib/python3.12/site-packages
               mkdir -p $sp
               # provider layouts must stay native (rocm_sdk globs lib/ under
               # each importable package); core's bin/ stays out (its absolute
               # build-env symlinks don't survive outside site-packages).
-              unzip -q -o "${coreWheel}" "_rocm_sdk_core/__init__.py" "_rocm_sdk_core/lib/*" -d $work/core
-              cp -r $work/core/_rocm_sdk_core $sp/
-              unzip -q -o "${librariesWheel}" "_rocm_sdk_libraries/__init__.py" "_rocm_sdk_libraries/lib/*" -d $work/libs
-              cp -r $work/libs/_rocm_sdk_libraries $sp/
-              unzip -q -o "${deviceWheel}" "_rocm_sdk_libraries/lib/*" -d $work/device
-              cp -rn $work/device/_rocm_sdk_libraries/lib/. $sp/_rocm_sdk_libraries/lib/
-              unzip -q -o "${bootstrapWheel}" "rocm_bootstrap/*" -d $work/bootstrap
-              cp -r $work/bootstrap/rocm_bootstrap $sp/
-              tar -xzf "${rocmSdist}" -C $work
-              cp -r $work/rocm-${amdRocmSdist.version}/src/rocm_sdk $sp/
+              mkdir -p $sp/_rocm_sdk_core $sp/_rocm_sdk_libraries
+              cp $core/__init__.py $sp/_rocm_sdk_core/
+              cp -r $core/lib $sp/_rocm_sdk_core/
+              cp $libs/__init__.py $sp/_rocm_sdk_libraries/
+              cp -r $libs/lib $sp/_rocm_sdk_libraries/
+              # cp preserves the store's read-only modes; the device merge
+              # below writes into this tree, so make it writable first.
+              chmod -R u+w $sp/_rocm_sdk_libraries
+              cp -rn $device/lib/. $sp/_rocm_sdk_libraries/lib/
+              cp -r $bootstrap $sp/
+              # Registry module straight from the sdist tarball (building
+              # the sdist wheel would need setuptools with no network).
+              work=$(mktemp -d)
+              tar -xzf ${pythonSet.rocm.src} -C $work
+              cp -r $work/rocm-*/src/rocm_sdk $sp/
               runHook postInstall
             '';
           };
@@ -643,7 +596,10 @@
             # Tuning cache (e.g. GLM's dense GEMM tune, ~8 min first launch)
             # must survive container replacement: keep HOME on the volume.
             export HOME="''${KYOJIN_HOME:-/models/home}"
-            mkdir -p "$HOME" "$model_dir"
+            # The image layer ships /tmp, but a stale or foreign image must
+            # never take down serve at import time (torch's cuda-shim probe
+            # needs a temp dir): ensure the temp dirs here, every start.
+            mkdir -p /tmp /var/tmp "$HOME" "$model_dir"
             # One slot per flavor; the marker records which repo filled it so
             # switching repos under the same flavor fails loudly instead of
             # serving a stale pack.

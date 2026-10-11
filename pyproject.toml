@@ -55,23 +55,27 @@ examples = [
     "requests",
     "pydantic",
 ]
-cu124 = [
-    "torch>=2.6.0",
-]
-cu126 = [
-    "torch>=2.6.0",
-]
-cu128 = [
-    "torch>=2.6.0",
-]
-cu129 = [
-    "torch>=2.6.0",
-]
-cu130 = [
-    "torch>=2.6.0",
-]
-cu132 = [
-    "torch>=2.6.0",
+# ROCm install from the lock (AMD multi-arch index, see install.md).
+# This fork is ROCm-first: there are no CUDA extras, and torch resolves
+# from AMD's index everywhere (including the default dependencies below),
+# so no CUDA torch can ever enter the lock. Pinned to the verified set
+# (doc/install.md); bump the whole set deliberately, then re-verify
+# `nix build .#exllamav3`.
+rocm = [
+    "torch[device-gfx1151]==2.14.0+rocm10.1.0a20260822",
+    "rocm[devel,device-gfx1151]==10.1.0a20260822",
+    # Full ROCm stack pinned explicitly: uv only honors index sources
+    # for direct requirements (transitive lookups fall back to PyPI,
+    # where these builds cannot exist), so every AMD package is listed
+    # even when also pulled transitively (same pins, by construction).
+    "triton==3.8.0+git675c5987.rocm10.1.0a20260822",
+    "rocm-sdk-core==10.1.0a20260822",
+    "rocm-sdk-libraries==10.1.0a20260822",
+    "rocm-sdk-devel==10.1.0a20260822",
+    "rocm-sdk-device-gfx1151==10.1.0a20260822",
+    "rocm-bootstrap==0.1.0",
+    "amd-torch-device-gfx1151==2.14.0+rocm10.1.0a20260822",
+    "amd-torch-device-gfx115x==2.14.0+rocm10.1.0a20260822",
 ]
 
 [tool.setuptools]
@@ -95,54 +99,55 @@ version = { attr = "exllamav3.version.__version__" }
 
 [tool.uv]
 package = true
-conflicts = [
-    [
-        { extra = "cu124" },
-        { extra = "cu126" },
-        { extra = "cu128" },
-        { extra = "cu129" },
-        { extra = "cu130" },
-        { extra = "cu132" },
-    ],
-]
+# AMD's nightly index versions everything pre-release (10.1.0a...); the
+# rocm extra cannot resolve without this. Plain `uv lock` (no --upgrade)
+# keeps existing pins, so this only affects newly-resolved requirements.
+prerelease = "allow"
 
 [tool.uv.sources]
+# torch resolves from AMD's index everywhere (default deps included):
+# this fork ships no CUDA torch in any configuration.
 torch = [
-    { index = "pytorch-cu124", extra = "cu124" },
-    { index = "pytorch-cu126", extra = "cu126" },
-    { index = "pytorch-cu128", extra = "cu128" },
-    { index = "pytorch-cu129", extra = "cu129" },
-    { index = "pytorch-cu130", extra = "cu130" },
-    { index = "pytorch-cu132", extra = "cu132" },
+    { index = "rocm" },
+]
+# Everything below only exists on AMD's index. The index is explicit,
+# so each needs its own entry to be consulted.
+triton = [
+    { index = "rocm" },
+]
+rocm = [
+    { index = "rocm" },
+]
+rocm-bootstrap = [
+    { index = "rocm" },
+]
+rocm-sdk-core = [
+    { index = "rocm" },
+]
+rocm-sdk-libraries = [
+    { index = "rocm" },
+]
+rocm-sdk-devel = [
+    { index = "rocm" },
+]
+rocm-sdk-device-gfx1151 = [
+    { index = "rocm" },
+]
+amd-torch-device-gfx1151 = [
+    { index = "rocm" },
+]
+amd-torch-device-gfx115x = [
+    { index = "rocm" },
 ]
 
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "rocm"
+url = "https://rocm.nightlies.amd.com/whl-multi-arch/"
 explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
-explicit = true
+# NOTE: this index serves bare links with no hashes, so `uv lock` cannot
+# record any. The cp312/linux artifacts used by Nix carry hand-backfilled
+# `hash = "sha256:..."` entries in uv.lock (converted from verified pins
+# via `nix hash convert --hash-algo sha256 --from nix32 --to base16`).
+# If a future re-lock drops them, Nix evaluation fails loudly asking for
+# a sha256 (`uv lock --check` does NOT verify hashes) — re-add them.

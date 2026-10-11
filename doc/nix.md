@@ -57,9 +57,12 @@ Torch tracks the line verified in doc/install.md:
 | rocm (registry sdist) / bootstrap | 10.1.0a20260822 / 0.1.0 |
 | triton (ROCm) | 3.8.0+git675c5987.rocm10.1.0a20260822 |
 
-To bump: re-run the `uv pip compile` from the install guide against the
-index, fetch each wheel hash with `nix-prefetch-url`, and update `url` and
-`sha256` in `flake.nix` (wheel URLs stay percent-encoded, keep the `%2B`).
+To bump: update the pins in the `rocm` extra in `pyproject.toml`, re-run
+`uv lock`, and re-verify `nix build .#exllamav3`. The AMD index serves
+bare links with no hashes, so the cp312/linux artifacts carry
+hand-backfilled `hash = "sha256:..."` entries in `uv.lock` (convert with
+`nix hash convert --hash-algo sha256 --from nix32 --to base16`); if a
+re-lock drops them, Nix evaluation fails loudly asking for a sha256.
 Then rebuild `.#torch-rocm` and `.#exllamav3`.
 
 ## Running on gfx1151 hardware
