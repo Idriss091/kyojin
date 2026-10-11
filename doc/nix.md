@@ -131,6 +131,14 @@ nix run .#kyojin-bench -- --base http://localhost:8000/v1 \
   --corpus <any 8000+ word text file> --json
 ```
 
+For comparable numbers across machines, freeze the input with the pinned
+corpus (same revision in, same bytes out) instead of a hand-picked file:
+
+```bash
+nix run .#kyojin-bench -- --base http://localhost:8000/v1 \
+  --corpus $(nix build --print-out-paths .#bench-corpus)/corpus.txt --json
+```
+
 It prints a Markdown block ready to paste into a benchmark report issue,
 plus a fenced JSON block with `--json` for collecting tables.
 

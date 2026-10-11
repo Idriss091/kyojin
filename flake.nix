@@ -600,6 +600,17 @@
             };
           };
 
+          # Pinned benchmark corpus (optional companion to kyojin-bench):
+          # every repo Markdown file concatenated at build time, so reports
+          # stay comparable between machines. bench.py's own default is
+          # whatever markdown surrounds it at runtime; pass this file as
+          # --corpus to freeze the input instead.
+          benchCorpus = pkgs.runCommand "kyojin-bench-corpus" { src = ./.; } ''
+            mkdir -p $out
+            find $src -name '*.md' -not -path '*/.git/*' -not -path '*/.venv/*' -not -path '*/node_modules/*' -print0 \
+              | sort -z | xargs -0 cat > $out/corpus.txt
+          '';
+
           # 10. Container image + entrypoint. Ships the full SDK + toolchain
           # because serve builds GPU kernels on first use (install.md) with
           # hipcc; a runtime-lib subset would break that. A later diet to a
@@ -795,6 +806,7 @@
             kyojin = kyojinServe;
             docker = kyojinImage;
             bench = kyojinBench;
+            bench-corpus = benchCorpus;
           };
 
           apps =
