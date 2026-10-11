@@ -536,6 +536,10 @@
                 mkdir -p $out/share/kyojin/$flavor
                 cp $src/tools/$flavor/serve.py $src/tools/$flavor/serve_metrics.py \
                   $out/share/kyojin/$flavor/
+                # qwen/serve.py imports spec_policy at draft-build time
+                # (sibling import, resolved relative to its own file).
+                [ "$flavor" = qwen ] && cp $src/tools/$flavor/spec_policy.py \
+                  $out/share/kyojin/$flavor/
                 # chat templates live next to the scripts (qwen/mimo) or in
                 # lanes/assets (glm); the servers resolve them relative to
                 # their own file, so ship them at the same relative paths.
