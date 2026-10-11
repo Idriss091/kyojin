@@ -55,10 +55,27 @@ examples = [
     "requests",
     "pydantic",
 ]
+cu124 = [
+    "torch>=2.6.0",
+]
+cu126 = [
+    "torch>=2.6.0",
+]
+cu128 = [
+    "torch>=2.6.0",
+]
+cu129 = [
+    "torch>=2.6.0",
+]
+cu130 = [
+    "torch>=2.6.0",
+]
+cu132 = [
+    "torch>=2.6.0",
+]
 # ROCm install from the lock (AMD multi-arch index, see install.md).
-# This fork is ROCm-first: there are no CUDA extras, and torch resolves
-# from AMD's index everywhere (including the default dependencies below),
-# so no CUDA torch can ever enter the lock. Pinned to the verified set
+# The CUDA extras above stay for Nvidia users; the AMD pins live in the
+# rocm extra (plus the flake selection) only. Pinned to the verified set
 # (doc/install.md); bump the whole set deliberately, then re-verify
 # `nix build .#exllamav3`.
 rocm = [
@@ -103,17 +120,34 @@ package = true
 # rocm extra cannot resolve without this. Plain `uv lock` (no --upgrade)
 # keeps existing pins, so this only affects newly-resolved requirements.
 prerelease = "allow"
+conflicts = [
+    [
+        { extra = "cu124" },
+        { extra = "cu126" },
+        { extra = "cu128" },
+        { extra = "cu129" },
+        { extra = "cu130" },
+        { extra = "cu132" },
+        { extra = "rocm" },
+    ],
+]
 
 [tool.uv.sources]
-# torch resolves from AMD's index everywhere (default deps included):
-# this fork ships no CUDA torch in any configuration.
 torch = [
-    { index = "rocm" },
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu130", extra = "cu130" },
+    { index = "pytorch-cu132", extra = "cu132" },
+    { index = "rocm", extra = "rocm" },
 ]
 # Everything below only exists on AMD's index. The index is explicit,
-# so each needs its own entry to be consulted.
+# so each needs its own entry to be consulted. triton is scoped to the
+# rocm extra: it exists on PyPI too, and the CUDA branches must keep
+# resolving it from there.
 triton = [
-    { index = "rocm" },
+    { index = "rocm", extra = "rocm" },
 ]
 rocm = [
     { index = "rocm" },
@@ -140,6 +174,36 @@ amd-torch-device-gfx115x = [
     { index = "rocm" },
 ]
 
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
 
 [[tool.uv.index]]
 name = "rocm"

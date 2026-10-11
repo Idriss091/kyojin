@@ -54,9 +54,11 @@
           };
 
           # 2. Overlay: uv.lock -> derivations (wheels preferred).
-          # The lock is ROCm-only (no CUDA extras, no conflicts group),
-          # so selecting the rocm extra pins torch/triton to the AMD
-          # nightly set also pinned in pyproject.toml.
+          # The cu124-cu132+rocm extras are a uv `conflicts` group: uv2nix
+          # demands exactly one selected branch per declaration (empty leaves
+          # all torch forks in play -> "Non disjoint" solver error). Select
+          # rocm (AMD nightly set, also pinned in pyproject.toml); CUDA
+          # branches stay resolvable in uv for non-Nix flows.
           uvLockedOverlay = workspace.mkPyprojectOverlay {
             sourcePreference = "wheel";
             dependencies = {
