@@ -48,6 +48,24 @@
           inherit (pkgs) lib;
           python = pkgs.python312;
 
+          # System headers for SDK clang (it runs outside the cc
+          # wrapper). They must be searched AFTER clang's resource dir so
+          # the cuda_wrappers stay engaged and their #include_next lands
+          # in libstdc++/glibc, like /usr/include on Ubuntu.
+          # Only -Xclang -internal-isystem lands after builtins
+          # (-isystem/-idirafter/--sysroot never reach past the resource
+          # dir, starving the wrappers). Verified via -### + live builds.
+          # Shared by the build-time exllamav3 compile AND the runtime JIT
+          # wrappers below (gr_mix/gdn/ple/qsa/kda --genco on first serve):
+          # the JIT needs the same sysincludes plus HIP_DEVICE_LIB_PATH
+          # (Trap 4: bitcode lives at lib/llvm/amdgcn/bitcode, not the
+          # $ROCM_PATH/amdgcn/bitcode clang probes).
+          hipSysIncludes = lib.concatStringsSep " " [
+            "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.cc}/include/c++/${pkgs.stdenv.cc.cc.version}"
+            "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.cc}/include/c++/${pkgs.stdenv.cc.cc.version}/${pkgs.stdenv.hostPlatform.config}"
+            "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.libc.dev}/include"
+          ];
+
           # 1. Load workspace (pyproject.toml + uv.lock at eval time)
           workspace = inputs.uv2nix.lib.workspace.loadWorkspace {
             workspaceRoot = ./.;
@@ -172,18 +190,8 @@
                 '';
               };
               withCudaPatch = old: (ignoreCuda old) // (cudaSearchHook old);
-              # System headers for SDK clang (it runs outside the cc
-              # wrapper). They must be searched AFTER clang's resource dir so
-              # the cuda_wrappers stay engaged and their #include_next lands
-              # in libstdc++/glibc, like /usr/include on Ubuntu.
-              # Only -Xclang -internal-isystem lands after builtins
-              # (-isystem/-idirafter/--sysroot never reach past the resource
-              # dir, starving the wrappers). Verified via -### + live builds.
-              hipSysIncludes = lib.concatStringsSep " " [
-                "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.cc}/include/c++/${pkgs.stdenv.cc.cc.version}"
-                "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.cc}/include/c++/${pkgs.stdenv.cc.cc.version}/${pkgs.stdenv.hostPlatform.config}"
-                "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.libc.dev}/include"
-              ];
+              # hipSysIncludes lives at perSystem scope (shared with the
+              # runtime JIT wrappers below); referenced as ${hipSysIncludes}.
             in
             lib.genAttrs nvidiaSibs (
               n:
@@ -522,6 +530,10 @@
           # scripts' sys.path bootstrap keeps working. Wrappers bake in the
           # engine venv python, provider/engine PYTHONPATH, EXL3_ROCM_SDK
           # and the Trap-1 LD_PRELOAD; CLI args pass straight through.
+          # Runtime JIT (gr_mix/gdn/ple/qsa/kda --genco on first serve)
+          # needs the same compiler env as the build: HIP_DEVICE_LIB_PATH
+          # (Trap 4 bitcode) + HIPCC_COMPILE_FLAGS_APPEND (sysincludes).
+          # Compiler-only: LD_LIBRARY_PATH stays SDK-free per Trap 5.
           kyojinServe = pkgs.stdenv.mkDerivation {
             pname = "kyojin";
             # Keep in sync with exllamav3/version.py (pyproject-nix reports
@@ -562,6 +574,8 @@
                   --prefix PYTHONPATH : "${pythonSet.exllamav3}/lib/python3.12/site-packages:${rocmProviders}/lib/python3.12/site-packages:$out/share/kyojin" \
                   --set EXL3_ROCM_SDK "${rocmSdk}" \
                   --set EXL3_HIPCC "${rocmSdk}/bin/hipcc" \
+                  --set HIP_DEVICE_LIB_PATH "${rocmSdk}/lib/llvm/amdgcn/bitcode" \
+                  --set HIPCC_COMPILE_FLAGS_APPEND "${hipSysIncludes}" \
                   --prefix LD_LIBRARY_PATH : "${pkgs.gcc.cc.lib}/lib:${cudaLibPath}" \
                   --set LD_PRELOAD "${rocmSdk}/lib/libhsa-runtime64.so.1"
               done
@@ -748,6 +762,10 @@
               # ROCm runtime needs gcc libs at dlopen time (ctypes preloads).
               export LD_LIBRARY_PATH="${cudaLibPath}:${pkgs.gcc.cc.lib}/lib:''${LD_LIBRARY_PATH:-}"
               export EXL3_ROCM_SDK="${rocmSdk}"
+              # Runtime JIT needs the same compiler env as the serve wrappers
+              # (Trap 4 bitcode + sysincludes); compiler-only, no loader effect.
+              export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
+              export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes}"
             '';
           };
 
@@ -782,6 +800,43 @@
               # lands; harmless afterwards (grep matches nothing).
               files=$(ls tests/test_*_cpu.py | grep -v test_ablit_qwen_cpu)
               timeout 240 pytest $files -q
+              runHook postCheck
+            '';
+            installPhase = ''
+              runHook preInstall
+              touch $out
+              runHook postInstall
+            '';
+          };
+
+          # JIT smoke: cross-compile a dummy HIP kernel plus the real gr_mix.hip
+          # with the same compiler env the serve wrappers set. Pure
+          # cross-compilation (--genco --offload-arch): no GPU/KFD needed, so
+          # this runs on any CI runner. Catches a missing HIP_DEVICE_LIB_PATH
+          # (Trap 4: "cannot find ROCm device library") or missing sysincludes
+          # ("Could not find standard C++ header") without ever serving.
+          # The wrapper grep pins the two vars to kyojinServe so they cannot
+          # silently drift apart from what is tested here.
+          checks.kyojin-hipcc-smoke = pkgs.stdenv.mkDerivation {
+            pname = "kyojin-hipcc-smoke";
+            version = "0";
+            src = ./.;
+            dontBuild = true;
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
+              export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes}"
+              printf '__global__ void dummy() {}\n' > dummy.hip
+              "${rocmSdk}/bin/hipcc" --genco --offload-arch=gfx1151 -O3 -o dummy.hsaco dummy.hip
+              test -s dummy.hsaco
+              "${rocmSdk}/bin/hipcc" --genco --offload-arch=gfx1151 -O3 -ffp-contract=off \
+                -o gr_mix.hsaco exllamav3/modules/gr_fn/gr_mix.hip
+              test -s gr_mix.hsaco
+              for flavor in glm mimo qwen; do
+                grep -q HIP_DEVICE_LIB_PATH ${kyojinServe}/bin/kyojin-serve-$flavor
+                grep -q HIPCC_COMPILE_FLAGS_APPEND ${kyojinServe}/bin/kyojin-serve-$flavor
+              done
               runHook postCheck
             '';
             installPhase = ''
