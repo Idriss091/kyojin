@@ -109,6 +109,11 @@ exllamav3 = [
     "conversion/standard_cal_data/*.utf8",
     "exllamav3_ext/**/*",
     "**/*.hip",
+    # CPU bounds-proof markers (e.g. attention_fn/qsa_proof/*.ok):
+    # require_proof() reads them next to the installed module; without
+    # them every install falls back to the Triton pair (same class of
+    # bug as the missing .hip kernels).
+    "**/*.ok",
 ]
 
 [tool.setuptools.dynamic]
