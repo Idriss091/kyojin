@@ -145,7 +145,10 @@ if is_rocm:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from exllamav3.util.arch_list import maybe_set_arch_list_env
         maybe_set_arch_list_env()
-    except (ImportError, RuntimeError):
+    except ImportError:
+        # Minimal build envs (uv lock, PEP 517 metadata) lack torch/numpy,
+        # so detection is skipped there; anything else (e.g. RuntimeError
+        # from arch detection) fails loudly instead of building blind.
         pass
 if _get_sources is not None:
     sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
