@@ -343,6 +343,8 @@ class ResidentEngine:
         if not 1 <= sessions <= MAX_SESSIONS:
             raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
         self.sessions = sessions
+        self.row_budget = 0   # set by --row-budget (sessions > 1)
+        self.max_draft = num_draft
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
@@ -353,11 +355,14 @@ class ResidentEngine:
                            max_history=max_history)
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
-        self.draft_model = Model.from_config(self.config, component="mtp")
-        self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                 max_history=max_history)
-        startup_health.stage("drafter weights")
-        self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        if num_draft > 0:
+            self.draft_model = Model.from_config(self.config, component="mtp")
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
+                                     max_history=max_history)
+            startup_health.stage("drafter weights")
+            self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        else:   # --num-draft 0: plain decode, no drafter
+            self.draft_model = self.draft_cache = None
         self.vision = None
         self.emb_cache = ImageEmbeddingCache()
         if vision:
@@ -365,7 +370,7 @@ class ResidentEngine:
         self.supports_vision = self.vision is not None
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
+            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft or None,
             record_draft_stats=True)
         # n1f2: one drafted token, fused catch-up variant 2. One Generator only: a second one over the
         # same Cache takes ownership and breaks the first. Sampling also goes through MTP: a draft is
@@ -539,6 +544,9 @@ class ResidentEngine:
                 if not self._cmds:
                     await self._wake.wait()
                 continue
+            if self.row_budget and generator.draft_model is not None:
+                # verify rows per round = busy sessions x (depth + 1): keep them within the budget (depth >= 1)
+                generator.num_draft_tokens = max(1, min(self.max_draft, self.row_budget // generator.num_remaining_jobs() - 1))
             try:
                 events = await loop.run_in_executor(None, lambda: list(generator.iterate()))
             except Exception as exc:                                  # noqa: BLE001
@@ -1140,6 +1148,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
     parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
+    parser.add_argument("--row-budget", type=int, default=0,
+                        help="sessions > 1: cap verify rows per round (busy sessions x (draft depth + 1)) by lowering the draft depth, never below 1; 0 = off")
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
@@ -1184,8 +1194,9 @@ def main() -> None:
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
-        engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft,
+        engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
                               vision=not args.no_vision, sessions=args.sessions)
+        engine.row_budget = args.row_budget if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
@@ -1214,7 +1225,7 @@ def main() -> None:
                 print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
                 print(mem_line("primed"), flush=True)
         from exllamav3.generator.slot_store import SlotStore
-        engine.slot_store = SlotStore(engine.greedy_generator, [engine.cache, engine.draft_cache],
+        engine.slot_store = SlotStore(engine.greedy_generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                       args.slot_save_path, args.model_id)
         if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
