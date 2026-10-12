@@ -601,5 +601,122 @@ class ImageEmbeddingReuseTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class SessionsTests(unittest.TestCase):
+    """--sessions N: the app runs N requests at once; the engine driver routes one shared Generator's events."""
+    template = ServeTests.template
+
+    def test_requests_overlap_and_slot_action_waits_for_them(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            sessions = 3
+            live = 0
+            peak = 0
+
+            async def generate(self, prompt, stats=None, **kw):
+                Slow.live += 1
+                Slow.peak = max(Slow.peak, Slow.live)
+                try:
+                    await asyncio.sleep(0.3)
+                    stats.update({"new_tokens": 1, "prompt_tokens": 2})
+                    yield "ok"
+                finally:
+                    Slow.live -= 1
+
+        class Store:
+            busy = False
+            seen_live = None
+
+            def slots(self):
+                return []
+
+            def erase(self):
+                Store.seen_live = Slow.live
+                return {"id_slot": 0, "n_erased": 0}
+
+        async def check():
+            eng = Slow("x")
+            eng.slot_store = Store()
+            client = TestClient(TestServer(serve.create_app(eng, "m", self.template)))
+            await client.start_server()
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            reqs = [asyncio.create_task(client.post("/v1/chat/completions", json=body)) for _ in range(4)]
+            await asyncio.sleep(0.15)
+            act = await client.post("/slots/0?action=erase")
+            res = [await r for r in reqs]
+            out = ([r.status for r in res], act.status)
+            await client.close()
+            return out
+
+        statuses, act = run(check())
+        self.assertEqual(statuses, [200] * 4)
+        self.assertEqual(act, 200)
+        self.assertEqual(Slow.peak, 3)          # 4 requests, 3 sessions
+        self.assertEqual(Store.seen_live, 0)    # the slot action ran with no request inside generate()
+
+    def test_driver_routes_events_by_serial_and_cancel_keeps_the_others(self):
+        class Job:
+            serial_number = None
+
+            def __init__(self, n):
+                self.n = n
+
+        class Gen:
+            def __init__(self):
+                self.active_jobs, self.pending_jobs, self.k, self.cancelled = [], [], 0, []
+
+            def enqueue(self, job):
+                job.serial_number = len(self.active_jobs) + len(self.cancelled) + 100
+                self.active_jobs.append(job)
+                return job.serial_number
+
+            def num_remaining_jobs(self):
+                return len(self.active_jobs) + len(self.pending_jobs)
+
+            def cancel(self, job):
+                self.active_jobs.remove(job)
+                self.cancelled.append(job)
+
+            def clear_queue(self):
+                self.active_jobs.clear()
+
+            def iterate(self):
+                self.k += 1
+                out = []
+                for j in list(self.active_jobs):
+                    ev = {"serial": j.serial_number, "text": f"{j.n}.{self.k} "}
+                    if self.k >= j.n:
+                        ev["eos"] = True
+                        ev["new_tokens"] = self.k
+                        self.active_jobs.remove(j)
+                    out.append(ev)
+                return out
+
+        async def check():
+            eng = object.__new__(serve.ResidentEngine)
+            eng.sessions, eng.greedy_generator = 2, Gen()
+
+            async def one(n, cancel=None):
+                st, txt = {}, []
+                async for piece in eng._run_shared(Job(n), type("T", (), {"numel": lambda self: 1})(), cancel, st, 0.0, None):
+                    txt.append(piece)
+                return "".join(txt), st
+
+            stop = asyncio.Event()
+            a = asyncio.create_task(one(2))
+            b = asyncio.create_task(one(50, stop))
+            ra = await a
+            stop.set()
+            rb = await b
+            return ra, rb, eng.greedy_generator
+
+        (ta, sa), (tb, sb), gen = run(check())
+        self.assertEqual(ta, "2.1 2.2 ")
+        self.assertEqual(sa["new_tokens"], 2)
+        self.assertTrue(tb.startswith("50.1 ") and "eos" not in sb)
+        self.assertEqual(gen.num_remaining_jobs(), 0)   # the cancelled job left the Generator
+        self.assertEqual(len(gen.cancelled), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

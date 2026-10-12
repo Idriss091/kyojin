@@ -6,6 +6,7 @@ import traceback
 import argparse
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import os
@@ -319,12 +320,15 @@ def load_image(url: str) -> tuple[Any, str]:
         raise _bad(f"cannot decode image: {exc}") from exc
 
 
+MAX_SESSIONS = 16   # Cache default max_batch_size (recurrent state slots)
+
+
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True):
+                 vision: bool = True, sessions: int = 1):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -333,6 +337,12 @@ class ResidentEngine:
         self.torch = torch
         self.Job = Job
         self.num_draft = num_draft
+        # Concurrent requests batched through the one Generator. The recurrent (KDA) state has Cache.max_batch_size = 16
+        # slots whatever the value (the Cache default, allocated in every case), so up to MAX_SESSIONS sessions cost no
+        # extra state memory; the paged KV pool (ctx + 4096 tokens) is shared by all sessions.
+        if not 1 <= sessions <= MAX_SESSIONS:
+            raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
+        self.sessions = sessions
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
@@ -402,8 +412,9 @@ class ResidentEngine:
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None) -> AsyncIterator[str]:
-        """Yield incremental decoded text. Caller serializes access to this method.
+                       images: list | None = None, stats: dict | None = None) -> AsyncIterator[str]:
+        """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
+        sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
         prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
@@ -414,7 +425,10 @@ class ResidentEngine:
         probe = getattr(self, "rss_probe", None)
         embs = []
         if images:
-            embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+            if self.sessions > 1:   # the tower must not run next to a Generator step: run it on the driver, between steps
+                embs = await self._post(self._embed, images)
+            else:
+                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
             for emb in embs:
                 prompt = prompt.replace(IMAGE_TRIPLE, emb.text_alias, 1)
             ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
@@ -438,6 +452,10 @@ class ResidentEngine:
         conditions = list(self.config.eos_token_id_list) + stop
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
                        stop_conditions=conditions, embeddings=embs or None)
+        if self.sessions > 1:
+            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe):
+                yield piece
+            return
         generator.enqueue(job)
         loop = asyncio.get_running_loop()
         try:
@@ -464,6 +482,125 @@ class ResidentEngine:
             # a leftover job would run inside the next request.
             if generator.num_remaining_jobs():
                 generator.clear_queue()
+
+    # Shared mode (sessions > 1). One driver task is the only code that touches the Generator: it runs queued commands
+    # (enqueue, cancel, image tower, slot actions) between two iterate() calls and routes the events of each step to the
+    # request that owns the job (by serial number).
+
+    def _post(self, fn, *args) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        if getattr(self, "_driver", None) is None or self._driver.get_loop() is not loop:
+            self._cmds, self._routes, self._wake = [], {}, asyncio.Event()
+            self._driver = loop.create_task(self._drive())
+        elif self._driver.done():
+            exc = None if self._driver.cancelled() else self._driver.exception()
+            if exc is None:
+                raise RuntimeError("the engine driver has stopped")
+            print(f"serve: WARNING the engine driver crashed ({exc!r}); starting a new one", file=sys.stderr, flush=True)
+            self._driver = loop.create_task(self._drive())
+        fut = loop.create_future()
+        self._cmds.append((fn, args, fut))
+        self._wake.set()
+        return fut
+
+    async def _drive(self) -> None:
+        try:
+            await self._drive_loop()
+        finally:   # cancelled or crashed: nothing will answer the waiting requests any more, so fail them now
+            stopped = RuntimeError("the engine driver has stopped")
+            for _, _, fut in self._cmds:
+                if not fut.done():
+                    fut.set_exception(stopped)
+            self._cmds.clear()
+            for q in self._routes.values():
+                q.put_nowait(stopped)
+            self._routes.clear()
+
+    async def _drive_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        generator = self.greedy_generator
+        while True:
+            while self._cmds:
+                fn, args, fut = self._cmds.pop(0)
+                try:
+                    res = await loop.run_in_executor(None, fn, *args)
+                except asyncio.CancelledError:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("the engine driver has stopped"))
+                    raise
+                except Exception as exc:                              # noqa: BLE001
+                    if not fut.done():
+                        fut.set_exception(exc)
+                else:
+                    if not fut.done():
+                        fut.set_result(res)
+            if not generator.num_remaining_jobs():
+                self._wake.clear()
+                if not self._cmds:
+                    await self._wake.wait()
+                continue
+            try:
+                events = await loop.run_in_executor(None, lambda: list(generator.iterate()))
+            except Exception as exc:                                  # noqa: BLE001
+                # a failed step leaves every job in an unknown state: fail them all
+                for q in self._routes.values():
+                    q.put_nowait(exc)
+                self._routes.clear()
+                generator.clear_queue()
+                continue
+            by_serial: dict[int, list] = {}
+            for ev in events:
+                by_serial.setdefault(ev.get("serial"), []).append(ev)
+            for serial, evs in by_serial.items():
+                q = self._routes.get(serial)
+                if q is not None:      # None: cancelled after the step started
+                    q.put_nowait(evs)
+
+    async def _run_shared(self, job, ids, cancel, stats: dict, t0: float, probe) -> AsyncIterator[str]:
+        """One request's job in the shared Generator: enqueue on the driver, stream its events, and (whatever way this
+        ends) remove the job, so no leftover job runs inside another request."""
+        q: asyncio.Queue = asyncio.Queue()
+        generator = self.greedy_generator
+
+        def enqueue():
+            self._routes[generator.enqueue(job)] = q   # on the driver: no step can emit before the route exists
+        await self._post(enqueue)
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return
+                try:
+                    item = await asyncio.wait_for(q.get(), 0.25)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(item, Exception):
+                    raise item
+                for event in item:
+                    if event.get("error"):
+                        raise RuntimeError(str(event["error"]))
+                    text = event.get("text", "")
+                    if text:
+                        yield text
+                    if event.get("eos"):
+                        stats.update(event)
+                        self.last_stats = stats
+                        if probe is not None:
+                            probe.request(int(ids.numel()), int(event.get("new_tokens", 0)), time.perf_counter() - t0)
+                        return
+        finally:
+            def forget():
+                serial = job.serial_number
+                if self._routes.get(serial) is q:
+                    del self._routes[serial]
+                for j in generator.active_jobs + generator.pending_jobs:
+                    if j is job:
+                        generator.cancel(j)
+            if not self._driver.done():
+                await asyncio.shield(self._post(forget))
+
+    async def run_exclusive(self, fn, *args):
+        """Run fn on the driver, between steps (slot save/restore; the caller has drained the requests)."""
+        return await self._post(fn, *args)
 
 
 def warmup(engine: Any, template: str, prompt_tokens: int = 4608, decode_tokens: int = 16) -> float:
@@ -596,7 +733,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
+    sessions = int(getattr(engine, "sessions", 1))
+    gate = asyncio.Semaphore(sessions)   # sessions > 1: one permit per running request; slot actions take them all
+    slot_lock = asyncio.Lock()           # sessions > 1: one slot action at a time
     processing = 0  # admitted requests; closure, app config is immutable after startup
+    running = 0     # sessions > 1: requests inside generate()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
@@ -623,8 +764,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         return web.json_response({"object": "list", "data": [
             {"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]})
 
+    @contextlib.asynccontextmanager
+    async def exclusive():
+        """The generator is idle inside: sessions == 1 holds the lock; sessions > 1 waits for every running request."""
+        if sessions == 1:
+            async with lock:
+                yield
+            return
+        async with slot_lock:
+            got = 0
+            try:
+                for _ in range(sessions):
+                    await gate.acquire()
+                    got += 1
+                yield
+            finally:
+                for _ in range(got):
+                    gate.release()
+
     async def worker() -> None:
-        nonlocal processing
+        nonlocal processing, running
         while True:
             body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
@@ -635,17 +794,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
             try:
-                async with lock:
+                async with (lock if sessions == 1 else gate):
+                    running += 1
                     if store is not None:
                         store.busy = True
-                    engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
-                    async for delta in engine.generate(
-                        body["_prompt"],
-                        max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
-                        top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                        cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
-                        out.put_nowait(delta)
-                    request_stats.update(getattr(engine, "last_stats", None) or {})
+                    if sessions == 1:
+                        engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
+                    try:
+                        async for delta in engine.generate(
+                            body["_prompt"],
+                            max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
+                            top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
+                            cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {}),
+                            **({"stats": request_stats} if sessions > 1 else {})):
+                            out.put_nowait(delta)
+                    finally:
+                        running -= 1
+                        if sessions > 1 and store is not None:
+                            store.busy = running > 0
+                    if sessions == 1:
+                        request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     out.put_nowait(None)
@@ -653,15 +821,17 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 out.put_nowait(exc)
             finally:
                 processing -= 1
-                if store is not None:
+                if store is not None and sessions == 1:
                     store.busy = False
                 queue.task_done()
 
     async def start(_: web.Application) -> None:
-        app["worker_task"] = asyncio.create_task(worker())
+        app["worker_tasks"] = [asyncio.create_task(worker()) for _ in range(sessions)]
+        app["worker_task"] = app["worker_tasks"][0]
 
     async def close(app_: web.Application) -> None:
-        app_["worker_task"].cancel()
+        for t in app_["worker_tasks"]:
+            t.cancel()
 
     async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
@@ -919,7 +1089,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         action = request.query.get("action")
         body = await request.json() if request.can_read_body else {}
         try:
-            async with lock:
+            async with exclusive():
                 if action == "erase":
                     return web.json_response(store.erase())
                 if action not in ("save", "restore"):
@@ -970,6 +1140,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
     parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
+    parser.add_argument("--sessions", type=int, default=1,
+                        help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
+                             "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
@@ -985,6 +1158,13 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    if not 1 <= args.sessions <= MAX_SESSIONS:
+        parser.error(f"--sessions must be 1..{MAX_SESSIONS}")
+    if args.sessions > 1:
+        print(f"serve: --sessions {args.sessions}: up to {args.sessions} requests share the KV pool of -c {args.max_ctx} "
+              f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
+              f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
+              file=sys.stderr, flush=True)
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))
@@ -1005,7 +1185,7 @@ def main() -> None:
     startup_health.report_compiler()
     try:
         engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision)
+                              vision=not args.no_vision, sessions=args.sessions)
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
