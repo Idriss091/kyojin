@@ -326,6 +326,7 @@ MAX_SESSIONS = 16   # Cache default max_batch_size (recurrent state slots)
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
+    row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
                  vision: bool = True, sessions: int = 1):
