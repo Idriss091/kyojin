@@ -2,7 +2,7 @@
 
 One image per model: `kyojin-qwen`, `kyojin-glm`, `kyojin-mimo`. The three share every heavy layer (14.4 GB each on disk, one copy of the layers); only the last layer differs, and it only sets which defaults the image starts with. The model is never baked in: mount it on `/models`, or mount an empty folder and the image downloads the pack from the hub. The GPU is passed in as `/dev/kfd` and `/dev/dri`. Host requirements: a gfx1151 machine (Strix Halo, 128 GB) and the `amdgpu` kernel driver. No ROCm install is needed on the host.
 
-Status of each line below: "tested" means run on a Strix Halo machine with docker 29 on 06/10/2026 (Qwen pack, GLM pack, MiMo pack, local copies). "Untested" lines are marked.
+Status of each line below: "tested" means run on a Strix Halo machine with docker 29 (Qwen and GLM packs on 12/10/2026 with Kyojin 1.4; MiMo pack on 06/10/2026; local copies). "Untested" lines are marked.
 
 ## What the image contains
 
@@ -37,12 +37,12 @@ Measured (Qwen pack, 89 GB, 131072 context, docker 29, nothing else on the GPU):
 
 | Start | Time to ready |
 |---|---|
-| First start, empty cache volume | 370 s (kernels are compiled and cached) |
-| Second start, same cache volume | 93 s |
-| GLM pack, first start | 1213 s (dense GEMM tuning alone is 411 s) |
+| First start, empty cache volume | 566 s (kernels are compiled, the dense GEMM table is tuned, both are cached) |
+| Second start, same cache volume | 82 s |
+| GLM pack, first start | 813 s |
 | MiMo pack, first start | 130 s |
 
-A chat completion and a tool call (`tools` in the request, the answer carries `tool_calls`) worked on Qwen; GLM and MiMo were loaded and answered one completion. `docker stop` returns in 1 s (Qwen), 7 s (GLM), 2 s (MiMo); the exit code is 143 (SIGTERM) for Qwen and 0 for GLM and MiMo.
+A chat completion and a tool call (`tools` in the request, the answer carries `tool_calls`) worked on Qwen and on GLM; MiMo was loaded and answered one completion. `docker stop` returns in 1 s (Qwen), 10 s (GLM), 2 s (MiMo); the exit code is 143 (SIGTERM) for Qwen and 0 for GLM and MiMo.
 
 ### Keep the cache
 
@@ -107,7 +107,7 @@ The container port must be the port llama-swap picked (`-p ${PORT}:${PORT}`), so
             enable_thinking: false
 ```
 
-- `healthCheckTimeout`: llama-swap waits this long for `checkEndpoint`. Qwen needs 370 s the first time and 95 s afterwards, GLM about 1200 s the first time. Set 900 for Qwen and MiMo, 1800 for GLM, and warm the cache by hand once so that later starts are short.
+- `healthCheckTimeout`: llama-swap waits this long for `checkEndpoint`. Qwen needs about 570 s the first time and 85 s afterwards, GLM about 815 s the first time. Set 900 for Qwen and MiMo, 1800 for GLM, and warm the cache by hand once so that later starts are short.
 - `checkEndpoint: /v1/models` answers once the model is loaded.
 - `cmdStop`: SIGTERM stops the server in 1 to 7 s here; `-t 30` leaves room for a slower free of the GPU.
 - Context: `-c 262144` ran on the Qwen pack. GLM at 262144 is not tested. MiMo's memory is tight at 262144 on 128 GB and is not tested; its tested value is the default 131072.
