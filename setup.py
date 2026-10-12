@@ -2,7 +2,6 @@ import importlib.util
 import os
 import shutil
 import subprocess
-import sys
 
 from setuptools import setup
 
@@ -141,15 +140,25 @@ _get_sources = _load_get_sources()
 
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm:
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from exllamav3.util.arch_list import maybe_set_arch_list_env
-        maybe_set_arch_list_env()
-    except ImportError:
-        # Minimal build envs (uv lock, PEP 517 metadata) lack torch/numpy,
-        # so detection is skipped there; anything else (e.g. RuntimeError
-        # from arch detection) fails loudly instead of building blind.
-        pass
+    # NOTE (same as build_config above): a normal import of
+    # exllamav3.util.arch_list executes exllamav3/__init__.py, which needs
+    # the full runtime (numpy, tokenizers, ...) absent from minimal build
+    # envs, and along the way triggers ext.py's JIT load with torch's
+    # default flags. arch_list itself needs only torch, guaranteed present
+    # here, so load it by file path instead. No silent paths: anything
+    # unexpected (missing file, detection failure) raises.
+    _arch_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        library_dir, "util", "arch_list.py",
+    )
+    _arch_spec = importlib.util.spec_from_file_location(
+        "exllamav3_arch_list", _arch_path
+    )
+    if _arch_spec is None or _arch_spec.loader is None:
+        raise RuntimeError(f"Cannot load arch detection from {_arch_path}")
+    _arch_mod = importlib.util.module_from_spec(_arch_spec)
+    _arch_spec.loader.exec_module(_arch_mod)
+    _arch_mod.maybe_set_arch_list_env()
 if _get_sources is not None:
     sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 else:
