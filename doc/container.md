@@ -2,7 +2,7 @@
 
 One image per model: `kyojin-qwen`, `kyojin-glm`, `kyojin-mimo`. The three share every heavy layer (14.4 GB each on disk, one copy of the layers); only the last layer differs, and it only sets which defaults the image starts with. The model is never baked in: mount it on `/models`, or mount an empty folder and the image downloads the pack from the hub. The GPU is passed in as `/dev/kfd` and `/dev/dri`. Host requirements: a gfx1151 machine (Strix Halo, 128 GB) and the `amdgpu` kernel driver. No ROCm install is needed on the host.
 
-Status of each line below: "tested" means run on a Strix Halo machine with docker 29 (Qwen and GLM packs on 12/10/2026 with Kyojin 1.4; MiMo pack on 06/10/2026; local copies). The podman line was run on 13/10/2026 with podman 4.9 (Qwen pack). "Untested" lines are marked.
+Status of each line below: "tested" means run on a Strix Halo machine with docker 29 (Qwen and GLM packs on 13/10/2026 with Kyojin 1.5; MiMo pack on 06/10/2026; local copies). The podman line was run on 13/10/2026 with podman 4.9 (Qwen pack). "Untested" lines are marked.
 
 ## What the image contains
 
@@ -10,14 +10,14 @@ ROCm torch and `rocm-sdk-devel` from AMD's gfx1151 nightly index, the Kyojin tre
 
 ## Prebuilt images
 
-Nothing to build: the images of Kyojin 1.4 are on the GitHub registry (about 3 GB to download, 11 GB on disk).
+Nothing to build: the images of Kyojin 1.5 are on the GitHub registry (about 3 GB to download, 11 GB on disk).
 
 ```bash
-docker pull ghcr.io/yamz-labs/kyojin-qwen:1.4     # or podman pull
-docker pull ghcr.io/yamz-labs/kyojin-glm:1.4
+docker pull ghcr.io/yamz-labs/kyojin-qwen:1.5     # or podman pull
+docker pull ghcr.io/yamz-labs/kyojin-glm:1.5
 ```
 
-Then use `ghcr.io/yamz-labs/kyojin-qwen:1.4` in place of `kyojin-qwen` (or `localhost/kyojin-qwen`) in the run lines below. The MiMo image is not published: build it with the line below.
+Then use `ghcr.io/yamz-labs/kyojin-qwen:1.5` in place of `kyojin-qwen` (or `localhost/kyojin-qwen`) in the run lines below. The MiMo image is not published: build it with the line below.
 
 ## Build (tested)
 
@@ -57,7 +57,7 @@ A chat completion and a tool call (`tools` in the request, the answer carries `t
 
 ### Keep the cache
 
-The cache holds compiled HIP/Triton kernels and, for GLM, the dense GEMM tuning table. It must outlive the container, or every start pays the full first-start time again, and GLM's 20 minutes may exceed a supervisor timeout. In order: a volume on `/root/.cache` (as above); else a hidden folder `.kyojin-cache` inside `/models` if it is mounted writable; `KYOJIN_CACHE_DIR=/some/folder` forces a folder. Warm the cache once by hand before you put the model behind a supervisor.
+The cache holds compiled HIP/Triton kernels and, for GLM, the dense GEMM tuning table. It must outlive the container, or every start pays the full first-start time again, and Qwen's 10 minutes may exceed a supervisor timeout. In order: a volume on `/root/.cache` (as above); else a hidden folder `.kyojin-cache` inside `/models` if it is mounted writable; `KYOJIN_CACHE_DIR=/some/folder` forces a folder. Warm the cache once by hand before you put the model behind a supervisor.
 
 ### No pack yet
 
@@ -118,7 +118,7 @@ The container port must be the port llama-swap picked (`-p ${PORT}:${PORT}`), so
             enable_thinking: false
 ```
 
-- `healthCheckTimeout`: llama-swap waits this long for `checkEndpoint`. Qwen needs about 570 s the first time and 85 s afterwards, GLM about 815 s the first time. Set 900 for Qwen and MiMo, 1800 for GLM, and warm the cache by hand once so that later starts are short.
+- `healthCheckTimeout`: llama-swap waits this long for `checkEndpoint`. Qwen needs about 600 s the first time and 95 s afterwards, GLM about 95 s the first time and 65 s afterwards. Set 900 for Qwen and MiMo, 300 for GLM, and warm the cache by hand once so that later starts are short.
 - `checkEndpoint: /v1/models` answers once the model is loaded.
 - `cmdStop`: SIGTERM stops the server in 1 to 7 s here; `-t 30` leaves room for a slower free of the GPU.
 - Context: `-c 262144` ran on the Qwen pack. GLM at 262144 is not tested. MiMo's memory is tight at 262144 on 128 GB and is not tested; its tested value is the default 131072.
