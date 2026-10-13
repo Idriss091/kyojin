@@ -77,7 +77,7 @@ classes for the shapes the file already holds, and it only ever writes the unpad
 key, while the serving path uses the padded-A variant for most EXL3 linears — so on an empty file the
 600 s it spends buy almost nothing for the first requests. `tools/strix_halo/prime_dense_tune.sh`
 closes both gaps: it is a thin wrapper that activates the venv, sets `EXL3_ROCM_SDK`, sources
-`tools/strix_halo/env.sh` (the same environment `run_kyojin.sh` uses) and runs `prime_dense_tune.py`
+`tools/strix_halo/env.sh` (the same environment the servers use) and runs `prime_dense_tune.py`
 with every argument passed through.
 
 ```bash
