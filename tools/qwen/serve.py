@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import gc
 import importlib.util
 import io
@@ -40,6 +41,7 @@ sys.path.insert(0, str(HERE))
 sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
+import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 
 
 def _load_mimo():
@@ -64,6 +66,7 @@ FALLBACK_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "top_k":
 # Thinking effort when a request names none. The model's own template defines xhigh and low only;
 # chat_template.jinja next to this file is that template plus a medium level.
 DEFAULT_EFFORT = "medium"
+_UNKNOWN_SALT = object()   # cache namespace after a failed reset: the next request resets again
 NO_CTX_REPLY = 32768  # reply budget when the engine reports no context length
 DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 # OpenAI effort names -> the Qwen template names (xhigh, medium, low).
@@ -673,6 +676,7 @@ class QwenEngine:
                 self.vision = None
                 print(f"qserve: vision tower not loaded ({exc!r}); image input disabled", flush=True)
         self.supports_vision = self.vision is not None
+        self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
         startup_health.stage("engine setup")
         self._ngram_resident()
         self.generator = self.uninstall = None
@@ -740,6 +744,17 @@ class QwenEngine:
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
+
+    def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
+        return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
+
+    async def reset_prefix_cache(self) -> None:
+        """Forget every cached prompt prefix (page table, recurrent checkpoints, n-gram index): a fresh Generator, the path
+        cache_prompt=false takes. The caller has drained the requests (cache_salt namespace change)."""
+        await self._post(self._build, self.spec_on)
+        if self.slot_store is not None:
+            self.slot_store.erase()
 
     def token_str(self, token_id: int) -> str:
         return self.tokenizer.tokenizer.decode([int(token_id)], skip_special_tokens=False)
@@ -924,7 +939,7 @@ class QwenEngine:
                         cancel: asyncio.Event | None = None, seed: int | None = None, reasoning_first: bool = False,
                         thinking_budget: int | None = None, loop_guard: bool | None = None,
                         loop_final: bool | None = None, logprobs: int | None = None, stats: dict[str, Any],
-                        _mine: list) -> AsyncIterator[str]:
+                        prompt_ids: list[int] | None = None, ignore_eos: bool = False, _mine: list) -> AsyncIterator[str]:
         """Yield decoded text pieces. Final stats land in `stats`. Every job enqueued is appended to `_mine`.
 
         Final check (on with the guard, loop_final=False turns it off): when the turn ends normally and the visible text
@@ -944,7 +959,10 @@ class QwenEngine:
         want_spec = bool(speculative) and self.draft_model is not None
         if want_spec != self.spec_on or not cache_prompt:
             await self._post(self._build, want_spec)
-        ids, embs = await self._post(self._encode, prompt, images or [])
+        if prompt_ids is not None:   # token-id prompt: exactly these ids, no template, no BOS, no re-encoding
+            ids, embs = self.torch.tensor([prompt_ids], dtype=self.torch.long), []
+        else:
+            ids, embs = await self._post(self._encode, prompt, images or [])
         ctx = getattr(self, "ctx", None)
         if ctx:   # the chat handler counted a picture as one token; its embeddings take many
             room = reply_room(ctx, int(ids.numel()), int(getattr(self.generator, "num_draft_tokens", 0)))
@@ -975,7 +993,7 @@ class QwenEngine:
 
         while True:
             job = self.Job(input_ids=job_ids, max_new_tokens=max(max_tokens - generated + discount, 1),
-                           sampler=self._sampler(sampling), stop_conditions=self.eos + list(stop),
+                           sampler=self._sampler(sampling), stop_conditions=([] if ignore_eos else self.eos) + list(stop),
                            embeddings=embs or None, decode_special_tokens=True, seed=seed,
                            **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
             _mine.append(job)
@@ -1184,7 +1202,7 @@ def format_logprobs(entries: list, token_ids: list[int], token_str, chat: bool) 
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
 
 
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
@@ -1196,6 +1214,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     gate = asyncio.Semaphore(sessions)   # one permit per running request; slot actions take them all (drain)
     lock = asyncio.Lock()                # serializes the slot actions
     running = 0
+    salt_state: dict[str, Any] = {"current": None}   # cache_salt namespace of the prompt cache (None = requests without a salt)
+    admit_lock = asyncio.Lock()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, defaults=defaults)
 
@@ -1212,6 +1232,35 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision), **startup_health.compiler_health(),
                                   **(engine.spec_stats() if hasattr(engine, "spec_stats") else {})})
 
+    @contextlib.asynccontextmanager
+    async def admit(salt: str | None):
+        """One running-request permit. Every running request shares one cache_salt namespace: when the salt changes, the
+        requests in flight finish, the prompt cache is dropped (engine.reset_prefix_cache) and the new request starts alone.
+        The same salt (and traffic with no salt at all) never drops anything."""
+        async with admit_lock:
+            if salt == salt_state["current"]:
+                await gate.acquire()
+            else:
+                async with lock:
+                    held = 0
+                    try:
+                        for _ in range(sessions):
+                            await gate.acquire()
+                            held += 1
+                        salt_state["current"] = _UNKNOWN_SALT        # a failed reset must not leave the old namespace claimed
+                        await engine.reset_prefix_cache()
+                        salt_state["current"] = salt
+                    except BaseException:
+                        for _ in range(held):
+                            gate.release()
+                        raise
+                    for _ in range(held - 1):                        # keep the permit of this request
+                        gate.release()
+        try:
+            yield
+        finally:
+            gate.release()
+
     async def worker() -> None:
         nonlocal running
         while True:
@@ -1219,13 +1268,15 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             store = getattr(engine, "slot_store", None)
             stats: dict[str, Any] = {}
             try:
-                async with gate:
+                async with admit(job.get("cache_salt")):
                     running += 1
                     if store is not None:
                         store.busy = True
                     try:
                         async for delta in engine.generate(
                                 job["prompt"], stats=stats, max_tokens=job["max_tokens"], sampling=job["sampling"],
+                                **({"prompt_ids": job["prompt_ids"]} if job.get("prompt_ids") is not None else {}),
+                                **({"ignore_eos": True} if job.get("ignore_eos") else {}),
                                 stop=job["stop"], images=job["images"], speculative=job["speculative"],
                                 cache_prompt=job["cache_prompt"], cancel=job["cancel"],
                                 seed=job.get("seed"), reasoning_first=job.get("reasoning_first", False),
@@ -1260,6 +1311,12 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         # no speculative mode to leave, so speculative=false changes nothing)
         if sessions > 1 and (not job["cache_prompt"] or (not job["speculative"] and getattr(engine, "spec_on", False))):
             raise BadRequest("speculative=false or cache_prompt=false needs a server started with --sessions 1")
+
+    def salt_of(body: dict[str, Any]) -> str | None:
+        salt = serve_compat.cache_salt(body)
+        if salt is not None and not hasattr(engine, "reset_prefix_cache"):
+            raise BadRequest("cache_salt is not supported by this engine")
+        return salt
 
     def prepare(body: Any) -> dict[str, Any]:
         """Validate a request and build the engine job. Raises BadRequest."""
@@ -1319,6 +1376,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                "reasoning_first": prompt.rstrip().endswith("<think>"), "tools": body.get("tools"),
                "return_token_ids": bool(body.get("return_token_ids")), "cancel": asyncio.Event()}
         check_sessions(job)
+        job["cache_salt"] = salt_of(body)
         return job
 
     async def completions(request: web.Request) -> web.StreamResponse:
@@ -1327,7 +1385,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             job = prepare(body)
         except json.JSONDecodeError as exc:
             return err(400, f"invalid JSON: {exc}")
-        except BadRequest as exc:
+        except (BadRequest, serve_compat.CompatError) as exc:
             return err(400, str(exc))
         request_id, created = f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
         base = {"id": request_id, "object": "chat.completion.chunk", "created": created, "model": model_id}
@@ -1476,6 +1534,39 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return err(400, str(exc))
         return web.json_response({"prompt": prompt})
 
+    async def tokenize(request: web.Request) -> web.Response:
+        """vLLM POST /tokenize: {prompt | messages, add_special_tokens?} -> {tokens, count, max_model_len}."""
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise BadRequest("body must be a JSON object")
+            if body.get("model", model_id) != model_id:
+                raise BadRequest(f"unknown model; expected {model_id}")
+            if not hasattr(engine, "encode_ids"):
+                return err(501, "this engine cannot tokenize")
+            add_special = body.get("add_special_tokens")
+            if add_special is not None and not isinstance(add_special, bool):
+                raise BadRequest("add_special_tokens must be boolean")
+            if body.get("messages") is not None:
+                if not isinstance(body["messages"], list) or not body["messages"]:
+                    raise BadRequest("messages must be a non-empty array")
+                if extract_images(body["messages"]):
+                    raise BadRequest("images cannot be tokenized here")
+                text = render_prompt(template, normalize_messages(body["messages"]), body.get("tools"),
+                                     **resolve_template_kwargs(body, defaults))
+                add_special = bool(add_special)          # a rendered chat prompt carries its own special tokens
+            else:
+                text = body.get("prompt")
+                if not isinstance(text, str):
+                    raise BadRequest("prompt must be a string (or send messages)")
+                add_special = True if add_special is None else add_special
+            ids = engine.encode_ids(text, add_special)
+        except json.JSONDecodeError as exc:
+            return err(400, f"invalid JSON: {exc}")
+        except (BadRequest, ValueError, TypeError, KeyError, AttributeError, jinja2.TemplateError) as exc:
+            return err(400, str(exc))
+        return web.json_response(serve_compat.tokenize_reply(ids, getattr(engine, "ctx", None)))
+
     async def completion(request: web.Request) -> web.Response:
         """Minimal llama.cpp POST /completion: prompt used verbatim (no template), same queue and generator."""
         try:
@@ -1541,10 +1632,16 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             if body.get("model", model_id) != model_id:
                 raise BadRequest(f"unknown model; expected {model_id}")
             prompt = body.get("prompt")
-            if isinstance(prompt, list) and len(prompt) == 1:
-                prompt = prompt[0]
-            if not isinstance(prompt, str) or not prompt:
-                raise BadRequest("prompt must be a non-empty string (one prompt per request)")
+            prompt_ids = serve_compat.token_prompt(prompt, getattr(engine, "vocab_size", None))
+            if prompt_ids is not None:
+                prompt = ""
+            else:
+                if isinstance(prompt, list) and len(prompt) == 1:
+                    prompt = prompt[0]
+                if not isinstance(prompt, str) or not prompt:
+                    raise BadRequest("prompt must be a non-empty string or a list of token ids (one prompt per request)")
+            if body.get("ignore_eos") is not None and not isinstance(body["ignore_eos"], bool):
+                raise BadRequest("ignore_eos must be boolean")
             if body.get("n") not in (None, 1) or body.get("echo") or body.get("best_of") not in (None, 1):
                 raise BadRequest("n, best_of and echo are not supported")
             if "stream" in body and not isinstance(body["stream"], bool):
@@ -1566,20 +1663,21 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             lp = logprobs_arg(body.get("logprobs"))
             if lp is not None and body.get("stream"):
                 raise BadRequest("logprobs are returned on non-streaming requests only")
-            prompt_tokens = engine.count_tokens(prompt)
+            prompt_tokens = len(prompt_ids) if prompt_ids is not None else engine.count_tokens(prompt)
             ctx = getattr(engine, "ctx", None)
             if ctx:
                 room = reply_room(ctx, prompt_tokens, draft_window(engine, body.get("speculative", True) is not False))
                 if room < 1:
                     raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
                 max_tokens = min(max_tokens, room)
-            job = {"logprobs": lp, "prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
+            job = {"cache_salt": salt_of(body), "prompt_ids": prompt_ids, "ignore_eos": body.get("ignore_eos") is True,
+                   "logprobs": lp, "prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
                    "sampling": sampling_from(body, defaults), "cache_prompt": body.get("cache_prompt", True) is not False,
                    "loop_guard": body.get("loop_guard"), "cancel": asyncio.Event()}
             check_sessions(job)
         except json.JSONDecodeError as exc:
             return err(400, f"invalid JSON: {exc}")
-        except BadRequest as exc:
+        except (BadRequest, serve_compat.CompatError) as exc:
             return err(400, str(exc))
         request_id, created = f"cmpl-{uuid.uuid4().hex}", int(time.time())
 
@@ -1589,9 +1687,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 
         def reason_usage(stats: dict[str, Any], text: str):
             n_new = int(stats.get("new_tokens") or engine.count_tokens(text))
-            n_prompt = int(stats.get("prompt_tokens") or prompt_tokens)
+            n_prompt = prompt_tokens if prompt_ids is not None else int(stats.get("prompt_tokens") or prompt_tokens)
             reason = "length" if stats.get("eos_reason") == "max_new_tokens" else "stop"
-            return reason, {"prompt_tokens": n_prompt, "completion_tokens": n_new, "total_tokens": n_prompt + n_new}
+            return reason, serve_compat.usage(n_prompt, n_new, int(stats.get("cached_tokens") or 0))
 
         out: asyncio.Queue = asyncio.Queue()
         await queue.put((job, out))
@@ -1698,6 +1796,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
+    app.router.add_post("/tokenize", tokenize)
     app.router.add_post("/completion", completion)
     app.router.add_post("/v1/completions", v1_completions)
     if getattr(engine, "slot_store", None) is not None:

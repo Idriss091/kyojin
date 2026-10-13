@@ -718,5 +718,160 @@ class SessionsTests(unittest.TestCase):
         self.assertEqual(len(gen.cancelled), 1)
 
 
+class VllmCompatTests(unittest.TestCase):
+    """POST /tokenize, /v1/completions with token-id prompts, cache_salt (model-free: fake engine)."""
+    template = ServeTests.template
+
+    class Eng(FakeEngine):
+        vocab_size = 1000
+        ctx = 4096
+
+        def __init__(self, output="abc", sessions=1, delay=0.0):
+            super().__init__(output)
+            self.sessions, self.delay, self.resets, self.active, self.calls = sessions, delay, [], 0, []
+
+        def encode_ids(self, text, add_special_tokens=False):
+            return ([0] if add_special_tokens else []) + [len(w) for w in text.split()]
+
+        async def reset_prefix_cache(self):
+            self.resets.append(self.active)
+            await asyncio.sleep(self.delay)
+
+        async def generate(self, prompt, stats=None, **kw):
+            self.active += 1
+            self.calls.append((prompt, kw))
+            try:
+                await asyncio.sleep(self.delay)
+                st = {"cached_tokens": 99, "new_tokens": 3, "prompt_tokens": 3, "eos_reason": "max_new_tokens"}
+                self.last_stats = st
+                if stats is not None:
+                    stats.update(st)
+                for ch in self.output:
+                    yield ch
+            finally:
+                self.active -= 1
+
+    def call(self, engine, requests):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def go():
+            client = TestClient(TestServer(serve.create_app(engine, "m", self.template)))
+            await client.start_server()
+            try:
+                out = []
+                for path, payload in requests:
+                    r = await client.post(path, json=payload)
+                    out.append((r.status, await r.json() if r.content_type == "application/json" else await r.text()))
+                return out
+            finally:
+                await client.close()
+        return run(go())
+
+    def one(self, engine, path, payload):
+        return self.call(engine, [(path, payload)])[0]
+
+    def test_tokenize_reply_shape_and_errors(self):
+        eng = self.Eng()
+        self.assertEqual(self.one(eng, "/tokenize", {"model": "m", "prompt": "ab cde f", "add_special_tokens": False}),
+                         (200, {"count": 3, "max_model_len": 4096, "tokens": [2, 3, 1], "token_strs": None}))
+        self.assertEqual(self.one(eng, "/tokenize", {"prompt": "ab"})[1]["tokens"], [0, 2])
+        self.assertEqual(self.one(eng, "/tokenize", {"messages": [{"role": "user", "content": "hi"}]})[0], 200)
+        for payload in ({"model": "other", "prompt": "x"}, {"prompt": 5}, {}, {"prompt": "x", "add_special_tokens": "no"}):
+            self.assertEqual(self.one(eng, "/tokenize", payload)[0], 400, payload)
+        self.assertEqual(self.one(FakeEngine("x"), "/tokenize", {"prompt": "x"})[0], 501)
+
+    def test_token_id_prompt_reaches_the_engine_untouched(self):
+        for prompt in ([5, 6, 7, 8], [[5, 6, 7, 8]]):
+            eng = self.Eng()
+            st, body = self.one(eng, "/v1/completions", {"model": "m", "prompt": prompt, "max_tokens": 8, "ignore_eos": True,
+                                                         "temperature": 0.0, "add_special_tokens": False, "cache_salt": "s"})
+            self.assertEqual(st, 200)
+            kw = eng.calls[0][1]
+            self.assertEqual((kw["prompt_ids"], kw["ignore_eos"], kw["max_tokens"]), ([5, 6, 7, 8], True, 8))
+            self.assertEqual(body["usage"]["prompt_tokens"], 4)
+            self.assertEqual(body["usage"]["prompt_tokens_details"], {"cached_tokens": 4})   # engine said 99: clamped
+            self.assertEqual((body["choices"][0]["text"], body["choices"][0]["finish_reason"]), ("abc", "length"))
+
+    def test_stream_ends_with_usage_and_done(self):
+        eng = self.Eng()
+        st, raw = self.one(eng, "/v1/completions", {"model": "m", "prompt": [1, 2, 3], "max_tokens": 8, "stream": True,
+                                                    "stream_options": {"include_usage": True}})
+        events = [json.loads(x[6:]) for x in raw.split("\n\n") if x.startswith("data: ") and "[DONE]" not in x]
+        self.assertEqual(st, 200)
+        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
+        self.assertEqual("".join(e["choices"][0]["text"] for e in events), "abc")
+        self.assertGreater(len([e for e in events if e["choices"][0]["text"]]), 1)    # streamed, not buffered
+        self.assertEqual(events[-1]["usage"]["prompt_tokens"], 3)
+        self.assertIn("cached_tokens", events[-1]["usage"]["prompt_tokens_details"])
+
+    def test_stop_string_cuts_text_and_stream(self):
+        eng = self.Eng("one two STOP three")
+        st, body = self.one(eng, "/v1/completions", {"model": "m", "prompt": "go", "stop": ["STOP"], "max_tokens": 50})
+        self.assertEqual((st, body["choices"][0]["text"], body["choices"][0]["finish_reason"]), (200, "one two ", "stop"))
+        st, raw = self.one(eng, "/v1/completions", {"model": "m", "prompt": "go", "stop": "STOP", "max_tokens": 50, "stream": True})
+        events = [json.loads(x[6:]) for x in raw.split("\n\n") if x.startswith("data: ") and "[DONE]" not in x]
+        self.assertEqual("".join(e["choices"][0]["text"] for e in events), "one two ")
+        self.assertEqual(events[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_validation(self):
+        eng = self.Eng()
+        for bad in ([-1], [1000], [1, True], [1, 2.5], [1, "a"], [[1], [2]], [], [[]]):
+            self.assertEqual(self.one(eng, "/v1/completions", {"model": "m", "prompt": bad})[0], 400, bad)
+        for extra in ({"ignore_eos": "yes"}, {"max_tokens": 0}, {"n": 2}, {"stream": "x"}, {"cache_salt": ""}, {"cache_salt": 3},
+                      {"model": "other"}):
+            self.assertEqual(self.one(eng, "/v1/completions", {"model": "m", "prompt": [1]} | extra)[0], 400, extra)
+        self.assertEqual(self.one(eng, "/v1/completions", {"model": "m", "prompt": [1] * 5000})[0], 400)
+        self.assertEqual(eng.calls, [])
+        self.assertEqual(self.one(FakeEngine("x"), "/v1/completions", {"model": "m", "prompt": "hi", "cache_salt": "a"})[0], 400)
+
+    def test_cache_salt_resets_only_when_the_namespace_changes(self):
+        for sessions in (1, 2):
+            eng = self.Eng(sessions=sessions)
+            reqs = [("/v1/completions", {"model": "m", "prompt": [1, 2], "max_tokens": 2} | ({} if s is None else {"cache_salt": s}))
+                    for s in (None, None, "a", "a", "a", "b", "a", None, None)]
+            self.assertEqual([c for c, _ in self.call(eng, reqs)], [200] * 9)
+            self.assertEqual(len(eng.resets), 4, sessions)          # None -> a, a -> b, b -> a, a -> None
+
+    def test_requests_without_a_salt_never_reset_and_chat_takes_a_salt(self):
+        eng = self.Eng()
+        chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        self.call(eng, [("/v1/completions", {"model": "m", "prompt": [1]}), ("/v1/chat/completions", chat)])
+        self.assertEqual(eng.resets, [])
+        res = self.call(eng, [("/v1/chat/completions", chat | {"cache_salt": s}) for s in ("x", "x", "y")])
+        self.assertEqual([c for c, _ in res], [200] * 3)
+        self.assertEqual(len(eng.resets), 2)
+
+    def test_chat_usage_reports_cached_tokens(self):
+        eng = self.Eng("hello")
+        st, body = self.one(eng, "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "one two three"}]})
+        usage = body["usage"]
+        self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": min(99, usage["prompt_tokens"])})
+
+    def test_salt_change_waits_for_the_running_requests(self):
+        eng = self.Eng(sessions=3, delay=0.05)
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def go():
+            client = TestClient(TestServer(serve.create_app(eng, "m", self.template)))
+            await client.start_server()
+            try:
+                def req(salt):
+                    return client.post("/v1/completions", json={"model": "m", "prompt": [1, 2], "cache_salt": salt})
+                return [r.status for r in await asyncio.gather(req("a"), req("a"), req("b"), req("b"), req("a"))]
+            finally:
+                await client.close()
+        self.assertEqual(run(go()), [200] * 5)
+        self.assertGreaterEqual(len(eng.resets), 2)
+        self.assertEqual(eng.resets, [0] * len(eng.resets))
+
+    def test_chat_template_kwargs_reach_the_template(self):
+        kw = serve.template_kwargs({"chat_template_kwargs": {"reasoning_effort": "low"}, "reasoning_effort": "high"})
+        self.assertEqual(kw["reasoning_effort"], "low")
+        self.assertEqual(serve.template_kwargs({"reasoning_effort": "high"})["reasoning_effort"], "high")
+        self.assertEqual(serve.template_kwargs({"chat_template_kwargs": {"clear_thinking": False}})["clear_thinking"], False)
+        with self.assertRaises(Exception):
+            serve.template_kwargs({"chat_template_kwargs": "x"})
+
+
 if __name__ == "__main__":
     unittest.main()

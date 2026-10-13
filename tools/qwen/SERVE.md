@@ -85,6 +85,15 @@ environment wins. The engine modules read several of these when they are importe
   forgets the prompt cache first (cold run), `"return_token_ids": true` adds the generated ids. Switching
   speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache (400 with `--sessions` > 1).
 
+- vLLM-style extensions (also used by the RigMark benchmark): `POST /tokenize` (`{"prompt"|"messages", "add_special_tokens"}` ->
+  `{"tokens", "count", "max_model_len"}`); `/v1/completions` takes `prompt` as a list of token ids (`[1, 2, 3]` or `[[1, 2, 3]]`):
+  the ids go to the model as sent (no template, no BOS), `usage.prompt_tokens` is their count, an id outside the vocabulary
+  answers 400, and `ignore_eos: true` keeps generating through the end-of-sequence token. `usage.prompt_tokens_details.cached_tokens`
+  is on every `/v1/completions` and chat answer. `cache_salt` (chat and completions, non-empty string): requests with different
+  salts never share prompt cache. The server keeps one salt namespace at a time (requests without a salt are one namespace):
+  when it changes, running requests finish, the prompt cache is dropped (a fresh Generator, as `cache_prompt: false` does), and the
+  request starts. The same salt, or no salt at all, never drops anything, so only the first request after a change pays the rebuild.
+
 ## Start-up progress on `/health`
 
 The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
@@ -150,7 +159,7 @@ The server prints this warning at start-up whenever N > 1, and a second one past
 
 ## Tests
 
-    python -m pytest tools/test_startup_health.py tools/qwen/test_serve.py tools/qwen/test_guard.py   # CPU, fake engine, no GPU (template test needs the pack)
+    python -m pytest tools/test_startup_health.py tools/test_serve_compat.py tools/qwen/test_serve.py tools/qwen/test_guard.py   # CPU, fake engine, no GPU (template test needs the pack)
     python tools/qwen/serve_check.py http://127.0.0.1:8000 out_dir      # live server: chat, thinking, tools, stream, image,
                                                                          # 3-turn cache, plain vs speculative, warm vs cold
 
