@@ -1,0 +1,7 @@
+.git
+.venv*
+build
+*.safetensors
+*.st
+__pycache__
+doc/container.md

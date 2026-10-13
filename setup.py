@@ -1,6 +1,7 @@
 import importlib.util
 import os
-import sys
+import shutil
+import subprocess
 
 from setuptools import setup
 
@@ -67,6 +68,40 @@ if torch and torch_version.hip:
         extra_cflags += ["-I" + dev_include]
         extra_cuda_cflags += ["-I" + dev_include]
 
+def _host_cxx_has_format():
+    # Probe whether the host C++ compiler ships a <format> header (GCC 13+).
+    # Older toolchains have no such header, where -include would itself be a
+    # fatal error, so the pre-include below only opts in when it exists.
+    # Harmless on toolchains whose <format> predates the __noinline__
+    # attribute use; required on libstdc++16+. Same compiler selection as
+    # torch's cpp_extension (CXX or the default); on any detection failure
+    # keep today's behavior (no flag).
+    cxx = os.environ.get("CXX", "c++")
+    if shutil.which(cxx) is None:
+        cxx = "g++"
+        if shutil.which(cxx) is None:
+            return False
+    try:
+        probe = subprocess.run(
+            [cxx, "-xc++", "-E", "-fsyntax-only", "-"],
+            input="#include <format>\n",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+if torch and torch_version.hip and _host_cxx_has_format():
+    # HIP's host_defines.h empties __host__/__device__/__noinline__ for host
+    # compilation, which breaks libstdc++16's <format> ([[__gnu__::__noinline__]]
+    # parses as an empty attribute name). Force <format> to parse first, before
+    # any HIP header can poison the macro state (pragma once protects later
+    # includes). Host-only: device TUs don't hit this path.
+    extra_cflags += ["-include", "format"]
+
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,
@@ -105,9 +140,25 @@ _get_sources = _load_get_sources()
 
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from exllamav3.util.arch_list import maybe_set_arch_list_env
-    maybe_set_arch_list_env()
+    # NOTE (same as build_config above): a normal import of
+    # exllamav3.util.arch_list executes exllamav3/__init__.py, which needs
+    # the full runtime (numpy, tokenizers, ...) absent from minimal build
+    # envs, and along the way triggers ext.py's JIT load with torch's
+    # default flags. arch_list itself needs only torch, guaranteed present
+    # here, so load it by file path instead. No silent paths: anything
+    # unexpected (missing file, detection failure) raises.
+    _arch_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        library_dir, "util", "arch_list.py",
+    )
+    _arch_spec = importlib.util.spec_from_file_location(
+        "exllamav3_arch_list", _arch_path
+    )
+    if _arch_spec is None or _arch_spec.loader is None:
+        raise RuntimeError(f"Cannot load arch detection from {_arch_path}")
+    _arch_mod = importlib.util.module_from_spec(_arch_spec)
+    _arch_spec.loader.exec_module(_arch_mod)
+    _arch_mod.maybe_set_arch_list_env()
 if _get_sources is not None:
     sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 else:
