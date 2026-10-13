@@ -1390,6 +1390,11 @@ class Job:
             if self.generator.recurrent_cache is not None and os.environ.get("EXL3_RECURRENT_LAST_PAGE", "1") != "0":
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
+                # The gap is measured from the start of the prompt for a page-aligned resume, as in a cold prefill, so the
+                # last chunks have the same shapes cold and resumed (a 6144 resume of a 7000-token prompt ran one 855-row
+                # chunk instead of cold's 768 + 87 and the recurrent state differed). Only a mid-page resume (tail
+                # checkpoint, never comparable to a cold prefill) keeps the distance to its checkpoint.
+                gap_base = self.cached_pages * PAGE_SIZE if self._unaligned_start else 0
                 # EXL3_PF_NO_TAIL=1 (default 0, big-tail mode only): no separate pass for the prompt's last page
                 # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
                 # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)
@@ -1402,7 +1407,7 @@ class Job:
                     no_tail_row = last_page_b - prefill_start
                 elif prefill_start < last_page_b <= prefill_end and not (
                         prefill_end > last_page_b and self._tail_ok(seq) and seqlen % PAGE_SIZE != 0 and
-                        last_page_b - self.cached_pages * PAGE_SIZE < int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))):
+                        last_page_b - gap_base < int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))):
                     # (a prompt-end tail checkpoint, see _tail_stash, replaces this separate pass; it is still taken
                     # when the last full-page checkpoint is EXL3_TAIL_MAXGAP tokens behind, which bounds the replay
                     # after a restart from the disk slot)
