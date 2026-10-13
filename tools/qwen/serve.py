@@ -685,6 +685,12 @@ class QwenEngine:
         self.spec_on = self.draft_model is not None
         self.slot_store = None
         self.last_stats: dict[str, Any] = {}
+        # The loaded model and tokenizer are about 1.9 M Python objects, and every later gc.collect() walked them all: the Generator
+        # rebuild of a cache_salt change or cache_prompt=false spent 0.5 s there, inside time to first token (0.53 -> 0.03 s).
+        # Keep them out of the collector, before the first Generator exists (a frozen Generator would never be freed). 0 = off.
+        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
+            gc.collect()
+            gc.freeze()
         self._build(self.spec_on)
 
     def _ngram_resident(self) -> None:
