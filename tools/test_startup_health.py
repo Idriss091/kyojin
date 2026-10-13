@@ -592,8 +592,8 @@ class WiringTest(unittest.TestCase):
 
     EXPECT = {
         "qwen": {"target weights", "drafter weights", "vision tower", "engine setup", "warm-up"},
-        "glm": {"target weights", "drafter weights", "warm-up", "dense GEMM tuning"},
-        "mimo": {"target weights", "drafter weights", "engine setup"},
+        "glm": {"target weights", "drafter weights", "vision tower", "warm-up", "dense GEMM tuning"},
+        "mimo": {"target weights", "drafter weights", "engine setup", "vision tower"},
     }
 
     def calls(self, name):
