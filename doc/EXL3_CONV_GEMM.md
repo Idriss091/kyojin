@@ -116,9 +116,9 @@ for a 2888x4177 image, which needs the full patch range.
 
 ## Comparison with the default configuration
 
-First-token seconds for the **first input of that resolution** in a freshly started process:
+First-token seconds for the **first** input of each of these resolutions:
 
-| | default | `FAST` | `GEMM` | pre-generated |
+| | default | `FAST` | GEMM(recommend) | GEMM(pre-generated) |
 |---|---|---|---|---|
 | start | 702 s | 626 s | **45 s** | 45 s |
 | 400x400 | 91.4 s | 24.3 s | 23.8 s | 23.9 s |
@@ -131,14 +131,19 @@ First-token seconds for the **first input of that resolution** in a freshly star
 | needs preparation | — | no | no | **30 min, per ROCm version** |
 
 ¹ extrapolated at the measured 0.3 s per vision token (5476 and 7992 tokens); not run to completion.
-The two large-image cells of the pre-generated column are estimates from an equivalent cache state
+The two large-image cells of the GEMM(pre-generated) column are estimates from an equivalent cache state
 (a warm file written by a 2048x2048 run), because that configuration was measured on the smaller
 sizes only.
 
-**Time basis.** Every figure is the first-token time of the **first** input of that resolution in a
-freshly started process, i.e. it includes whatever one-off work that size triggers. It is not a
-throughput figure and not a repeat cost: repeating the same size afterwards is steady state — 9.9 s
-for a 2048x2048 under the recommended setup, against 35.1 s for its first input.
+**Time basis.** All four columns were measured with the same protocol, and every cell is the **first**
+time that size was sent in its process. The four small sizes went in one after another — 400x400,
+800x600, 1024x1024, 1000x1000 — within a single start, and the two large ones the same way within
+another start. The figures therefore include the one-off work a request triggers, in particular the
+~25 s that a fresh process pays on its first image request: that is why the first row of each group
+(400x400, 2048x2048) is more expensive than the larger sizes that follow it. It is a property of the
+process and not of the size, and it sits in every column alike, so the comparison within a row still
+holds. Repeating a size afterwards is steady state: 9.9 s for a 2048x2048 under GEMM(recommend),
+against 35.1 s for its first input.
 
 ## Additional notes
 
