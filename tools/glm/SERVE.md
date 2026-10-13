@@ -139,6 +139,17 @@ Every frame carries `id`, `object: chat.completion.chunk`, `created`, `model`.
 Non-streaming returns `chat.completion` with `choices[0].message` holding `content`,
 optional `reasoning_content`, optional `tool_calls`, plus `usage`.
 
+### `POST /tokenize`, `POST /v1/completions`, `cache_salt` (vLLM style)
+`/tokenize` takes `{"prompt" | "messages", "add_special_tokens"}` and returns `{"tokens", "count", "max_model_len"}`.
+`/v1/completions` (stream and non-stream, same queue and `--sessions` as chat) takes `prompt` as text or as a list of token ids
+(`[1, 2, 3]` or `[[1, 2, 3]]`). The prompt is used as sent: no chat template, no BOS, no re-encoding of ids. `usage.prompt_tokens`
+is the count of ids sent, an id outside the vocabulary answers 400, `ignore_eos: true` keeps generating through EOS, `stop` and
+`max_tokens` work as in chat. `usage.prompt_tokens_details.cached_tokens` is on every chat and completions answer.
+`cache_salt` (chat and completions, non-empty string): requests with different salts never share prompt cache. The server keeps
+one salt namespace at a time (requests without a salt are one namespace): when it changes, running requests finish, the whole
+prompt cache is dropped (a fresh Generator over the same cache) and the request starts. The same salt, or no salt at all,
+never drops anything. `chat_template_kwargs` (`reasoning_effort`, `clear_thinking`) is read like the top-level fields and wins.
+
 ### Thinking
 GLM's generation prompt ends with `<think>`, so the model *starts inside* the block.
 `opens_thinking()` detects that (`prompt.rstrip().endswith("<think>")`) and the server
@@ -193,7 +204,7 @@ models:
 - **Speed.** ~23.8 t/s end-to-end on the lighthouse bench through this server vs ~30.8 t/s
   in the standalone MTP bench. The gap is content, not the server: mtp_round on the same prose prompt
   gives 24.6 t/s (draft acceptance 0.57) vs 28.2 on chat (0.79); server overhead is ~3%.
-- No auth, no CORS, no `/v1/completions`, no embeddings endpoint. Bind to 127.0.0.1.
+- No auth, no CORS, no embeddings endpoint. Bind to 127.0.0.1.
 
 ## Open issues (found while documenting, NOT fixed)
 
@@ -213,7 +224,7 @@ models:
 ## Tests
 
 ```bash
-python -m pytest -q tools/glm/test_serve.py tools/test_startup_health.py
+python -m pytest -q tools/glm/test_serve.py tools/test_serve_compat.py tools/test_startup_health.py
 ```
 
 Model-free: a `FakeEngine` emits deterministic GLM XML in 3-character chunks so tags are

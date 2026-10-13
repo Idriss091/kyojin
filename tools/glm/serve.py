@@ -24,6 +24,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 from image_cache import ImageEmbeddingCache, digest
@@ -127,6 +128,7 @@ TOOL_CLOSE = "</tool_call>"
 # The engine's own default stays greedy; the lane passes the model card's sampling.
 # Used when a request omits the field. main() replaces the sampling values with the pack's
 # generation_config.json (the model card's recommendation); command-line flags win over both.
+_UNKNOWN_SALT = object()   # cache namespace after a failed reset: the next request resets again
 SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium", "max_tokens": None}
 # The model's template (levels low, high, max) with a medium level added: the model's "high" plus one instruction line.
 DEFAULT_TEMPLATE = Path(__file__).resolve().parent.parent / "lanes" / "assets" / "glm53-template-medium.jinja"
@@ -142,8 +144,13 @@ def pack_sampling(model_dir: str) -> dict[str, float]:
 
 
 def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
-    kw = {"clear_thinking": body.get("clear_thinking")}
-    effort = body.get("reasoning_effort", SERVE_DEFAULTS["reasoning_effort"])
+    """Template variables: chat_template_kwargs (vLLM style) wins over the top-level fields, then the server defaults."""
+    ctk = body.get("chat_template_kwargs") or {}
+    if not isinstance(ctk, dict):
+        raise web.HTTPBadRequest(reason="chat_template_kwargs must be an object")
+    pick = lambda key, default=None: ctk[key] if ctk.get(key) is not None else body.get(key, default)
+    kw = {"clear_thinking": pick("clear_thinking")}
+    effort = pick("reasoning_effort", SERVE_DEFAULTS["reasoning_effort"])
     if effort is not None:
         kw["reasoning_effort"] = effort
     return kw
@@ -376,15 +383,39 @@ class ResidentEngine:
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
-        self.greedy_generator = Generator(
-            model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft or None,
-            record_draft_stats=True)
+        self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
+        self.Generator = Generator
+        self.greedy_generator = self._make_generator()
         # n1f2: one drafted token, fused catch-up variant 2. One Generator only: a second one over the
         # same Cache takes ownership and breaks the first. Sampling also goes through MTP: a draft is
         # kept only when the independently sampled target token equals it, so outputs follow the target.
         GM.MTP_FUSE_CATCHUP = 2
         os.environ.setdefault("EXL3_MOE_UNION_V2", "1")  # the "+v2" of n1f2+v2
+
+    def _make_generator(self):
+        return self.Generator(
+            model=self.model, cache=self.cache, tokenizer=self.tokenizer,
+            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.num_draft or None,
+            record_draft_stats=True)
+
+    def _rebuild_generator(self) -> None:
+        """A fresh Generator over the same Cache (one at a time: a second one takes the Cache over). It drops the whole prompt
+        cache: page table, recurrent checkpoints, prompt-end checkpoints, CPU tier. The old one is freed first."""
+        import gc
+        self.greedy_generator = None
+        gc.collect()
+        self.torch.cuda.empty_cache()
+        self.greedy_generator = self._make_generator()
+        if getattr(self, "slot_store", None) is not None:
+            self.slot_store.generator = self.greedy_generator
+            self.slot_store.erase()
+
+    async def reset_prefix_cache(self) -> None:
+        """Forget every cached prompt prefix (cache_salt namespace change). The caller has drained the requests."""
+        if self.sessions > 1:
+            await self._post(self._rebuild_generator)    # on the driver, between two steps
+        else:
+            await asyncio.get_running_loop().run_in_executor(None, self._rebuild_generator)
 
     def _load_vision(self):
         """The vision tower (model.visual.*, fp16) next to the text model; None, with a log line, when the pack has none."""
@@ -422,10 +453,15 @@ class ResidentEngine:
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
 
+    def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
+        return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
+
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None, stats: dict | None = None) -> AsyncIterator[str]:
+                       images: list | None = None, stats: dict | None = None,
+                       prompt_ids: list[int] | None = None, ignore_eos: bool = False) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
@@ -437,7 +473,11 @@ class ResidentEngine:
         t0 = time.perf_counter()
         probe = getattr(self, "rss_probe", None)
         embs = []
-        if images:
+        if prompt_ids is not None:   # token-id prompt: exactly these ids, no template, no BOS, no re-encoding
+            ids = torch.tensor([prompt_ids], dtype=torch.long)
+            if getattr(self, "slot_store", None) is not None:
+                self.slot_store.note_prompt("", ids)
+        elif images:
             if self.sessions > 1:   # the tower must not run next to a Generator step: run it on the driver, between steps
                 embs = await self._post(self._embed, images)
             else:
@@ -462,7 +502,7 @@ class ResidentEngine:
         else:
             sampler = ComboSampler(temperature=max(temperature, 1e-6), top_p=top_p, min_p=0.0, **kw)
         generator = self.greedy_generator
-        conditions = list(self.config.eos_token_id_list) + stop
+        conditions = ([] if ignore_eos else list(self.config.eos_token_id_list)) + stop
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
                        stop_conditions=conditions, embeddings=embs or None)
         if self.sessions > 1:
@@ -531,7 +571,6 @@ class ResidentEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
-        generator = self.greedy_generator
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -547,6 +586,8 @@ class ResidentEngine:
                 else:
                     if not fut.done():
                         fut.set_result(res)
+            # read every round: _rebuild_generator (cache_salt change) replaces the Generator between two steps
+            generator = self.greedy_generator
             if not generator.num_remaining_jobs():
                 self._wake.clear()
                 if not self._cmds:
@@ -742,7 +783,7 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/completion": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
 
 
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
@@ -752,10 +793,21 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     sessions = int(getattr(engine, "sessions", 1))
     gate = asyncio.Semaphore(sessions)   # sessions > 1: one permit per running request; slot actions take them all
     slot_lock = asyncio.Lock()           # sessions > 1: one slot action at a time
+    salt_state: dict[str, Any] = {"current": None}   # cache_salt namespace of the prompt cache (None = requests without a salt)
+    admit_lock = asyncio.Lock()          # sessions > 1: serializes admission
     processing = 0  # admitted requests; closure, app config is immutable after startup
     running = 0     # sessions > 1: requests inside generate()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+
+    def salt_of(body: dict[str, Any]) -> str | None:
+        try:
+            salt = serve_compat.cache_salt(body)
+        except serve_compat.CompatError as exc:
+            raise web.HTTPBadRequest(reason=str(exc)) from exc
+        if salt is not None and not hasattr(engine, "reset_prefix_cache"):
+            raise web.HTTPBadRequest(reason="cache_salt is not supported by this engine")
+        return salt
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
         # The MTP window is a fixed num_draft_tokens per round, so rounds = proposed / window
@@ -798,6 +850,44 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 for _ in range(got):
                     gate.release()
 
+    @contextlib.asynccontextmanager
+    async def admit(salt: str | None):
+        """Permission to run one request. Every running request shares one cache_salt namespace: when the salt changes, the
+        requests in flight finish, the prompt cache is dropped (engine.reset_prefix_cache) and the new request starts alone.
+        The same salt (and traffic with no salt at all) never drops anything."""
+        async def reset() -> None:
+            salt_state["current"] = _UNKNOWN_SALT            # a failed reset must not leave the old namespace claimed
+            await engine.reset_prefix_cache()
+            salt_state["current"] = salt
+
+        if sessions == 1:
+            async with lock:
+                if salt != salt_state["current"]:
+                    await reset()
+                yield
+            return
+        async with admit_lock:
+            if salt == salt_state["current"]:
+                await gate.acquire()
+            else:
+                async with slot_lock:
+                    held = 0
+                    try:
+                        for _ in range(sessions):
+                            await gate.acquire()
+                            held += 1
+                        await reset()
+                    except BaseException:
+                        for _ in range(held):
+                            gate.release()
+                        raise
+                    for _ in range(held - 1):                # keep the permit of this request
+                        gate.release()
+        try:
+            yield
+        finally:
+            gate.release()
+
     async def worker() -> None:
         nonlocal processing, running
         while True:
@@ -810,7 +900,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
             try:
-                async with (lock if sessions == 1 else gate):
+                async with admit(body.get("_cache_salt")):
                     running += 1
                     if store is not None:
                         store.busy = True
@@ -822,6 +912,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                             top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
                             cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {}),
+                            **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
+                            **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"stats": request_stats} if sessions > 1 else {})):
                             out.put_nowait(delta)
                     finally:
@@ -896,6 +988,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
+            body["_cache_salt"] = salt_of(body)
             for key in ("temperature", "top_p"):
                 if body.get(key) is None:
                     body[key] = SERVE_DEFAULTS[key]
@@ -921,9 +1014,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return drain(request, cancel, out)
 
         def usage(raw: str) -> dict[str, int]:
-            completion_tokens = engine.count_tokens(raw)
-            return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens}
+            return serve_compat.usage(prompt_tokens, engine.count_tokens(raw), int(request_stats.get("cached_tokens") or 0))
 
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
@@ -1095,6 +1186,148 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             "timings": {"prompt_n": int(st.get("cached_tokens", 0)),
                         "predicted_n": int(st.get("new_tokens", 0))}})
 
+    async def tokenize(request: web.Request) -> web.Response:
+        """vLLM POST /tokenize: {prompt | messages, add_special_tokens?} -> {tokens, count, max_model_len}."""
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise web.HTTPBadRequest(reason="body must be a JSON object")
+            if body.get("model", model_id) != model_id:
+                raise web.HTTPBadRequest(reason=f"unknown model; expected {model_id}")
+            if not hasattr(engine, "encode_ids"):
+                raise web.HTTPNotImplemented(reason="this engine cannot tokenize")
+            add_special = body.get("add_special_tokens")
+            if add_special is not None and not isinstance(add_special, bool):
+                raise web.HTTPBadRequest(reason="add_special_tokens must be boolean")
+            if body.get("messages") is not None:
+                if not isinstance(body["messages"], list) or not body["messages"]:
+                    raise web.HTTPBadRequest(reason="messages must be a non-empty array")
+                if extract_images(body["messages"]):
+                    raise web.HTTPBadRequest(reason="images cannot be tokenized here")
+                text = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
+                add_special = bool(add_special)          # a rendered chat prompt carries its own special tokens
+            else:
+                text = body.get("prompt")
+                if not isinstance(text, str):
+                    raise web.HTTPBadRequest(reason="prompt must be a string (or send messages)")
+                add_special = True if add_special is None else add_special
+            ids = engine.encode_ids(text, add_special)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(reason=str(exc)) from exc
+        return web.json_response(serve_compat.tokenize_reply(ids, getattr(engine, "ctx", None)))
+
+    async def v1_completions(request: web.Request) -> web.StreamResponse:
+        """OpenAI POST /v1/completions over the same queue/generator as chat: the prompt (text, or a list of token ids) is
+        used verbatim (no chat template, no BOS added), one prompt, one choice. Streamed with a final `usage`."""
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise web.HTTPBadRequest(reason="body must be a JSON object")
+            if body.get("model", model_id) != model_id:
+                raise web.HTTPBadRequest(reason=f"unknown model; expected {model_id}")
+            prompt = body.get("prompt")
+            try:
+                prompt_ids = serve_compat.token_prompt(prompt, getattr(engine, "vocab_size", None))
+            except serve_compat.CompatError as exc:
+                raise web.HTTPBadRequest(reason=str(exc)) from exc
+            if prompt_ids is not None:
+                prompt = ""
+            else:
+                if isinstance(prompt, list) and len(prompt) == 1:
+                    prompt = prompt[0]
+                if not isinstance(prompt, str) or not prompt:
+                    raise web.HTTPBadRequest(reason="prompt must be a non-empty string or a list of token ids (one prompt per request)")
+            if body.get("n") not in (None, 1) or body.get("echo") or body.get("best_of") not in (None, 1):
+                raise web.HTTPBadRequest(reason="n, best_of and echo are not supported")
+            for key in ("stream", "ignore_eos"):
+                if body.get(key) is not None and not isinstance(body[key], bool):
+                    raise web.HTTPBadRequest(reason=f"{key} must be boolean")
+            max_tokens = 16 if body.get("max_tokens") is None else body["max_tokens"]
+            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+                raise web.HTTPBadRequest(reason="max_tokens must be a positive integer")
+            stops = body.get("stop") or []
+            stops = [stops] if isinstance(stops, str) else stops
+            if not isinstance(stops, list) or not all(isinstance(x, str) for x in stops):
+                raise web.HTTPBadRequest(reason="stop must be a string or a list of strings")
+            prompt_tokens = len(prompt_ids) if prompt_ids is not None else engine.count_tokens(prompt)
+            job = {"_prompt": prompt, "_prompt_ids": prompt_ids, "_ignore_eos": body.get("ignore_eos") is True,
+                   "max_tokens": max_tokens, "_room": reply_room(engine, prompt_tokens), "_stop": list(stops),
+                   "temperature": float(SERVE_DEFAULTS["temperature"] if body.get("temperature") is None else body["temperature"]),
+                   "top_p": float(SERVE_DEFAULTS["top_p"] if body.get("top_p") is None else body["top_p"]),
+                   "_cache_salt": salt_of(body)}
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(reason=str(exc)) from exc
+
+        limit = token_limit(job)
+        request_id, created = f"cmpl-{uuid.uuid4().hex}", int(time.time())
+        out: asyncio.Queue = asyncio.Queue()
+        request_stats: dict[str, Any] = {}
+        cancel = job["_cancel"] = asyncio.Event()
+        await queue.put((job, out, request_stats))
+
+        def chunk(text: str, finish: str | None) -> dict[str, Any]:
+            return {"id": request_id, "object": "text_completion", "created": created, "model": model_id,
+                    "choices": [{"text": text, "index": 0, "logprobs": None, "finish_reason": finish}]}
+
+        def finish_and_usage(text: str, stopped: str | None) -> tuple[str, dict[str, Any]]:
+            n_new = int(request_stats.get("new_tokens") or engine.count_tokens(text))
+            reason = "length" if stopped is None and (request_stats.get("eos_reason") == "max_new_tokens" or n_new >= limit) else "stop"
+            return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0))
+
+        hold = max((len(x) for x in job["_stop"]), default=1) - 1
+
+        if body.get("stream", False):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+            await response.prepare(request)
+            try:
+                text, sent, stopped = "", 0, None
+                async for delta in drain(request, cancel, out):
+                    text += delta
+                    cut, stopped = stop_text(text, job["_stop"])
+                    if stopped is not None:
+                        cancel.set()            # a stop string ended the reply: the rest is not generated
+                        text = cut
+                        break
+                    safe = max(sent, len(text) - hold)
+                    if safe > sent:
+                        await response.write(sse(chunk(text[sent:safe], None)))
+                        sent = safe
+                if len(text) > sent:
+                    await response.write(sse(chunk(text[sent:], None)))
+                reason, usage = finish_and_usage(text, stopped)
+                await response.write(sse(chunk("", reason) | {"usage": usage}))
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+            except ConnectionResetError:
+                client_left(cancel, "stream")
+            except asyncio.CancelledError:
+                cancel.set()
+                raise
+            except Exception as exc:                                   # noqa: BLE001
+                cancel.set()
+                try:
+                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await response.write_eof()
+                except ConnectionError:
+                    pass
+            return response
+
+        try:
+            raw = ""
+            async for delta in drain(request, cancel, out):
+                raw += delta
+        except ConnectionResetError:
+            return client_left(cancel, "request")
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+        except Exception:
+            cancel.set()
+            raise
+        text, stopped = stop_text(raw, job["_stop"])
+        reason, usage = finish_and_usage(text, stopped)
+        return web.json_response(chunk(text, reason) | {"usage": usage})
+
     async def slots(_: web.Request) -> web.Response:
         return web.json_response(engine.slot_store.slots())
 
@@ -1140,6 +1373,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app.router.add_get("/metrics", metrics_view)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
+    app.router.add_post("/tokenize", tokenize)
+    app.router.add_post("/v1/completions", v1_completions)
     app.router.add_post("/completion", completion)
     app.on_startup.append(start)
     app.on_cleanup.append(close)

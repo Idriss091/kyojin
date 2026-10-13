@@ -788,5 +788,161 @@ class ImageEmbeddingReuseTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class VllmCompatTests(unittest.TestCase):
+    """POST /tokenize, token-id prompts on /v1/completions, cache_salt (model-free: fake engine)."""
+
+    class Eng(FakeEngine):
+        vocab_size = 1000
+
+        def __init__(self, output="a b c", sessions=1, delay=0.0):
+            super().__init__(output)
+            self.sessions, self.delay, self.resets, self.active, self.log = sessions, delay, [], 0, []
+
+        def encode_ids(self, text, add_special_tokens=False):
+            return ([0] if add_special_tokens else []) + [len(w) for w in text.split()]
+
+        async def reset_prefix_cache(self):
+            self.resets.append(self.active)
+            await asyncio.sleep(self.delay)
+
+        async def generate(self, prompt, **kw):
+            self.active += 1
+            self.log.append(kw.get("prompt_ids"))
+            try:
+                await asyncio.sleep(self.delay)
+                async for piece in super().generate(prompt, **kw):
+                    yield piece
+            finally:
+                self.active -= 1
+
+    def post(self, engine, path, payload):
+        async def fn(client):
+            r = await client.post(path, json=payload)
+            return r.status, await r.json() if r.content_type == "application/json" else await r.text()
+        return with_client(engine, fn)
+
+    def test_tokenize_reply_shape(self):
+        eng = self.Eng()
+        st, body = self.post(eng, "/tokenize", {"model": "m", "prompt": "ab cde f", "add_special_tokens": False})
+        self.assertEqual((st, body), (200, {"count": 3, "max_model_len": 4096, "tokens": [2, 3, 1], "token_strs": None}))
+        self.assertEqual(self.post(eng, "/tokenize", {"prompt": "ab"})[1]["tokens"], [0, 2])   # vLLM default: special tokens on
+        st, body = self.post(eng, "/tokenize", {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(st, 200)
+        self.assertGreater(body["count"], 0)
+
+    def test_tokenize_bad_requests(self):
+        eng = self.Eng()
+        for payload in ({"model": "other", "prompt": "x"}, {"prompt": 5}, {}, {"prompt": "x", "add_special_tokens": "no"},
+                        {"messages": []}):
+            self.assertEqual(self.post(eng, "/tokenize", payload)[0], 400, payload)
+        self.assertEqual(self.post(FakeEngine(""), "/tokenize", {"prompt": "x"})[0], 501)
+
+    def test_token_id_prompt_reaches_the_engine_untouched(self):
+        for prompt in ([5, 6, 7, 8], [[5, 6, 7, 8]]):
+            eng = self.Eng()
+            st, body = self.post(eng, "/v1/completions", {"model": "m", "prompt": prompt, "max_tokens": 8, "ignore_eos": True,
+                                                         "temperature": 0.0, "add_special_tokens": False, "cache_salt": "s1"})
+            self.assertEqual(st, 200)
+            self.assertEqual(eng.log, [[5, 6, 7, 8]])
+            self.assertIs(eng.calls[0][1]["ignore_eos"], True)
+            self.assertEqual(body["usage"]["prompt_tokens"], 4)                      # the ids sent, not the engine's count
+            self.assertEqual(body["usage"]["prompt_tokens_details"], {"cached_tokens": 4})   # clamped to prompt_tokens
+
+    def test_token_id_prompt_stream_ends_with_usage_and_done(self):
+        eng = self.Eng("abcdef")
+        st, raw = self.post(eng, "/v1/completions", {"model": "m", "prompt": [1, 2, 3], "max_tokens": 8, "stream": True,
+                                                    "stream_options": {"include_usage": True}})
+        events = sse_events(raw)
+        self.assertEqual(st, 200)
+        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
+        self.assertEqual("".join(e["choices"][0]["text"] for e in events), "abcdef")
+        self.assertEqual(events[-1]["usage"]["prompt_tokens"], 3)
+        self.assertEqual(events[-1]["usage"]["prompt_tokens_details"]["cached_tokens"], 3)
+        self.assertIsNone(eng.calls[0][1].get("ignore_eos"))
+
+    def test_text_prompt_and_unknown_fields_still_accepted(self):
+        eng = self.Eng()
+        st, body = self.post(eng, "/v1/completions", {"model": "m", "prompt": "hello there", "max_tokens": 3, "seed": 7,
+                                                     "user": "u", "add_special_tokens": False, "stream_options": {"include_usage": True}})
+        self.assertEqual(st, 200)
+        self.assertEqual(body["usage"]["prompt_tokens"], 11)
+        self.assertEqual(eng.log, [None])
+
+    def test_token_id_prompt_validation(self):
+        eng = self.Eng()
+        for bad in ([-1], [1000], [1, True], [1, 2.5], [1, "a"], [[1], [2]], [[1], 2], [], [[]]):
+            self.assertEqual(self.post(eng, "/v1/completions", {"model": "m", "prompt": bad})[0], 400, bad)
+        self.assertEqual(eng.log, [])        # nothing reached the engine
+        self.assertEqual(self.post(eng, "/v1/completions", {"model": "m", "prompt": [1], "ignore_eos": "yes"})[0], 400)
+        self.assertEqual(self.post(eng, "/v1/completions", {"model": "m", "prompt": [1] * 5000})[0], 400)   # longer than ctx
+
+    def test_cache_salt_resets_only_when_the_namespace_changes(self):
+        eng = self.Eng()
+
+        async def fn(client):
+            codes = []
+            for salt in (None, None, "a", "a", "a", "b", "a", None, None):
+                payload = {"model": "m", "prompt": [1, 2], "max_tokens": 2} | ({} if salt is None else {"cache_salt": salt})
+                codes.append((await client.post("/v1/completions", json=payload)).status)
+            return codes
+        self.assertEqual(with_client(eng, fn), [200] * 9)
+        self.assertEqual(len(eng.resets), 4)        # None -> a, a -> b, b -> a, a -> None
+
+    def test_requests_without_a_salt_never_reset(self):
+        eng = self.Eng()
+
+        async def fn(client):
+            await client.post("/v1/completions", json={"model": "m", "prompt": [1, 2]})
+            await client.post("/v1/completions", json={"model": "m", "prompt": "x y"})
+            await client.post("/v1/chat/completions", json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        with_client(eng, fn)
+        self.assertEqual(eng.resets, [])
+
+    def test_chat_accepts_cache_salt_too(self):
+        eng = self.Eng()
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+        async def fn(client):
+            return [(await client.post("/v1/chat/completions", json=body | {"cache_salt": s})).status for s in ("x", "x", "y")]
+        self.assertEqual(with_client(eng, fn), [200] * 3)
+        self.assertEqual(len(eng.resets), 2)
+
+    def test_salt_change_waits_for_the_running_requests(self):
+        eng = self.Eng(sessions=3, delay=0.05)
+
+        async def fn(client):
+            def req(salt):
+                return client.post("/v1/completions", json={"model": "m", "prompt": [1, 2], "cache_salt": salt})
+            rs = await asyncio.gather(req("a"), req("a"), req("b"), req("b"), req("a"))
+            return [r.status for r in rs]
+        self.assertEqual(with_client(eng, fn), [200] * 5)
+        self.assertGreaterEqual(len(eng.resets), 2)
+        self.assertEqual(eng.resets, [0] * len(eng.resets))     # no request was running when the cache was dropped
+
+    def test_failed_reset_is_retried_by_the_next_request(self):
+        class Flaky(self.Eng):
+            fail = True
+
+            async def reset_prefix_cache(self):
+                await super().reset_prefix_cache()
+                if Flaky.fail:
+                    Flaky.fail = False
+                    raise RuntimeError("boom")
+        eng = Flaky()
+
+        async def fn(client):
+            body = {"model": "m", "prompt": [1, 2], "cache_salt": "a"}
+            return [(await client.post("/v1/completions", json=body)).status for _ in range(2)]
+        st = with_client(eng, fn)
+        self.assertEqual(st[0], 500)
+        self.assertEqual((st[1], len(eng.resets)), (200, 2))
+
+    def test_cache_salt_validation(self):
+        eng = self.Eng()
+        for bad in ("", 5, ["a"], True):
+            self.assertEqual(self.post(eng, "/v1/completions", {"model": "m", "prompt": [1], "cache_salt": bad})[0], 400, bad)
+        self.assertEqual(self.post(FakeEngine("x"), "/v1/completions", {"model": "m", "prompt": "hi", "cache_salt": "a"})[0], 400)
+
+
 if __name__ == "__main__":
     unittest.main()
