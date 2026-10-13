@@ -1149,8 +1149,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
     parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
-    parser.add_argument("--row-budget", type=int, default=0,
-                        help="sessions > 1: cap verify rows per round (busy sessions x (draft depth + 1)) by lowering the draft depth, never below 1; 0 = off")
+    parser.add_argument("--row-budget", type=int, default=None,
+                        help="sessions > 1: cap verify rows per round (busy sessions x (draft depth + 1)) by lowering the draft depth, never below 1; "
+                             "default 5 when --sessions > 1, 0 = off")
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
@@ -1197,7 +1198,7 @@ def main() -> None:
     try:
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
                               vision=not args.no_vision, sessions=args.sessions)
-        engine.row_budget = args.row_budget if args.sessions > 1 else 0
+        engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
