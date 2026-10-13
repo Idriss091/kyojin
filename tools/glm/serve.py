@@ -387,10 +387,12 @@ class ResidentEngine:
         self.supports_vision = self.vision is not None
         self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
         self.Generator = Generator
-        # The loaded model and tokenizer are far more Python objects than a request ever creates, and every later gc.collect()
-        # walked them all: the Generator rebuild of a cache_salt change paid for it inside time to first token. Keep them out
-        # of the collector, before the first Generator exists (a frozen Generator would never be freed). 0 = off.
-        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
+        # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
+        # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: one
+        # load, arms interleaved, +3.8 % first-token rate at 8K and +11 % at 2K, but over five server loads the 8K figure did
+        # not move and two of the three loads with the switch had slow outliers (cause not found). The Qwen server has it on.
+        if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
             import gc
             gc.collect()
             gc.freeze()
