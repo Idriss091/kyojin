@@ -17,6 +17,11 @@ the first input of a resolution is slow for two unrelated reasons:
 
 Both disappear with environment variables. Nothing else in the server changes.
 
+**Since Kyojin 1.5 the GLM server applies the recommended setup below by default** (`EXL3_CONV_GEMM=1`,
+`EXL3_DENSE_GEMM_TUNE=0`, set by `tools/glm/serve.py` unless the variable is already in the environment).
+The "default" columns and wording in this page describe the engine without those two values, which is
+what `EXL3_CONV_GEMM=0 EXL3_DENSE_GEMM_TUNE=1` still gives.
+
 ## Recommended setup
 
 ```bash

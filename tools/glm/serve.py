@@ -37,6 +37,10 @@ SPEED_ENV = {
     # Vision spatial-merge convolution as one GEMM: no MIOpen solver search, so the first image of a new
     # size costs seconds, not minutes (first 1024x1024: 433 s -> 4 s; answers byte-identical). "0" = F.conv2d.
     "EXL3_CONV_GEMM": "1",
+    # No dense GEMM screening: a first start takes about a minute instead of 13 (771 s -> 65 s) and a new image
+    # size never stalls on it. Answers are byte-identical. "1" brings the tuner and its start-up pre-tuning
+    # (EXL3_SERVE_DTUNE_PRIME_S) back; see doc/EXL3_CONV_GEMM.md for the offline pre-generation.
+    "EXL3_DENSE_GEMM_TUNE": "0",
     "EXL3_MOE_CFG": "2",
     "EXL3_HIP_PREFILL_MIN_ROWS": "2",
     "EXL3_BLOCK_GRAPH": "1",
@@ -1196,7 +1200,7 @@ def main() -> None:
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
-    tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
+    tune = warm and os.environ["EXL3_DENSE_GEMM_TUNE"] != "0" and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
     startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
@@ -1230,7 +1234,7 @@ def main() -> None:
                 mem_diag("warm")
             # EXL3_SERVE_DTUNE_PRIME_S: time budget for pre-tuning dense GEMM classes (0 = skip)
             budget = float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600"))
-            if budget > 0:
+            if budget > 0 and os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") != "0":
                 keys, secs = prime_dense_tune(budget)
                 print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
                 print(mem_line("primed"), flush=True)

@@ -865,7 +865,8 @@ request then pays the kernel warm-up.
 #### `EXL3_SERVE_DTUNE_PRIME_S` (default: `600`)
 
 Seconds the GLM server spends pre-tuning dense GEMM shapes before it opens the port. `0` skips the
-tuning and the matching `/health` stage.
+tuning and the matching `/health` stage. Read only with `EXL3_DENSE_GEMM_TUNE=1`: the GLM server sets
+`EXL3_DENSE_GEMM_TUNE=0` and `EXL3_CONV_GEMM=1` by default (see [EXL3_CONV_GEMM.md](EXL3_CONV_GEMM.md)).
 
 #### `EXL3_SERVE_EMPTY_CACHE` (default: `1`)
 
