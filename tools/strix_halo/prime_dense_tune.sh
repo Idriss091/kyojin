@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prime the dense-GEMM tune cache before the first server start.
 #
-# Same environment as run_kyojin.sh (venv + ROCm SDK + strix_halo env), then run
+# Same environment as the servers (venv + ROCm SDK + strix_halo env), then run
 # prime_dense_tune.py with every argument passed through.
 #
 #   bash tools/strix_halo/prime_dense_tune.sh --model <pack dir> --dry-run

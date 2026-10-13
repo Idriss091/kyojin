@@ -29,9 +29,14 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-temperature` / `--default-top-p` | from `generation_config.json` (`1.0` / `0.95`) | used when a request omits the field (explicit null too). Greedy defaults loop on agent clients that send no sampling |
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
+| `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
+| `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
+| `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
+| `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
+| `--exact-prefix-cache` | off | a request resumed from the prompt cache gives the same greedy text as its cold prefill. Costs about 5-12 % of cold prefill speed at 7-14K tokens |
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
-wins): `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,
+wins): `EXL3_CONV_GEMM=1`, `EXL3_DENSE_GEMM_TUNE=0`, `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,
 `EXL3_BLOCK_GRAPH=1`, `EXL3_BLOCK_GRAPH_MLA=2`, plus the module-level
 `Generator.MTP_FUSE_CATCHUP = 2`. There is no `--temperature`/seed handling beyond the
 request body.
@@ -98,26 +103,17 @@ server does not fetch remote URLs). One image takes 40 to about 1,500 tokens dep
 sent again in a later turn keeps the prompt cache. `--no-vision` skips the tower; an image request then gets HTTP 400,
 as do video and audio parts.
 
-For image input, three environment variables before the start make the first image of a new size fast:
+The first image of a new size costs seconds: the server runs the vision spatial-merge convolution as a GEMM
+(`EXL3_CONV_GEMM=1`) and skips the dense GEMM screening (`EXL3_DENSE_GEMM_TUNE=0`). Both are server defaults
+since 1.5; a value already in the environment wins. Measured on this model: start to ready 771 s -> 65 s, first
+1024x1024 image 433 s -> 4 s, text prefill and decode unchanged, answers byte-identical.
 
-```bash
-export EXL3_CONV_GEMM=1            # vision spatial-merge convolution as a GEMM: no MIOpen solver search
-export EXL3_DENSE_GEMM_TUNE=0      # no dense GEMM screening, at startup or per shape
-export EXL3_SERVE_DTUNE_PRIME_S=0  # (implied by the line above; kept for explicitness)
-python tools/glm/serve.py \
-    --model ~/models/glm53-exl3-td205 --port 18080
-```
+`EXL3_DENSE_GEMM_TUNE=1` brings the tuner back, with up to 600 s of pre-tuning at the first start
+(`EXL3_SERVE_DTUNE_PRIME_S`) and 20-45 s for each new image size. It buys about 6 % of prefill speed on a
+large image and nothing on text, because the expert layers are EXL3-quantized and do not use the tuned path.
+`EXL3_CONV_GEMM=0` brings the MIOpen convolution back (~0.3 s per vision token for the first image of each size).
 
-With the defaults, the first image of every new size pays two independent searches: a MIOpen convolution
-solver search that grows with the vision token count (~0.3 s per token — about 68 s for a 400x400 image
-and 416 s for 1024x1024, and a 1 % change in resolution pays it again), plus a dense GEMM screening on
-the language and vision projections (up to 600 s at startup, 20-45 s for each new image size). The three
-variables above remove both: a new size then costs seconds and the start is ~45 s.
-`EXL3_DENSE_GEMM_TUNE=0` costs 0-7 % of prefill throughput, measured on this model (text is unaffected;
-a large-image prefill is about 6 % slower), because the expert layers are EXL3-quantized and do not use
-the tuned path.
-
-Without the code change, `MIOPEN_FIND_MODE=FAST` alone removes the convolution half of that cost
+With `EXL3_CONV_GEMM=0`, `MIOPEN_FIND_MODE=FAST` alone removes the convolution half of that cost
 (a first 1024x1024 goes from 431 s to 22 s) and leaves the GEMM side, and its 600 s of startup
 pre-tuning, exactly as the default has them. Measurements, the offline pre-generation alternative, and
 the comparison with the default configuration: [doc/EXL3_CONV_GEMM.md](../../doc/EXL3_CONV_GEMM.md).
@@ -188,8 +184,8 @@ models:
 
 ## Known limits
 
-- **One model, one flight.** The `asyncio.Queue` worker serializes every request; a
-  second concurrent request waits, it is not batched. `n > 1` is ignored.
+- **One request at a time by default.** A second concurrent request waits. `--sessions N` decodes N
+  requests together. `n > 1` is ignored.
 - **Client disconnect leaks work.** If the HTTP client goes away mid-stream, the worker
   keeps generating into the orphaned queue and every other request stalls until that
   generation ends.

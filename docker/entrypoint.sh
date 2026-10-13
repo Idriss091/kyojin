@@ -44,7 +44,18 @@ export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$CACHE_HOME/triton}
 # so python never sees it (measured: docker stop took the full timeout, exit 137). The trap is set before the
 # configuration step because that step can be a download of tens of GB.
 CHILD=""
-stop() { echo "[kyojin] signal received, stopping" >&2; [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null; STOPPED=1; }
+# A server that is still alive KYOJIN_STOP_TIMEOUT seconds after SIGTERM (default 20; seen once: a server that held
+# its GPU memory for 42 minutes) gets SIGKILL, so that a stop always frees the GPU.
+stop() {
+    echo "[kyojin] signal received, stopping" >&2
+    [ "$STOPPED" = 1 ] && return
+    STOPPED=1
+    [ -n "$CHILD" ] || return
+    kill -TERM "$CHILD" 2>/dev/null
+    ( pid=$CHILD; n=${KYOJIN_STOP_TIMEOUT:-20}
+      while [ "$n" -gt 0 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; n=$((n - 1)); done
+      kill -0 "$pid" 2>/dev/null && { echo "[kyojin] server still running after SIGTERM: SIGKILL" >&2; kill -KILL "$pid" 2>/dev/null; } ) &
+}
 STOPPED=0
 trap stop TERM INT
 wait_child() { while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD" 2>/dev/null; done; wait "$CHILD" 2>/dev/null; return $?; }

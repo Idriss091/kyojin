@@ -6,8 +6,7 @@ import traceback
 import argparse
 import asyncio
 import base64
-import collections
-import hashlib
+import contextlib
 import io
 import json
 import os
@@ -27,6 +26,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
@@ -34,6 +34,13 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
 SPEED_ENV = {
+    # Vision spatial-merge convolution as one GEMM: no MIOpen solver search, so the first image of a new
+    # size costs seconds, not minutes (first 1024x1024: 433 s -> 4 s; answers byte-identical). "0" = F.conv2d.
+    "EXL3_CONV_GEMM": "1",
+    # No dense GEMM screening: a first start takes about a minute instead of 13 (771 s -> 65 s) and a new image
+    # size never stalls on it. Answers are byte-identical. "1" brings the tuner and its start-up pre-tuning
+    # (EXL3_SERVE_DTUNE_PRIME_S) back; see doc/EXL3_CONV_GEMM.md for the offline pre-generation.
+    "EXL3_DENSE_GEMM_TUNE": "0",
     "EXL3_MOE_CFG": "2",
     "EXL3_HIP_PREFILL_MIN_ROWS": "2",
     "EXL3_BLOCK_GRAPH": "1",
@@ -265,7 +272,6 @@ DEFAULT_SAMPLER_KW: dict = json.loads(os.environ.get("SERVE_SAMPLER_KW", "{}") o
 # which the tokenizer expands to <|begin_of_image|> + one slot per vision token + <|end_of_image|>.
 IMAGE_TRIPLE = "<|begin_of_image|><|image|><|end_of_image|>"
 MAX_IMAGE_BYTES = 32 * 1024**2
-IMAGE_CACHE_SIZE = 8   # decoded embeddings kept by content hash, so a later turn re-sending the image reuses the KV cache
 
 
 def _bad(reason: str) -> web.HTTPBadRequest:
@@ -316,17 +322,21 @@ def load_image(url: str) -> tuple[Any, str]:
     if len(raw) > MAX_IMAGE_BYTES:
         raise _bad("image too large")
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB"), hashlib.sha256(raw).hexdigest()
+        return Image.open(io.BytesIO(raw)).convert("RGB"), digest(raw)
     except Exception as exc:                                          # noqa: BLE001
         raise _bad(f"cannot decode image: {exc}") from exc
+
+
+MAX_SESSIONS = 16   # Cache default max_batch_size (recurrent state slots)
 
 
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
+    row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True):
+                 vision: bool = True, sessions: int = 1):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -335,6 +345,14 @@ class ResidentEngine:
         self.torch = torch
         self.Job = Job
         self.num_draft = num_draft
+        # Concurrent requests batched through the one Generator. The recurrent (KDA) state has Cache.max_batch_size = 16
+        # slots whatever the value (the Cache default, allocated in every case), so up to MAX_SESSIONS sessions cost no
+        # extra state memory; the paged KV pool (ctx + 4096 tokens) is shared by all sessions.
+        if not 1 <= sessions <= MAX_SESSIONS:
+            raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
+        self.sessions = sessions
+        self.row_budget = 0   # set by --row-budget (sessions > 1)
+        self.max_draft = num_draft
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
@@ -345,19 +363,22 @@ class ResidentEngine:
                            max_history=max_history)
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
-        self.draft_model = Model.from_config(self.config, component="mtp")
-        self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                 max_history=max_history)
-        startup_health.stage("drafter weights")
-        self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        if num_draft > 0:
+            self.draft_model = Model.from_config(self.config, component="mtp")
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
+                                     max_history=max_history)
+            startup_health.stage("drafter weights")
+            self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        else:   # --num-draft 0: plain decode, no drafter
+            self.draft_model = self.draft_cache = None
         self.vision = None
-        self.emb_cache: collections.OrderedDict = collections.OrderedDict()
+        self.emb_cache = ImageEmbeddingCache()
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
+            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft or None,
             record_draft_stats=True)
         # n1f2: one drafted token, fused catch-up variant 2. One Generator only: a second one over the
         # same Cache takes ownership and breaks the first. Sampling also goes through MTP: a draft is
@@ -390,19 +411,13 @@ class ResidentEngine:
 
     def _embed(self, images: list[tuple[Any, str]]) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache; one prompt never holds an object twice."""
-        out, used = [], set()
-        for image, key in images:
-            emb = self.emb_cache.get(key) if key not in used else None
-            if emb is None:
-                emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
-            self.emb_cache[key] = emb
-            self.emb_cache.move_to_end(key)
-            used.add(key)
-            out.append(emb)
-        while len(self.emb_cache) > IMAGE_CACHE_SIZE:
-            self.emb_cache.popitem(last=False)
-        return out
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        def build(image):
+            t0 = time.perf_counter()
+            emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
+            return emb
+        return self.emb_cache.get_many(images, build)
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
@@ -410,8 +425,9 @@ class ResidentEngine:
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None) -> AsyncIterator[str]:
-        """Yield incremental decoded text. Caller serializes access to this method.
+                       images: list | None = None, stats: dict | None = None) -> AsyncIterator[str]:
+        """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
+        sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
         prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
@@ -422,7 +438,10 @@ class ResidentEngine:
         probe = getattr(self, "rss_probe", None)
         embs = []
         if images:
-            embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+            if self.sessions > 1:   # the tower must not run next to a Generator step: run it on the driver, between steps
+                embs = await self._post(self._embed, images)
+            else:
+                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
             for emb in embs:
                 prompt = prompt.replace(IMAGE_TRIPLE, emb.text_alias, 1)
             ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
@@ -446,6 +465,10 @@ class ResidentEngine:
         conditions = list(self.config.eos_token_id_list) + stop
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
                        stop_conditions=conditions, embeddings=embs or None)
+        if self.sessions > 1:
+            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe):
+                yield piece
+            return
         generator.enqueue(job)
         loop = asyncio.get_running_loop()
         try:
@@ -472,6 +495,128 @@ class ResidentEngine:
             # a leftover job would run inside the next request.
             if generator.num_remaining_jobs():
                 generator.clear_queue()
+
+    # Shared mode (sessions > 1). One driver task is the only code that touches the Generator: it runs queued commands
+    # (enqueue, cancel, image tower, slot actions) between two iterate() calls and routes the events of each step to the
+    # request that owns the job (by serial number).
+
+    def _post(self, fn, *args) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        if getattr(self, "_driver", None) is None or self._driver.get_loop() is not loop:
+            self._cmds, self._routes, self._wake = [], {}, asyncio.Event()
+            self._driver = loop.create_task(self._drive())
+        elif self._driver.done():
+            exc = None if self._driver.cancelled() else self._driver.exception()
+            if exc is None:
+                raise RuntimeError("the engine driver has stopped")
+            print(f"serve: WARNING the engine driver crashed ({exc!r}); starting a new one", file=sys.stderr, flush=True)
+            self._driver = loop.create_task(self._drive())
+        fut = loop.create_future()
+        self._cmds.append((fn, args, fut))
+        self._wake.set()
+        return fut
+
+    async def _drive(self) -> None:
+        try:
+            await self._drive_loop()
+        finally:   # cancelled or crashed: nothing will answer the waiting requests any more, so fail them now
+            stopped = RuntimeError("the engine driver has stopped")
+            for _, _, fut in self._cmds:
+                if not fut.done():
+                    fut.set_exception(stopped)
+            self._cmds.clear()
+            for q in self._routes.values():
+                q.put_nowait(stopped)
+            self._routes.clear()
+
+    async def _drive_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        generator = self.greedy_generator
+        while True:
+            while self._cmds:
+                fn, args, fut = self._cmds.pop(0)
+                try:
+                    res = await loop.run_in_executor(None, fn, *args)
+                except asyncio.CancelledError:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("the engine driver has stopped"))
+                    raise
+                except Exception as exc:                              # noqa: BLE001
+                    if not fut.done():
+                        fut.set_exception(exc)
+                else:
+                    if not fut.done():
+                        fut.set_result(res)
+            if not generator.num_remaining_jobs():
+                self._wake.clear()
+                if not self._cmds:
+                    await self._wake.wait()
+                continue
+            if self.row_budget and generator.draft_model is not None:
+                # verify rows per round = busy sessions x (depth + 1): keep them within the budget (depth >= 1)
+                generator.num_draft_tokens = max(1, min(self.max_draft, self.row_budget // generator.num_remaining_jobs() - 1))
+            try:
+                events = await loop.run_in_executor(None, lambda: list(generator.iterate()))
+            except Exception as exc:                                  # noqa: BLE001
+                # a failed step leaves every job in an unknown state: fail them all
+                for q in self._routes.values():
+                    q.put_nowait(exc)
+                self._routes.clear()
+                generator.clear_queue()
+                continue
+            by_serial: dict[int, list] = {}
+            for ev in events:
+                by_serial.setdefault(ev.get("serial"), []).append(ev)
+            for serial, evs in by_serial.items():
+                q = self._routes.get(serial)
+                if q is not None:      # None: cancelled after the step started
+                    q.put_nowait(evs)
+
+    async def _run_shared(self, job, ids, cancel, stats: dict, t0: float, probe) -> AsyncIterator[str]:
+        """One request's job in the shared Generator: enqueue on the driver, stream its events, and (whatever way this
+        ends) remove the job, so no leftover job runs inside another request."""
+        q: asyncio.Queue = asyncio.Queue()
+        generator = self.greedy_generator
+
+        def enqueue():
+            self._routes[generator.enqueue(job)] = q   # on the driver: no step can emit before the route exists
+        await self._post(enqueue)
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return
+                try:
+                    item = await asyncio.wait_for(q.get(), 0.25)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(item, Exception):
+                    raise item
+                for event in item:
+                    if event.get("error"):
+                        raise RuntimeError(str(event["error"]))
+                    text = event.get("text", "")
+                    if text:
+                        yield text
+                    if event.get("eos"):
+                        stats.update(event)
+                        self.last_stats = stats
+                        if probe is not None:
+                            probe.request(int(ids.numel()), int(event.get("new_tokens", 0)), time.perf_counter() - t0)
+                        return
+        finally:
+            def forget():
+                serial = job.serial_number
+                if self._routes.get(serial) is q:
+                    del self._routes[serial]
+                for j in generator.active_jobs + generator.pending_jobs:
+                    if j is job:
+                        generator.cancel(j)
+            if not self._driver.done():
+                await asyncio.shield(self._post(forget))
+
+    async def run_exclusive(self, fn, *args):
+        """Run fn on the driver, between steps (slot save/restore; the caller has drained the requests)."""
+        return await self._post(fn, *args)
 
 
 def warmup(engine: Any, template: str, prompt_tokens: int = 4608, decode_tokens: int = 16) -> float:
@@ -604,8 +749,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
+    sessions = int(getattr(engine, "sessions", 1))
+    gate = asyncio.Semaphore(sessions)   # sessions > 1: one permit per running request; slot actions take them all
+    slot_lock = asyncio.Lock()           # sessions > 1: one slot action at a time
     processing = 0  # admitted requests; closure, app config is immutable after startup
-    app = web.Application(client_max_size=16 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
+    running = 0     # sessions > 1: requests inside generate()
+    app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
@@ -631,8 +780,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         return web.json_response({"object": "list", "data": [
             {"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]})
 
+    @contextlib.asynccontextmanager
+    async def exclusive():
+        """The generator is idle inside: sessions == 1 holds the lock; sessions > 1 waits for every running request."""
+        if sessions == 1:
+            async with lock:
+                yield
+            return
+        async with slot_lock:
+            got = 0
+            try:
+                for _ in range(sessions):
+                    await gate.acquire()
+                    got += 1
+                yield
+            finally:
+                for _ in range(got):
+                    gate.release()
+
     async def worker() -> None:
-        nonlocal processing
+        nonlocal processing, running
         while True:
             body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
@@ -643,17 +810,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
             try:
-                async with lock:
+                async with (lock if sessions == 1 else gate):
+                    running += 1
                     if store is not None:
                         store.busy = True
-                    engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
-                    async for delta in engine.generate(
-                        body["_prompt"],
-                        max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
-                        top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                        cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
-                        out.put_nowait(delta)
-                    request_stats.update(getattr(engine, "last_stats", None) or {})
+                    if sessions == 1:
+                        engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
+                    try:
+                        async for delta in engine.generate(
+                            body["_prompt"],
+                            max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
+                            top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
+                            cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {}),
+                            **({"stats": request_stats} if sessions > 1 else {})):
+                            out.put_nowait(delta)
+                    finally:
+                        running -= 1
+                        if sessions > 1 and store is not None:
+                            store.busy = running > 0
+                    if sessions == 1:
+                        request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     out.put_nowait(None)
@@ -661,15 +837,17 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 out.put_nowait(exc)
             finally:
                 processing -= 1
-                if store is not None:
+                if store is not None and sessions == 1:
                     store.busy = False
                 queue.task_done()
 
     async def start(_: web.Application) -> None:
-        app["worker_task"] = asyncio.create_task(worker())
+        app["worker_tasks"] = [asyncio.create_task(worker()) for _ in range(sessions)]
+        app["worker_task"] = app["worker_tasks"][0]
 
     async def close(app_: web.Application) -> None:
-        app_["worker_task"].cancel()
+        for t in app_["worker_tasks"]:
+            t.cancel()
 
     async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
@@ -927,7 +1105,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         action = request.query.get("action")
         body = await request.json() if request.can_read_body else {}
         try:
-            async with lock:
+            async with exclusive():
                 if action == "erase":
                     return web.json_response(store.erase())
                 if action not in ("save", "restore"):
@@ -976,8 +1154,17 @@ def main() -> None:
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--exact-prefix-cache", action="store_true",
+                        help="a request resumed from a cached page checkpoint gives the same greedy text as its cold prefill: "
+                             "plain prefill chunks (EXL3_PREFILL_BIG_TAIL=0), about 5-12 %% slower cold prefill at 7-14K tokens")
     parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
     parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
+    parser.add_argument("--row-budget", type=int, default=None,
+                        help="sessions > 1: cap verify rows per round (busy sessions x (draft depth + 1)) by lowering the draft depth, never below 1; "
+                             "default 5 when --sessions > 1, 0 = off")
+    parser.add_argument("--sessions", type=int, default=1,
+                        help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
+                             "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
@@ -993,18 +1180,27 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    if not 1 <= args.sessions <= MAX_SESSIONS:
+        parser.error(f"--sessions must be 1..{MAX_SESSIONS}")
+    if args.sessions > 1:
+        print(f"serve: --sessions {args.sessions}: up to {args.sessions} requests share the KV pool of -c {args.max_ctx} "
+              f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
+              f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
+              file=sys.stderr, flush=True)
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))
     SERVE_DEFAULTS.update({k: v for k, v in (("temperature", args.default_temperature), ("top_p", args.default_top_p),
                                              ("reasoning_effort", args.default_reasoning_effort),
                                              ("max_tokens", args.default_max_tokens)) if v is not None})
+    if args.exact_prefix_cache:
+        os.environ["EXL3_PREFILL_BIG_TAIL"] = "0"
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
-    tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
+    tune = warm and os.environ["EXL3_DENSE_GEMM_TUNE"] != "0" and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
     startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
@@ -1012,8 +1208,9 @@ def main() -> None:
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
-        engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision)
+        engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
+                              vision=not args.no_vision, sessions=args.sessions)
+        engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
@@ -1037,12 +1234,12 @@ def main() -> None:
                 mem_diag("warm")
             # EXL3_SERVE_DTUNE_PRIME_S: time budget for pre-tuning dense GEMM classes (0 = skip)
             budget = float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600"))
-            if budget > 0:
+            if budget > 0 and os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") != "0":
                 keys, secs = prime_dense_tune(budget)
                 print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
                 print(mem_line("primed"), flush=True)
         from exllamav3.generator.slot_store import SlotStore
-        engine.slot_store = SlotStore(engine.greedy_generator, [engine.cache, engine.draft_cache],
+        engine.slot_store = SlotStore(engine.greedy_generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                       args.slot_save_path, args.model_id)
         if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

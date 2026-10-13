@@ -19,7 +19,7 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .job import Job
+from .job import Job, _ttrace_begin, _ttrace_end
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -99,6 +99,7 @@ class Generator:
         num_draft_tokens: int | None = None,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        tail_ckpt: int | None = None,
         cpu_cache_size: int = 0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
@@ -297,6 +298,12 @@ class Generator:
 
         # Defrag
         self.enable_defrag = enable_defrag
+
+        # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
+        self.tail_ckpts = []
+        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8")) if tail_ckpt is None else int(tail_ckpt)
+        # prompts shorter than this never stash (the stash is 20-40 ms of host copy and 142 MiB per entry)
+        self.tail_ckpt_min = int(os.environ.get("EXL3_TAIL_MIN", "512"))
 
         # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
@@ -605,18 +612,27 @@ class Generator:
             "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
 
         results = []
+        _t0 = _ttrace_begin()
         self.iterate_start_jobs(results)
+        _ttrace_end("start_jobs (alloc pages/restore ckpt)", _t0)
 
         # Perform one round of prefill
+        _t0 = _ttrace_begin()
         for job in list(self.active_jobs):
             try:
                 job.prefill(results)
             except Exception as e:
+                if os.environ.get("KYO_TURN_TRACE"):
+                    import traceback; traceback.print_exc()
                 self.reap_failed_job(job, e, results)
+        _ttrace_end("prefill total", _t0)
 
         # Recurrent checkpoints
+        _t0 = _ttrace_begin()
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
+        _ttrace_end("recurrent_checkpoint", _t0)
+        _t0 = _ttrace_begin()
 
         # Generation with draft model
         if self.draft_model:
@@ -643,6 +659,7 @@ class Generator:
         else:
             self.iterate_gen(results)
 
+        _ttrace_end("generation round", _t0)
         # Visualization
         if self.visualizer:
             self.update_visualizer()
@@ -782,6 +799,11 @@ class Generator:
             }
 
         return self.draft_ids_pinned[:, :window]
+
+
+    def clear_prompt_ckpts(self):
+        """Drop every prompt-end recurrent checkpoint (host memory, ~142 MiB each)."""
+        self.tail_ckpts.clear()
 
 
     def _flush_mtp_defer(self, job, with_tail: bool):
