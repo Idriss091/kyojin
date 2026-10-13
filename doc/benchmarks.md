@@ -23,6 +23,12 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 | GLM-5.3-Flash | 99.73 GB | 634 | 637 | 613 | 589 | 567 | 26.2 | 31.4 | 33.4 |
 | MiMo-V2.6-Flash | 105.8 GB | 760 | 702 | 599 | 458 | - | 28.9 | 31.2 | 37.0 |
 
+Kyojin 1.5, same recipe on a second Ryzen AI Max+ 395 with 128 GB: Qwen3.8-Flash-Next 1486 / 1478 / 1454 / 1397 / 1349
+prefill and 45.8 / 48.3 / 67.0 decode; GLM-5.3-Flash 623 / 629 / 602 prefill at 8K / 32K / 64K and 26.3 / 30.8 / 33.0
+decode. Since 1.5 the GLM server starts without the dense GEMM tuner (first start 95 s instead of about 13 minutes);
+the GLM row above was taken with it, and `EXL3_DENSE_GEMM_TUNE=1` brings it back.
+GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once, 40.6 for four.
+
 
 ![Prefill against context, three models](img/prefill.svg)
 

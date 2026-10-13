@@ -35,6 +35,7 @@ These are first versions. Speed, context length and model support keep improving
 Thank you to everyone who tests Kyojin on their own machine and writes precise reports.
 
 - [@felladrin](https://github.com/felladrin): pull requests for the GLM start-up, the GPU target lookup, the bench tool tests, the troubleshooting page, `--sessions` in the Qwen server and `tools/bench.sh --json`; bug reports, an independent benchmark and issue triage.
+- [@MangetsuC](https://github.com/MangetsuC): the GLM image path without solver searches (first image of a new size in seconds) and the dense GEMM tune primer.
 - [@nobert](https://github.com/nobert): the Prometheus `/metrics` endpoint, merged for GLM and MiMo.
 - [@morrisfamily](https://github.com/morrisfamily): benchmark report on a BOSGAME Beyond-Max.
 - [@ChrisC381](https://github.com/ChrisC381): reported the GLM difference between paired jobs.
