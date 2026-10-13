@@ -69,6 +69,17 @@ def test_glm_mimo_defaults(tmp_path, family):
     assert "--default-top-k" not in argv and "--default-min-p" not in argv
 
 
+def test_glm_pack_without_draft_sidecar_is_reported(tmp_path):
+    p = pack(tmp_path, TYPES["glm"])
+    warned = lambda env: any("mtp_eh_proj.st" in n and "WARNING" in n for n in ka.build(env)[1])
+    assert warned(env_for(tmp_path, "glm"))
+    assert not warned({**env_for(tmp_path, "glm"), "EXL3_MTP_EH_FP16": "0"})   # an explicit choice is not second-guessed
+    (p / ka.GLM_EH_SIDECAR).write_text("w")
+    assert not warned(env_for(tmp_path, "glm"))
+    pack(tmp_path / "q", TYPES["qwen"])
+    assert not any("WARNING" in n for n in ka.build(env_for(tmp_path / "q", "qwen"))[1])
+
+
 @pytest.mark.parametrize("family", ka.SERVERS)
 def test_profile_complete_and_flags_exist_in_servers(family):
     """Each flag emitted for a family, from the profile or from an option, must be an add_argument of that server."""

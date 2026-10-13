@@ -53,6 +53,7 @@ TRUE = {"1", "true", "yes", "on"}
 FALSE = {"0", "false", "no", "off"}
 # Weight files of a pack are listed in this index when the pack is sharded
 INDEX = "model.safetensors.index.json"
+GLM_EH_SIDECAR = "mtp_eh_proj.st"  # optional file of the GLM pack, read by tools/glm/serve.py
 
 
 class ConfigError(Exception):
@@ -258,6 +259,9 @@ def build(env, hub=None) -> tuple:
     pack = resolve_pack(model_dir, family, env, hub)
     argv = [SERVERS[family], "--model", str(pack), "--host", bare("HOST", env, "0.0.0.0"), "--port", port, "-c", ctx]
     argv += options + flags + shlex.split(env.get("KYOJIN_EXTRA_ARGS", ""))
+    if family == "glm" and not (pack / GLM_EH_SIDECAR).is_file() and "EXL3_MTP_EH_FP16" not in env:
+        notes.append(f"WARNING: {pack} has no {GLM_EH_SIDECAR}: speculative decode is about 15 % slower without it; "
+                     "download the pack again to get the file")
     return argv, notes + [f"family={family} pack={pack} context={ctx}"]
 
 
