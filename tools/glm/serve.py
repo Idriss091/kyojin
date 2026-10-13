@@ -605,7 +605,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     processing = 0  # admitted requests; closure, app config is immutable after startup
-    app = web.Application(client_max_size=16 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
+    app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
