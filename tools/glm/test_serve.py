@@ -717,6 +717,59 @@ class SessionsTests(unittest.TestCase):
         self.assertEqual(gen.num_remaining_jobs(), 0)   # the cancelled job left the Generator
         self.assertEqual(len(gen.cancelled), 1)
 
+    def test_driver_follows_a_rebuilt_generator(self):
+        """cache_salt change: _rebuild_generator swaps the Generator while the driver runs. Jobs enqueued afterwards must
+        be stepped (the driver once kept the old Generator and the request waited forever)."""
+        class Job:
+            serial_number = None
+
+        class Gen:
+            made = 0
+
+            def __init__(self):
+                Gen.made += 1
+                self.active_jobs, self.pending_jobs, self.k = [], [], 0
+
+            def enqueue(self, job):
+                job.serial_number = 100 + Gen.made
+                self.active_jobs.append(job)
+                return job.serial_number
+
+            def num_remaining_jobs(self):
+                return len(self.active_jobs)
+
+            def cancel(self, job):
+                self.active_jobs.remove(job)
+
+            def clear_queue(self):
+                self.active_jobs.clear()
+
+            def iterate(self):
+                out = []
+                for j in list(self.active_jobs):
+                    self.active_jobs.remove(j)
+                    out.append({"serial": j.serial_number, "text": "ok", "eos": True, "new_tokens": 1})
+                return out
+
+        async def check():
+            eng = object.__new__(serve.ResidentEngine)
+            eng.sessions, eng.greedy_generator = 2, Gen()
+            eng.torch = type("T", (), {"cuda": type("C", (), {"empty_cache": staticmethod(lambda: None)})})()
+            eng._make_generator = Gen
+
+            async def one():
+                txt = []
+                async for piece in eng._run_shared(Job(), type("T", (), {"numel": lambda self: 1})(), asyncio.Event(), {}, 0.0, None):
+                    txt.append(piece)
+                return "".join(txt)
+
+            first = await one()
+            await eng.reset_prefix_cache()
+            second = await asyncio.wait_for(one(), 5)
+            return first, second
+
+        self.assertEqual(run(check()), ("ok", "ok"))
+
 
 class VllmCompatTests(unittest.TestCase):
     """POST /tokenize, /v1/completions with token-id prompts, cache_salt (model-free: fake engine)."""

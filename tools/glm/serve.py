@@ -571,7 +571,6 @@ class ResidentEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
-        generator = self.greedy_generator
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -587,6 +586,8 @@ class ResidentEngine:
                 else:
                     if not fut.done():
                         fut.set_result(res)
+            # read every round: _rebuild_generator (cache_salt change) replaces the Generator between two steps
+            generator = self.greedy_generator
             if not generator.num_remaining_jobs():
                 self._wake.clear()
                 if not self._cmds:
