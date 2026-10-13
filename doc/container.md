@@ -139,6 +139,7 @@ The container port must be the port llama-swap picked (`-p ${PORT}:${PORT}`), so
 | `KYOJIN_DRAFT_TOKENS`, `KYOJIN_DRAFT_POLICY` | server default | Speculative decoding settings |
 | `KYOJIN_ENABLE_VISION`, `_THINKING`, `_UNCENSOR` | on | `0` switches the feature off (Qwen; uncensor also GLM) |
 | `KYOJIN_CACHE_DIR` | see "Keep the cache" | Folder for the kernel cache |
+| `KYOJIN_STOP_TIMEOUT` | `20` | Seconds after SIGTERM before a server that is still running gets SIGKILL (keep it below `docker stop -t`) |
 | `KYOJIN_DOWNLOAD`, `KYOJIN_HF_REPO` | on, the model's repo | Pack download control |
 | `KYOJIN_EXTRA_ARGS` | empty | Extra server arguments, shell-quoted |
 | `EXL3_*` | unset | Engine variables pass through unchanged |

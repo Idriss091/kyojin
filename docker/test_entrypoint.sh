@@ -23,7 +23,10 @@ print("STUB args:", " ".join(a), flush=True)
 print("STUB env: sourced=%s triton=%s" % (os.environ.get("KYOJIN_TEST_ENV_SOURCED"), os.environ.get("TRITON_CACHE_DIR")), flush=True)
 if "--rc" in a:
     sys.exit(int(a[a.index("--rc") + 1]))
-if "--hang" in a:
+if "--deaf" in a:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print("STUB deaf", flush=True)
+if "--hang" in a or "--deaf" in a:
     time.sleep(60)
 EOF
 mkdir -p "$T/bin"; ln -s "$(command -v python3)" "$T/bin/python"
@@ -68,6 +71,14 @@ for i in $(seq 1 50); do grep -q 'STUB env' "$T/out.term" 2>/dev/null && break; 
 S=$(date +%s.%N); kill -TERM "$EP"; wait "$EP"; RC=$?; E=$(python3 -c "import time;print(round(time.time()-$S,1))")
 check "SIGTERM stops the server (exit 143) in under 3 s (took ${E}s)" "[ $RC = 143 ] && python3 -c 'import sys;sys.exit(0 if $E<3 else 1)'"
 check "stop is logged" "grep -q 'signal received' $T/out.term"
+
+# 4b a server that ignores SIGTERM is killed after KYOJIN_STOP_TIMEOUT
+mkdir -p "$T/home.deaf"
+env -i PATH="$PATH" HOME="$T/home.deaf" KYOJIN_ROOT="$R" KYOJIN_MODEL=qwen MODEL_DIR="$T/models" KYOJIN_STOP_TIMEOUT=2 setsid bash "$R/docker/entrypoint.sh" --deaf >"$T/out.deaf" 2>&1 &
+EP=$!
+for i in $(seq 1 50); do grep -q 'STUB deaf' "$T/out.deaf" 2>/dev/null && break; sleep 0.2; done
+S=$(date +%s.%N); kill -TERM "$EP"; wait "$EP"; RC=$?; E=$(python3 -c "import time;print(round(time.time()-$S,1))")
+check "a server deaf to SIGTERM is killed after the timeout (exit 137, took ${E}s)" "[ $RC = 137 ] && python3 -c 'import sys;sys.exit(0 if 1.5<$E<6 else 1)' && grep -q 'SIGKILL' $T/out.deaf"
 
 # 5 SIGTERM during the configuration step (a long download): stub the argument script with a sleeper
 R2=$T/root2; cp -r "$R" "$R2"; printf 'import time\ntime.sleep(60)\n' >"$R2/docker/kyojin_args.py"
