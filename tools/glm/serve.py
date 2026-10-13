@@ -34,6 +34,9 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
 SPEED_ENV = {
+    # Vision spatial-merge convolution as one GEMM: no MIOpen solver search, so the first image of a new
+    # size costs seconds, not minutes (first 1024x1024: 433 s -> 4 s; answers byte-identical). "0" = F.conv2d.
+    "EXL3_CONV_GEMM": "1",
     "EXL3_MOE_CFG": "2",
     "EXL3_HIP_PREFILL_MIN_ROWS": "2",
     "EXL3_BLOCK_GRAPH": "1",
