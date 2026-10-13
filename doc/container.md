@@ -8,6 +8,17 @@ Status of each line below: "tested" means run on a Strix Halo machine with docke
 
 ROCm torch and `rocm-sdk-devel` from AMD's gfx1151 nightly index, the Kyojin tree with its extension built by `build.sh`, and the compilers the servers need at run time. It sets `EXL3_ROCM_SDK`, `EXL3_HSA_LIB` (the SDK's HSA runtime, there is no `/opt/rocm`) and `EXL3_HIPCC` (Qwen's gated-residual and QSA prefill kernels compile with it at first start). Nothing of this has to be set by you.
 
+## Prebuilt images
+
+Nothing to build: the images of Kyojin 1.4 are on the GitHub registry (about 3 GB to download, 11 GB on disk).
+
+```bash
+docker pull ghcr.io/yamz-labs/kyojin-qwen:1.4     # or podman pull
+docker pull ghcr.io/yamz-labs/kyojin-glm:1.4
+```
+
+Then use `ghcr.io/yamz-labs/kyojin-qwen:1.4` in place of `kyojin-qwen` (or `localhost/kyojin-qwen`) in the run lines below. The MiMo image is not published: build it with the line below.
+
 ## Build (tested)
 
 ```bash
