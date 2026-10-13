@@ -29,6 +29,11 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-temperature` / `--default-top-p` | from `generation_config.json` (`1.0` / `0.95`) | used when a request omits the field (explicit null too). Greedy defaults loop on agent clients that send no sampling |
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
+| `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
+| `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
+| `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
+| `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
+| `--exact-prefix-cache` | off | a request resumed from the prompt cache gives the same greedy text as its cold prefill. Costs about 5-12 % of cold prefill speed at 7-14K tokens |
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
 wins): `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,
@@ -188,8 +193,8 @@ models:
 
 ## Known limits
 
-- **One model, one flight.** The `asyncio.Queue` worker serializes every request; a
-  second concurrent request waits, it is not batched. `n > 1` is ignored.
+- **One request at a time by default.** A second concurrent request waits. `--sessions N` decodes N
+  requests together. `n > 1` is ignored.
 - **Client disconnect leaks work.** If the HTTP client goes away mid-stream, the worker
   keeps generating into the orphaned queue and every other request stalls until that
   generation ends.
