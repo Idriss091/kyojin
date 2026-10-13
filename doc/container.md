@@ -2,7 +2,7 @@
 
 One image per model: `kyojin-qwen`, `kyojin-glm`, `kyojin-mimo`. The three share every heavy layer (14.4 GB each on disk, one copy of the layers); only the last layer differs, and it only sets which defaults the image starts with. The model is never baked in: mount it on `/models`, or mount an empty folder and the image downloads the pack from the hub. The GPU is passed in as `/dev/kfd` and `/dev/dri`. Host requirements: a gfx1151 machine (Strix Halo, 128 GB) and the `amdgpu` kernel driver. No ROCm install is needed on the host.
 
-Status of each line below: "tested" means run on a Strix Halo machine with docker 29 (Qwen and GLM packs on 12/10/2026 with Kyojin 1.4; MiMo pack on 06/10/2026; local copies). "Untested" lines are marked.
+Status of each line below: "tested" means run on a Strix Halo machine with docker 29 (Qwen and GLM packs on 12/10/2026 with Kyojin 1.4; MiMo pack on 06/10/2026; local copies). The podman line was run on 13/10/2026 with podman 4.9 (Qwen pack). "Untested" lines are marked.
 
 ## What the image contains
 
@@ -52,7 +52,7 @@ The cache holds compiled HIP/Triton kernels and, for GLM, the dense GEMM tuning 
 
 Mount an empty writable folder on `/models`. The image downloads the pack of its model from the hub (95 to 106 GB) into it, checks the free space first, resumes after an interrupt and logs the size. `-e KYOJIN_DOWNLOAD=0` forbids it, `-e KYOJIN_HF_REPO=owner/name` picks another repository. Tested here with the packs already on disk; the download path itself is covered by the CPU tests with a fake hub and by a real download of a tiny public repository, not by a 95 GB pull.
 
-## Run as your own user, rootless podman (docker part tested, podman untested)
+## Run as your own user, rootless podman (tested)
 
 Podman with `--userns=keep-id` (or docker with `--user`) runs the server as your host user, who cannot write the image's `/root`. The entrypoint then uses a container-local home and prints `HOME not writable`. Put the cache on a folder you own:
 
@@ -64,7 +64,7 @@ docker run --rm --name kyojin-qwen --user "$(id -u):$(id -g)" \
   -p 8731:8731 kyojin-qwen
 ```
 
-Tested with docker and `--user 1000:1000`: ready in 392 s cold, 95 s warm from that cache. The podman line is the same idea and is untested (no podman on the test machine):
+Tested with docker and `--user 1000:1000`: ready in 392 s cold, 95 s warm from that cache. The podman line below is tested with rootless podman 4.9 on the Qwen pack (ready in 566 s cold, chat completions, clean stop in 1 s):
 
 ```bash
 podman run --rm --replace --name kyojin-qwen --http-proxy=false --userns=keep-id \
@@ -141,4 +141,5 @@ The container port must be the port llama-swap picked (`-p ${PORT}:${PORT}`), so
 ## Notes
 
 - One container, one model, one GPU: two models do not fit in 128 GB together.
+- Speed: the same request gives the same speed in the container and on the host (Qwen pack, 9.4K-token prompt, 400 generated tokens, same engine tree and flags, 6 runs each): prefill 1312 tok/s in the container and 1318 on the host, speculative decode 42.6 and 42.4 tok/s. The generated text is identical.
 - `--ipc=host` and `--ulimit memlock` are the flags of the tested runs. No `seccomp=unconfined` and no `label=disable` were needed with docker. SELinux hosts (Fedora, with podman) may need `--security-opt label=disable`: untested.
