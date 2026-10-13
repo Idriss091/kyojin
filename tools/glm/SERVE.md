@@ -98,6 +98,30 @@ server does not fetch remote URLs). One image takes 40 to about 1,500 tokens dep
 sent again in a later turn keeps the prompt cache. `--no-vision` skips the tower; an image request then gets HTTP 400,
 as do video and audio parts.
 
+For image input, three environment variables before the start make the first image of a new size fast:
+
+```bash
+export EXL3_CONV_GEMM=1            # vision spatial-merge convolution as a GEMM: no MIOpen solver search
+export EXL3_DENSE_GEMM_TUNE=0      # no dense GEMM screening, at startup or per shape
+export EXL3_SERVE_DTUNE_PRIME_S=0  # (implied by the line above; kept for explicitness)
+python tools/glm/serve.py \
+    --model ~/models/glm53-exl3-td205 --port 18080
+```
+
+With the defaults, the first image of every new size pays two independent searches: a MIOpen convolution
+solver search that grows with the vision token count (~0.3 s per token — about 68 s for a 400x400 image
+and 416 s for 1024x1024, and a 1 % change in resolution pays it again), plus a dense GEMM screening on
+the language and vision projections (up to 600 s at startup, 20-45 s for each new image size). The three
+variables above remove both: a new size then costs seconds and the start is ~45 s.
+`EXL3_DENSE_GEMM_TUNE=0` costs 0-7 % of prefill throughput, measured on this model (text is unaffected;
+a large-image prefill is about 6 % slower), because the expert layers are EXL3-quantized and do not use
+the tuned path.
+
+Without the code change, `MIOPEN_FIND_MODE=FAST` alone removes the convolution half of that cost
+(a first 1024x1024 goes from 431 s to 22 s) and leaves the GEMM side, and its 600 s of startup
+pre-tuning, exactly as the default has them. Measurements, the offline pre-generation alternative, and
+the comparison with the default configuration: [doc/EXL3_CONV_GEMM.md](../../doc/EXL3_CONV_GEMM.md).
+
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`
 name is emitted); frames are:
