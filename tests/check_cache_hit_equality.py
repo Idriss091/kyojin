@@ -4,9 +4,12 @@ wt = sys.argv[1]; out = sys.argv[2]
 LENS = [int(x) for x in sys.argv[3:]] or [5000, 7000]
 sys.path.insert(0, wt); sys.path.insert(0, wt + "/tools/glm")
 import torch
+MODEL = '/home/yaniss/hermes-work/v14g/run/home/models/GLM-5.3-Flash-EXL3-Yamz'
 import serve
+for _k, _v in serve.SPEED_ENV.items(): os.environ.setdefault(_k, _v)   # what serve.py main() does
+os.environ.setdefault('EXL3_MOE_UNION_V2', '1'); serve.apply_eh_sidecar_default(MODEL)
 from exllamav3.generator.sampler import GreedySampler
-eng = serve.ResidentEngine("/home/yaniss/hermes-work/v14g/run/home/models/GLM-5.3-Flash-EXL3-Yamz", max_history=2, max_ctx=int(os.environ.get("CTX", "65536")), num_draft=int(os.environ.get("NDRAFT", "2")), vision=False)
+eng = serve.ResidentEngine(MODEL, max_history=2, max_ctx=int(os.environ.get("CTX", "65536")), num_draft=int(os.environ.get("NDRAFT", "2")), vision=False)
 g = eng.greedy_generator
 files = ["exllamav3/generator/generator.py", "exllamav3/generator/job.py", "exllamav3/modules/gated_delta_net.py", "exllamav3/modules/mla_attn.py", "tools/glm/serve.py", "exllamav3/generator/pagetable.py"]
 def mk(i, n):

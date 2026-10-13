@@ -1150,6 +1150,9 @@ def main() -> None:
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--exact-prefix-cache", action="store_true",
+                        help="a request resumed from a cached page checkpoint gives the same greedy text as its cold prefill: "
+                             "plain prefill chunks (EXL3_PREFILL_BIG_TAIL=0), about 5-12 %% slower cold prefill at 7-14K tokens")
     parser.add_argument("--num-draft", type=int, default=2, help="MTP draft tokens per round (2 = R=3 verify, round2 27/09)")
     parser.add_argument("--max-history", type=int, default=None, help="recurrent state history slots; default = --num-draft. Each extra slot costs ~2.15 GiB")
     parser.add_argument("--row-budget", type=int, default=None,
@@ -1186,6 +1189,8 @@ def main() -> None:
     SERVE_DEFAULTS.update({k: v for k, v in (("temperature", args.default_temperature), ("top_p", args.default_top_p),
                                              ("reasoning_effort", args.default_reasoning_effort),
                                              ("max_tokens", args.default_max_tokens)) if v is not None})
+    if args.exact_prefix_cache:
+        os.environ["EXL3_PREFILL_BIG_TAIL"] = "0"
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
