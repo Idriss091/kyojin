@@ -29,7 +29,6 @@ decode. Since 1.5 the GLM server starts without the dense GEMM tuner (first star
 the GLM row above was taken with it, and `EXL3_DENSE_GEMM_TUNE=1` brings it back.
 GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once, 40.6 for four.
 
-
 ![Prefill against context, three models](img/prefill.svg)
 
 ### Speculative decode by context
