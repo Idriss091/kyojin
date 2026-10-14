@@ -136,6 +136,19 @@ class T(unittest.TestCase):
         try: self.assertEqual(sp.env_defaults(3), (0.5, 0.3, 5))
         finally: del os.environ["QWSPEC_THF"]; del os.environ["QWSPEC_MAXD"]
 
+    def test_ngram_from_env(self):
+        os.environ.pop("QWSPEC_NGRAM", None)
+        self.assertEqual(sp.ngram_from_env(), (2, 7, 16))
+        for v, want in (("2,3,5", (2, 3, 5)), ("off", None), ("0", None), (" 3, 7, 16 ", (3, 7, 16))):
+            os.environ["QWSPEC_NGRAM"] = v
+            try: self.assertEqual(sp.ngram_from_env(), want)
+            finally: del os.environ["QWSPEC_NGRAM"]
+        for v in ("2,7", "17,7,32", "2,0,5", "4,7,3"):
+            os.environ["QWSPEC_NGRAM"] = v
+            try:
+                with self.assertRaises(ValueError): sp.ngram_from_env()
+            finally: del os.environ["QWSPEC_NGRAM"]
+
     def test_online_scale(self):
         r = sp.OnlineRule(0.5, 0.3, 6)
         for _ in range(60):

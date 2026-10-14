@@ -313,6 +313,20 @@ def env_defaults(ndt):
     """(thf, thv, maxd) for install(): today's 0.6 / 0.3 / ndt unless QWSPEC_THF / QWSPEC_THV / QWSPEC_MAXD are set."""
     return _envf("QWSPEC_THF", 0.6), _envf("QWSPEC_THV", 0.3), _envf("QWSPEC_MAXD", int(ndt))
 
+def ngram_from_env(default=(2, 7, 16)):
+    """n-gram lookup setting for install(): (gram, K, match) from QWSPEC_NGRAM = "gram,K,match"; "off" = no lookup (None).
+    Default (2, 7, 16): the lookup replaces the drafter only on a match of 16 tokens or more and then drafts 7 tokens.
+    The former (2, 3, 5) dates from the time the drafter stopped at 3 drafts. With the deep tier the drafter keeps 4-5 drafts
+    on JSON and code where a 5-token match (keys, punctuation, idioms) copies the wrong values: lookup rounds accepted
+    1.7 of 3 drafts there against 5.1 of 5.5 for drafter rounds, and on a plain copy 3 drafts per round is less than the
+    drafter gives alone. QWSPEC_NGRAM=2,3,5 restores the former setting."""
+    v = (os.environ.get("QWSPEC_NGRAM") or "").strip().lower()
+    if v == "": return default
+    if v in ("off", "0", "none"): return None
+    g, k, m = (int(x) for x in v.split(","))
+    if not (1 <= g <= LMAX and k >= 1 and m >= g): raise ValueError(f"QWSPEC_NGRAM={v}")
+    return (g, k, m)
+
 def rule_from_env(thf, thv, maxd):
     """QWSPEC_RULE = tier (default) | product (the former 0.6/0.3/3 rule when maxd=3) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
     QWSPEC_FIXD = N: draft N depths with no host read and truncate once per round (rule applied on the stacked probabilities)."""

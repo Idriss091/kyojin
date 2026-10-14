@@ -728,7 +728,7 @@ class QwenEngine:
             thf, thv, maxd = spec_policy.env_defaults(self.ndt)   # 0.6 / 0.3 / ndt unless QWSPEC_THF / THV / MAXD are set
             fx = os.environ.get("QWSPEC_FIXD")
             self.uninstall = spec_policy.install(self.generator, self.draft_model, self.model,
-                                                 thf, thv, maxd, (2, 3, 5), {},
+                                                 thf, thv, maxd, spec_policy.ngram_from_env(), {},
                                                  rule=spec_policy.rule_from_env(thf, thv, maxd), fixed=int(fx) if fx else None)
         self.spec_on = spec
         if self.slot_store is not None:
