@@ -154,6 +154,30 @@ class T(unittest.TestCase):
             try: self.assertEqual(sp.ngram_from_env(), want)
             finally: del os.environ["QWSPEC_NGRAM"]
 
+    def test_install_lookup(self):
+        # lookup-only installer (GLM): a lookup round runs ONE draft forward and returns the copied tokens; any other round
+        # is the generator's own, at its own depth; the window is restored
+        from exllamav3.util.tensor import SeqTensor
+        row = lambda v: list(range(100, 120)) + [v] + [7, 8, 9]
+        def gen(ctx):
+            g = FakeGen(2); dm = FakeDM(g, [0.9] * 8); g.dm, g.lm = dm, FakeLM(dm); dm.chain = [0.9] * 16
+            sid = SeqTensor((1, 1), torch.long, -1, init_cap=256); sid.append(torch.tensor([ctx], dtype=torch.long))
+            g.job.sequences[0].sequence_ids = sid
+            return g
+        st = {}
+        g = gen(row(1000) + list(range(100, 118))); un = sp.install_lookup(g, (2, 3, 16, 1), st)
+        out = g.iterate_draftmodel_mtp_gen([])
+        self.assertEqual((out.tolist(), g.forwards, g.num_draft_tokens, st), ([[118, 119, 1000]], 1, 2, {"ng": 1, "ng_tokens": 3}))
+        g = gen(row(1000) + row(2000) + list(range(100, 118))); sp.install_lookup(g, (2, 3, 16, 1))
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).tolist(), [[118, 119]])            # cut where the two rows differ
+        g = gen(row(1000) + row(2000) + list(range(100, 118))); sp.install_lookup(g, (2, 3, 16, 3))
+        self.assertEqual((g.iterate_draftmodel_mtp_gen([]).shape[-1], g.forwards), (2, 2))   # under cmin: the drafter's own round
+        g = gen(list(range(40))); un = sp.install_lookup(g, (2, 3, 16, 1))
+        self.assertEqual((g.iterate_draftmodel_mtp_gen([]).shape[-1], g.forwards), (2, 2))   # no match
+        g.active_jobs = [g.job, FakeJob()]
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).shape[-1], 2)                      # two requests: no lookup
+        un(); self.assertNotIn("iterate_draftmodel_mtp_gen", g.__dict__)
+
     def test_witness_len(self):
         # a templated list: the constant part is copied, the copy stops at the value that changes from row to row
         row = lambda v: list(range(100, 120)) + [v, v + 1] + [7, 8, 9]

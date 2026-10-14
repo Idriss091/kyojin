@@ -371,6 +371,16 @@ class ResidentEngine:
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
         slots = max(1 if sessions == 1 else MAX_SESSIONS, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
+        # GLM_NGRAM = "gram,K,match[,cmin]" (off by default): n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
+        # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
+        # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot).
+        v = (os.environ.get("GLM_NGRAM") or "off").strip().lower()
+        self.lookup = None if v in ("off", "0", "none") or num_draft < 1 else tuple(int(x) for x in v.split(","))
+        if self.lookup:
+            if not (3 <= len(self.lookup) <= 4 and 1 <= self.lookup[0] <= 16 and self.lookup[1] >= 1 and self.lookup[2] >= self.lookup[0]):
+                raise ValueError(f"GLM_NGRAM={v}")
+            max_history = max(max_history, self.lookup[1])
+        self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history, max_batch_size=slots)
         startup_health.stage("target weights")
@@ -392,9 +402,8 @@ class ResidentEngine:
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
         # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
-        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: one
-        # load, arms interleaved, +3.8 % first-token rate at 8K and +11 % at 2K, but over five server loads the 8K figure did
-        # not move and two of the three loads with the switch had slow outliers (cause not found). The Qwen server has it on.
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: four
+        # server loads in both orders give +2.1 % first-token rate at 8K and +7.9 % at 2K. The Qwen server has it on.
         if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
             import gc
             gc.collect()
@@ -407,10 +416,20 @@ class ResidentEngine:
         os.environ.setdefault("EXL3_MOE_UNION_V2", "1")  # the "+v2" of n1f2+v2
 
     def _make_generator(self):
-        return self.Generator(
+        lookup = getattr(self, "lookup", None)
+        g = self.Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.num_draft or None,
+            draft_model=self.draft_model, draft_cache=self.draft_cache,
+            num_draft_tokens=max(self.num_draft, lookup[1] if lookup else 0) or None,   # buffers for the widest round
             record_draft_stats=True)
+        if lookup:
+            qdir = str(Path(__file__).resolve().parent.parent / "qwen")
+            if qdir not in sys.path:
+                sys.path.append(qdir)
+            import spec_policy
+            spec_policy.install_lookup(g, lookup, self.lookup_stats)
+            g.num_draft_tokens = self.num_draft     # the drafter's own depth; lookup rounds bring their K tokens
+        return g
 
     def _rebuild_generator(self) -> None:
         """A fresh Generator over the same Cache (one at a time: a second one takes the Cache over). It drops the whole prompt

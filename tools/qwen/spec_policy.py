@@ -346,6 +346,35 @@ def ngram_from_env(default=(2, 7, 16, 3)):
     if not (3 <= len(f) <= 4 and 1 <= g <= LMAX and k >= 1 and m >= g and min(f) >= 0): raise ValueError(f"QWSPEC_NGRAM={v}")
     return tuple(f)
 
+def install_lookup(g, ngram, stats=None):
+    """The n-gram lookup alone, for a Generator whose drafter keeps its own fixed depth (GLM): no depth rule, no read of the
+    draft probabilities. ngram = (nmin, K, lmin[, cmin]) as in install(). When the context suffix (>= lmin tokens) occurred
+    before, the round verifies its continuation (K tokens, cut by cmin as in install()) and runs ONE draft forward so the
+    drafter cache has no hole; every other round is the Generator's own. Only with a single active request. The cache
+    needs max_history >= K. Returns an uninstall function."""
+    fol = SeqFollower(ngram[0]); K, lmin = ngram[1], ngram[2]; cmin = ngram[3] if len(ngram) > 3 else 0
+    orig = type(g).iterate_draftmodel_mtp_gen.__get__(g)
+    def wrapped(results):
+        cont = None
+        if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
+            idx = fol.sync(g.active_jobs[0].sequences[0].sequence_ids)
+            L, c = idx.match(K)
+            if L >= lmin and c:
+                cont = c
+                if cmin > 0:
+                    a = idx.witness_len(c)
+                    if a < len(c): cont = c[:a] if a >= cmin else None
+        if cont is None: return orig(results)
+        w = g.num_draft_tokens; g.num_draft_tokens = 1
+        try: out = orig(results)
+        finally: g.num_draft_tokens = w
+        if out is None: return None
+        if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + len(cont)
+        return torch.tensor([cont], dtype=torch.long)
+    g.iterate_draftmodel_mtp_gen = wrapped
+    def uninstall(): g.__dict__.pop("iterate_draftmodel_mtp_gen", None)
+    return uninstall
+
 def rule_from_env(thf, thv, maxd):
     """QWSPEC_RULE = tier (default) | product (the former 0.6/0.3/3 rule when maxd=3) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
     QWSPEC_FIXD = N: draft N depths with no host read and truncate once per round (rule applied on the stacked probabilities)."""
