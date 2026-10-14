@@ -98,6 +98,14 @@ SPEED_ENV = {
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
     "EXL3_SPEC_SAMPLED": "1",
+    # 14/10 (box1 nc2): prefill producers write GEMM-padded rows (KDA o_proj input, mHC norm outputs) and the shared expert is
+    # added in the routed-MoE reduce epilogue: no pad copies, no separate widen + fp32 add. Bitwise: first-token and restored-
+    # prompt logits equal on vs off (kamel, 3 x 8K + 1 x 32K, one load, ABBA). 8K prefill +3.7..+6.2 % (these four + the async
+    # stash, which alone shows no gain and stays off), 32K +0.3 % (shared fuse) / +2.2 % (pads). 0 = off.
+    "EXL3_NC2_SHARED_FUSE": "1",
+    "EXL3_NC2_KDA_OPAD": "1",
+    "EXL3_NC2_HC_YPAD": "1",
+    "EXL3_NC2_HC_YPAD_MLP": "1",
 }
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
