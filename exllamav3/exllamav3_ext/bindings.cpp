@@ -90,6 +90,7 @@
 #include "dsa_topk_gfx12.cuh"
 #include "add.cuh"
 #include "fused_elt.cuh"
+#include "mla_dec_valu.cuh"
 #include "kda_inter.cuh"
 
 #include "quant/pack.cuh"
@@ -429,6 +430,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
     m.def("kda_gate", &kda_gate, "kda_gate");
     m.def("kda_fb_gate", &kda_fb_gate, "kda_fb_gate");
+#if defined(USE_ROCM)
+    m.def("mla_absorb_dec", &mla_absorb_dec, "mla_absorb_dec");
+    m.def("mla_unfold_dec", &mla_unfold_dec, "mla_unfold_dec");
+#endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
