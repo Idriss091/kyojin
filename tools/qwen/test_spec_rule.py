@@ -7,6 +7,7 @@ import os, sys, random, unittest
 os.environ.setdefault("HIP_VISIBLE_DEVICES", ""); os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
+import numpy as np
 import spec_policy as sp
 
 def ref_keep(ps, thf=0.6, thv=0.3, maxd=3):
@@ -138,16 +139,47 @@ class T(unittest.TestCase):
 
     def test_ngram_from_env(self):
         os.environ.pop("QWSPEC_NGRAM", None)
-        self.assertEqual(sp.ngram_from_env(), (2, 7, 16))
+        self.assertEqual(sp.ngram_from_env(), (2, 7, 16, 3))
         for v, want in (("2,3,5", (2, 3, 5)), ("off", None), ("0", None), (" 3, 7, 16 ", (3, 7, 16))):
             os.environ["QWSPEC_NGRAM"] = v
             try: self.assertEqual(sp.ngram_from_env(), want)
             finally: del os.environ["QWSPEC_NGRAM"]
-        for v in ("2,7", "17,7,32", "2,0,5", "4,7,3"):
+        for v in ("2,7", "17,7,32", "2,0,5", "4,7,3", "2,7,16,3,1", "2,7,16,-1"):
             os.environ["QWSPEC_NGRAM"] = v
             try:
                 with self.assertRaises(ValueError): sp.ngram_from_env()
             finally: del os.environ["QWSPEC_NGRAM"]
+        for v, want in (("2,7,16,3", (2, 7, 16, 3)), ("2,7,16,0", (2, 7, 16, 0))):
+            os.environ["QWSPEC_NGRAM"] = v
+            try: self.assertEqual(sp.ngram_from_env(), want)
+            finally: del os.environ["QWSPEC_NGRAM"]
+
+    def test_witness_len(self):
+        # a templated list: the constant part is copied, the copy stops at the value that changes from row to row
+        row = lambda v: list(range(100, 120)) + [v, v + 1] + [7, 8, 9]
+        idx = sp.NgramIndex(2)
+        for t in row(1000) + row(2000) + list(range(100, 118)): idx.push(t)
+        L, c = idx.match(7)
+        self.assertEqual((L >= 16, c), (True, [118, 119, 2000, 2001, 7, 8, 9]))
+        self.assertEqual(idx.witness_len(c), 2)
+        # one earlier occurrence only: nothing to compare with, the whole continuation stands
+        idx = sp.NgramIndex(2)
+        for t in row(1000) + list(range(100, 118)): idx.push(t)
+        L, c = idx.match(7)
+        self.assertEqual(idx.witness_len(c), len(c))
+        # against a direct scan on random streams with many repeats
+        import random
+        rng = random.Random(5)
+        for _ in range(300):
+            n = rng.randint(20, 400); per = [rng.randrange(4) for _ in range(rng.randint(3, 40))]
+            ctx = [per[i % len(per)] if rng.random() > 0.03 else rng.randrange(4) for i in range(n)]
+            idx = sp.NgramIndex(2); idx.extend(np.array(ctx))
+            L, c = idx.match(7)
+            if not L or idx._hit is None: continue
+            j, m = idx._hit
+            j2 = next((e for e in range(j - 1, m - 1, -1) if ctx[e - m:e] == ctx[j - m:j]), -1)
+            want = len(c) if j2 < 0 else next((a for a in range(len(c)) if ctx[j2 + a] != c[a]), len(c))
+            self.assertEqual(idx.witness_len(c), want)
 
     def test_online_scale(self):
         r = sp.OnlineRule(0.5, 0.3, 6)
