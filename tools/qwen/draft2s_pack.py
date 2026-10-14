@@ -4,7 +4,7 @@
 # Tier 2 row copy: the head rows after a 128-point input Hadamard per group, 3 bits per weight, one fp16 scale per (row,
 #   group): row-addressable, unlike the EXL3 head (its output Hadamard mixes 128 rows).
 # Tier 3 is the EXL3 head itself (exact logits of the short-listed 128-row blocks): nothing to pack.
-# Maths = box1 desk/composed_check.py and night1 qw0/head_sim3.py (recall 0.9958 at m = 512 on held-out steps).
+# Maths checked offline (recall 0.9958 at m = 512 on held-out steps).
 # usage: draft2s_pack.py W.npy HDIR OUT.safetensors     (W.npy = the dequantized head (in_features, vocab); HDIR = rec.json +
 #        h_*.npy of a capture; only the "train" split is used for the fit)
 import os, sys, json
@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import save_file
 
 AXES, GROUP = int(os.environ.get("DRAFT2S_AXES", 512)), 128
-M = int(os.environ.get("DRAFT2S_M", 512))   # tier-1 target count; GLM 4096-wide head: 1024 (box1 NOTEBOOK Result 11)
+M = int(os.environ.get("DRAFT2S_M", 512))   # tier-1 target count; GLM 4096-wide head: 1024 (measured)
 
 def hadamard(n):
     h = np.array([[1.0]], dtype=np.float32)

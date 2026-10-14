@@ -96,7 +96,7 @@ SPEED_ENV = {
     "EXL3_GEMV_R_RM6": "1",
     # 14/10: sampled requests (temperature > 0) draw the MTP drafts from the drafter's own law and keep them with the exact
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
-    # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, chat / code / structured within noise. 0 = argmax drafts.
+    # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
     "EXL3_SPEC_SAMPLED": "1",
 }
 

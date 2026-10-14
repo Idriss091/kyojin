@@ -11,9 +11,9 @@ A draft step needs one argmax and one max probability over the whole vocabulary.
   argmax = best exact logit among the 16; p = 1 / sum over candidates exp(v - max), v = exact logit for the 16, the
   3-bit score for the others (rows outside the candidates are left out: they hold a median 0.0000 / 90th pct 0.0011 of
   the normaliser on held-out Qwen draft steps, and dropping them changes the replayed served rule by <= 0.12 point).
-The target verifies every draft, so this head cannot change the text, only how many drafts are accepted (box1 NOTEBOOK
-Results 3-7: argmax = full head on 99.70 % of held-out steps).
-All index maths are bounds-checked on the CPU in box1 desk/draft2s_head_bounds.py (masked loads, clamped rows)."""
+The target verifies every draft, so this head cannot change the text, only how many drafts are accepted (measured:
+argmax = full head on 99.70 % of held-out steps).
+All index maths are bounds-checked on the CPU (masked loads, clamped rows)."""
 import os
 import torch
 import triton
