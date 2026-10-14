@@ -336,7 +336,7 @@ def load_image(url: str) -> tuple[Any, str]:
         raise _bad(f"cannot decode image: {exc}") from exc
 
 
-MAX_SESSIONS = 16   # Cache default max_batch_size (recurrent state slots)
+MAX_SESSIONS = 16   # upper bound of --sessions (the Cache default max_batch_size)
 
 
 class ResidentEngine:
@@ -354,9 +354,11 @@ class ResidentEngine:
         self.torch = torch
         self.Job = Job
         self.num_draft = num_draft
-        # Concurrent requests batched through the one Generator. The recurrent (KDA) state has Cache.max_batch_size = 16
-        # slots whatever the value (the Cache default, allocated in every case), so up to MAX_SESSIONS sessions cost no
-        # extra state memory; the paged KV pool (ctx + 4096 tokens) is shared by all sessions.
+        # Concurrent requests batched through the one Generator. The recurrent (KDA) state is allocated per slot and per
+        # history level (138 MiB each). The Cache default of 16 slots was allocated whatever --sessions said: 6.6 GiB at
+        # --num-draft 2, of which a single session uses 0.4 GiB. With one session the cache now gets one slot (the
+        # Generator caps its batch at the slot count); several sessions keep the 16 slots, that path was not re-measured.
+        # EXL3_GLM_SLOTS=16 restores the old layout. The paged KV pool (ctx + 4096 tokens) is shared by all sessions.
         if not 1 <= sessions <= MAX_SESSIONS:
             raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
         self.sessions = sessions
@@ -368,14 +370,15 @@ class ResidentEngine:
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
+        slots = max(1 if sessions == 1 else MAX_SESSIONS, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
-                           max_history=max_history)
+                           max_history=max_history, max_batch_size=slots)
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                     max_history=max_history)
+                                     max_history=max_history, max_batch_size=slots)
             startup_health.stage("drafter weights")
             self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
