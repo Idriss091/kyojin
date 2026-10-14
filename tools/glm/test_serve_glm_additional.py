@@ -73,7 +73,7 @@ def vision_engine():
             self.first_index = next(ids)
             self.text_alias = f"<$EMB_{self.first_index}$>"
             self.mm_length = 3
-            self.embeddings = torch.zeros(3, 4, dtype=torch.half)
+            self.embeddings = torch.zeros(3, 64, dtype=torch.half)
             self.deepstack_embeddings = None
 
     class Tower:
@@ -115,6 +115,34 @@ class ImageCacheBudgetTests(unittest.TestCase):
         cache = serve.make_image_cache(serve.auto_image_cache_bytes(123 << 30), 0)
         self.assertEqual(cache.max_bytes, 2048 << 20)
         self.assertEqual(cache.max_items, 0)
+
+    def test_the_cli_format_list_covers_every_engine_mode(self):
+        from exllamav3.tokenizer.mm_embedding import MM_QUANT_MODES
+        self.assertEqual(set(serve.IMAGE_CACHE_FORMATS), {"fp32", "fp16"} | set(MM_QUANT_MODES))
+
+    def test_embed_stores_the_rows_in_the_requested_format(self):
+        # --image-cache-format: fp32 and fp16 leave a plain tensor, q8 keeps the rows 8 bit. Either way the
+        # object, its pseudo token ids and its length are the ones the prompt cache is keyed on, and the cache
+        # counts the bytes of the form it actually holds (3 rows x 64 half values = 384 B as they are).
+        from PIL import Image
+        from exllamav3.tokenizer.mm_embedding import QuantizedMMRows
+        from image_cache_glm import embedding_nbytes
+        eng, _ = vision_engine()
+        img = Image.new("RGB", (8, 8))
+        counts, packed = {}, {}
+        for mode in serve.IMAGE_CACHE_FORMATS:
+            eng.image_cache_format = mode
+            eng.emb_cache.clear()
+            emb = serve.ResidentEngine._embed(eng, [(img, f"key-{mode}")], None)[0]
+            self.assertEqual(emb.mm_length, 3)
+            self.assertEqual(emb.text_alias, f"<$EMB_{emb.first_index}$>")    # ids and alias untouched
+            self.assertEqual(int(emb.embeddings.numel()), 192)                # logical values, not packed bytes
+            packed[mode] = isinstance(emb.embeddings, QuantizedMMRows)
+            counts[mode] = embedding_nbytes(emb)
+        self.assertEqual(packed, {"fp32": False, "fp16": False, "q8": True})
+        self.assertEqual(counts["fp32"], 384)                                  # as the tower emitted them
+        self.assertEqual(counts["fp16"], 384)                                  # two bytes a value
+        self.assertEqual(counts["q8"], 192 + 3 * 2)                            # one byte each + one scale per row
 
 
 class RequestLogTests(unittest.TestCase):

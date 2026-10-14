@@ -32,6 +32,7 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
 | `--image-cache-mb` | 2 GiB on a 128 GB Strix Halo | host memory for the decoded image embeddings, shared by all sessions; `0` = no byte limit. Default is 2 percent of RAM clamped to `[512, 2048]` MiB (see [Images](#images)) |
 | `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = only the byte budget |
+| `--image-cache-format` | `fp32` | how the cached rows are stored: `fp32` as the vision merger emits them, `fp16` (half the bytes, **measured bit-exact on this pack**) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
@@ -129,6 +130,16 @@ still runs from the first page to where the cache ended rather than collapsing t
 `img_cache` line reports `hits`, `misses` and `first_missing`, the index the prefix could match up to;
 `--image-cache-items` adds an optional cap on the number of pictures.
 
+`--image-cache-format` stores those rows packed instead of as fp32 (49.0 MiB for a 3179-token page): `fp16` is
+24.5 MiB and `q8` is 12.3 MiB. The rows are put back to their working dtype where the model gathers them — the
+same place the fp32 rows were read before, `mm_rows()` in `exllamav3/tokenizer/mm_embedding.py`, called from the
+embedding module, on the host because that module is a CPU module. Measured per picture that is actually
+re-prefilled: `q8` +0.5 ms against the 5.2 ms the fp32 path takes, i.e. 0.01 % of a 40-page cold prefill and
+nothing at all on a turn the cache serves from the paged prefix. All of them are off by default. Measured against
+fp32 on this pack (12544 rows of four real pages): **`fp16` is bit-exact** — the
+merger's fp32 output is an fp16 value widened, so nothing is rounded and the saving is free — and `q8` loses
+0.863 % (rms 1.3e-4, 41 dB).
+
 The first image of a new size costs seconds: the server runs the vision spatial-merge convolution as a GEMM
 (`EXL3_CONV_GEMM=1`) and skips the dense GEMM screening (`EXL3_DENSE_GEMM_TUNE=0`). Both are server defaults
 since 1.5; a value already in the environment wins. Measured on this model: start to ready 771 s -> 65 s, first
@@ -208,7 +219,7 @@ queue and the worker. Events, in the order a request that goes through produces 
 
 | event | written when | useful fields |
 |---|---|---|
-| `serve_start` | server ready, once | `ctx`, `cache_tokens`, `sessions`, `num_draft`, `row_budget`, `vision`, `conv_gemm`, `dense_tune`, `image_cache_mb`, `image_cache_items` |
+| `serve_start` | server ready, once | `ctx`, `cache_tokens`, `sessions`, `num_draft`, `row_budget`, `vision`, `conv_gemm`, `dense_tune`, `image_cache_mb`, `image_cache_items`, `image_cache_format` |
 | `req_start` | request arrives | `path`, `method`, `bytes` |
 | `req_refused` | 400/404/... answer | `status`, `reason` (the server's own text; a JSON parse error is reduced to line/column) |
 | `req_queued` | handed to the worker queue | `queued_ahead`, `prompt_tokens`, `messages`, `images`, `stream` |

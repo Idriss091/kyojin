@@ -46,11 +46,14 @@ def digest(raw: bytes) -> str:
 
 
 def embedding_nbytes(emb: Any) -> int:
-    """Host bytes of an MMEmbedding: its rows and its deepstack rows."""
+    """Host bytes of an MMEmbedding: its rows and its deepstack rows, in whatever form they are stored.
+    Quantized rows report their own size (int8 plus scales), so the budget counts what is really held."""
     total = 0
     for t in [getattr(emb, "embeddings", None), *(getattr(emb, "deepstack_embeddings", None) or [])]:
-        if t is not None:
-            total += int(t.numel()) * int(t.element_size())
+        if t is None:
+            continue
+        nbytes = getattr(t, "nbytes", None)
+        total += int(nbytes) if nbytes is not None else int(t.numel()) * int(t.element_size())
     return total
 
 

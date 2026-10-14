@@ -115,6 +115,11 @@ IMAGE_CACHE_AUTO_MIN_MB = 512
 IMAGE_CACHE_AUTO_MAX_MB = 2048
 IMAGE_CACHE_AUTO_SHARE = 0.02
 
+# How the cached rows may be stored (--image-cache-format). Kept here rather than imported from the engine
+# because serve.py must not import exllamav3 before SPEED_ENV is applied; a test checks it matches
+# exllamav3.tokenizer.mm_embedding.MM_QUANT_MODES.
+IMAGE_CACHE_FORMATS = ("fp32", "fp16", "q8")
+
 
 def physical_ram_bytes() -> int:
     """Installed RAM, or 0 when the platform will not say."""
@@ -464,7 +469,8 @@ class ResidentEngine:
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
                  vision: bool = True, sessions: int = 1,
-                 image_cache_bytes: int | None = None, image_cache_items: int = 0):
+                 image_cache_bytes: int | None = None, image_cache_items: int = 0,
+                 image_cache_format: str = "fp32"):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -514,6 +520,7 @@ class ResidentEngine:
         else:   # --num-draft 0: plain decode, no drafter
             self.draft_model = self.draft_cache = None
         self.vision = None
+        self.image_cache_format = image_cache_format
         self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
         if vision:
             self.vision = self._load_vision()
@@ -604,10 +611,16 @@ class ResidentEngine:
         cache = self.emb_cache
         entries_before = len(cache)
         built: set[int] = set()
+        mode = getattr(self, "image_cache_format", "fp32")
 
         def build(image):
             t0 = time.perf_counter()
             emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            if mode != "fp32":     # store the rows compressed; the ids and the text alias are untouched
+                # imported here, not at module level: exllamav3 reads some of the speed defaults at import
+                # time, and serve.py must not pull it in before SPEED_ENV is applied
+                from exllamav3.tokenizer.mm_embedding import quantize_rows
+                emb.embeddings = quantize_rows(emb.embeddings, mode)
             built.add(id(emb))     # tells a hit from a miss once get_many() hands the list back in prompt order
             print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             return emb
@@ -1716,6 +1729,10 @@ def main() -> None:
                              "Strix Halo: about 50 MiB per manga page, 1 MB per small crop")
     parser.add_argument("--image-cache-items", type=int, default=0,
                         help="optional cap on how many pictures are held at once (0 = only the byte budget)")
+    parser.add_argument("--image-cache-format", choices=IMAGE_CACHE_FORMATS, default="fp32",
+                        help="how the cached image embeddings are stored in host memory: fp32 as the vision merger "
+                             "emits them (default), fp16 (half the bytes, bit-exact on this pack) or q8 (8 bit with one fp16 scale per row, a quarter, "
+                             "measured 0.86 percent error)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
     parser.add_argument("--chat-template", default=None,
@@ -1771,13 +1788,14 @@ def main() -> None:
                             if image_cache_bytes else f"unlimited host memory ({image_cache_src})")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
                               vision=not args.no_vision, sessions=args.sessions,
-                              image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items)
+                              image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
+                              image_cache_format=args.image_cache_format)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
-              f"shared by {args.sessions} session(s)", flush=True)
+              f"{args.image_cache_format} rows, shared by {args.sessions} session(s)", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
@@ -1827,6 +1845,7 @@ def main() -> None:
                moe_fused=os.environ.get("EXL3_MOE_FUSED", "0"),
                image_cache_mb=round(emb_cache.max_bytes / 2 ** 20, 1) if emb_cache is not None else None,
                image_cache_items=getattr(emb_cache, "max_items", None),
+               image_cache_format=getattr(engine, "image_cache_format", "fp32"),
                heartbeat_s=reqlog.heartbeat_s)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
