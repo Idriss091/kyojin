@@ -169,6 +169,8 @@ def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dic
     # OpenAI sends tool-call arguments as a JSON string; the GLM template iterates them as a dict.
     fixed = []
     for m in messages:
+        if m.get("role") == "developer":                               # OpenAI's newer name for the system role
+            m = dict(m, role="system")
         if m.get("tool_calls"):
             m = dict(m, tool_calls=[
                 dict(c, function=dict(c["function"], arguments=_json_value(c["function"]["arguments"])))

@@ -197,6 +197,12 @@ class RequestTests(unittest.TestCase):
             self.assertEqual(serve.render_prompt(tpl, serve.normalize_messages(msgs), tools, **kw), expect)
 
 
+class RoleTests(unittest.TestCase):
+    def test_developer_role_is_the_system_role(self):
+        msgs = serve.normalize_messages([{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}])
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+
+
 class HttpTests(unittest.TestCase):
     def chat(self, engine, payload, stream=False):
         async def fn(client):

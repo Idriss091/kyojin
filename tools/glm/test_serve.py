@@ -208,6 +208,11 @@ class ServeTests(unittest.TestCase):
         out = serve.render_prompt(self.template, [{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user: hi<|im_end|>TOOLS=1")
 
+    def test_developer_role_renders_as_system(self):
+        dev = serve.render_prompt(self.template, [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        sys_ = serve.render_prompt(self.template, [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        self.assertEqual(dev, sys_)
+
     def test_parse_thinking_and_tool_calls(self):
         text = ('<think>reasoning with\nlines</think>Visible '
                 '<tool_call>weather<arg_key>city</arg_key><arg_value>{"name": "Paris",\n"x": 1}</arg_value></tool_call>'

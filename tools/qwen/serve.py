@@ -298,6 +298,8 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise BadRequest("each message needs a role")
         if m.get("content") is None:
             m = dict(m, content="")
+        if m["role"] == "developer":                                   # OpenAI's newer name for the system role
+            m = dict(m, role="system")
         out.append(m)
     return out
 

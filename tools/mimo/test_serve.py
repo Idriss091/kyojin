@@ -139,6 +139,11 @@ class ServeTests(unittest.TestCase):
                                   [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user\nhi<|im_end|>TOOLS=1<|im_start|>assistant\n")
 
+    def test_developer_role_renders_as_system(self):
+        dev = serve.render_prompt(TEMPLATE, [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        sys_ = serve.render_prompt(TEMPLATE, [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        self.assertEqual(dev, sys_)
+
     def test_tool_call_arguments_string_is_normalized(self):
         # OpenAI sends arguments as a JSON string; the template must not double-encode it.
         out = serve.render_prompt(
