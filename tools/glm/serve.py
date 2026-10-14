@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import contextvars
+import functools
 import io
 import json
 import os
@@ -27,6 +29,11 @@ import startup_health  # noqa: E402  (GET /health with load progress while the m
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: one line per request
+# lifecycle event (numbers and event names only, never prompt or reply text) plus a heartbeat while a job
+# is queued or prefilling, so "the client went silent" can be lined up with what the server was doing.
+# Off unless KYOJIN_REQLOG names a path; the server prints which of the two it is at start-up.
+from serve_reqlog import ReqLog, sanitize
 from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
@@ -341,6 +348,16 @@ def _bad(reason: str) -> web.HTTPBadRequest:
     return web.HTTPBadRequest(reason=reason)
 
 
+def refusal_text(exc: web.HTTPException) -> str:
+    """The server's own refusal text for the request log, without the exception type (the line already says
+    which request it was). A JSON parse error is reduced to line/column: its message quotes the request body."""
+    cause = exc.__cause__
+    if isinstance(cause, json.JSONDecodeError):
+        return sanitize(cause)
+    text = " ".join(str(exc.reason or "").split())[:160]
+    return text or type(exc).__name__
+
+
 def extract_images(messages: list[dict[str, Any]]) -> list[str]:
     """Image URLs of the messages in prompt order (OpenAI image_url parts). Video and audio parts are refused:
     this server has no such tower, and dropping them silently would let the model invent an answer."""
@@ -528,15 +545,38 @@ class ResidentEngine:
                                     pp.patch_size * pp.merge_size, pp.min_image_tokens, pp.max_image_tokens)
         return (th // pp.patch_size) * (tw // pp.patch_size) // (v.spatial_merge_size ** 2)
 
-    def _embed(self, images: list[tuple[Any, str]]) -> list:
+    def _embed(self, images: list[tuple[Any, str]], stats: dict[str, Any] | None = None) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py).
+
+        `stats`, when given, receives what the cache did for this request. A hit keeps the object and therefore
+        the pseudo ids the KV pages were keyed on; a miss re-encodes the picture and the paged prefix can only
+        match up to it, so `first_missing` (index of the first picture not held) is the number to watch. This
+        only reports: the cache policy itself is untouched."""
+        cache = self.emb_cache
+        entries_before = len(cache)
+        built: set[int] = set()
+
         def build(image):
             t0 = time.perf_counter()
             emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            built.add(id(emb))     # tells a hit from a miss once get_many() hands the list back in prompt order
             print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             return emb
-        return self.emb_cache.get_many(images, build)
+
+        out = cache.get_many(images, build)
+        if stats is not None:
+            missed = [id(emb) in built for emb in out]
+            misses = sum(missed)
+            stats.update({
+                "imgs": len(out), "hits": len(out) - misses, "misses": misses,
+                "first_missing": next((i for i, m in enumerate(missed) if m), None),
+                "entries": len(cache), "mb": round(cache.nbytes / 2 ** 20, 1),
+                "budget_mb": round(float(getattr(cache, "max_bytes", 0)) / 2 ** 20, 1),
+                "item_cap": int(getattr(cache, "max_items", 0) or 0),
+                "evicted": max(0, entries_before + misses - len(cache)),
+            })
+        return out
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
@@ -548,10 +588,13 @@ class ResidentEngine:
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None, stats: dict | None = None,
+                       images: list | None = None, stats: dict | None = None, img_stats: dict | None = None,
                        prompt_ids: list[int] | None = None, ignore_eos: bool = False) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
+
+        `img_stats` (optional) receives the image-embedding cache hit/miss counts of this request; it is kept
+        apart from `stats` because `stats` is the Generator's own end-of-job report.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
         prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
@@ -567,9 +610,9 @@ class ResidentEngine:
                 self.slot_store.note_prompt("", ids)
         elif images:
             if self.sessions > 1:   # the tower must not run next to a Generator step: run it on the driver, between steps
-                embs = await self._post(self._embed, images)
+                embs = await self._post(self._embed, images, img_stats)
             else:
-                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images, img_stats)
             for emb in embs:
                 prompt = prompt.replace(IMAGE_TRIPLE, emb.text_alias, 1)
             ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
@@ -888,6 +931,67 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
+    # Request log: off unless KYOJIN_REQLOG names a path, in which case every generation request gets one line
+    # per lifecycle event (numbers and event names only, never prompt or reply text) plus an 'alive' heartbeat
+    # while it is queued or running. `inflight` is what the heartbeat walks; it holds no request content.
+    reqlog = ReqLog.from_env(server="glm")
+    app.update(reqlog=reqlog)
+    inflight: dict[str, dict[str, Any]] = {}
+    background: dict[str, Any] = {}      # the heartbeat task, created at start-up (nothing when the log is off)
+    current_req: contextvars.ContextVar[str | None] = contextvars.ContextVar("reqid", default=None)
+
+    def reqid() -> str | None:
+        """The log id of the request being handled (None outside a logged route)."""
+        return current_req.get()
+
+    def track(rid: str | None, phase: str, **fields: Any) -> None:
+        if rid is None:
+            return
+        st = inflight.setdefault(rid, {"t0": time.perf_counter()})
+        st["phase"] = phase
+        st.update(fields)
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(reqlog.heartbeat_s)
+            now = time.perf_counter()
+            for rid, st in list(inflight.items()):
+                reqlog.log("alive", req=rid, phase=st.get("phase"), elapsed_s=round(now - st["t0"], 2),
+                           prompt_tokens=st.get("prompt_tokens"), processing=processing, running=running)
+
+    def logged(handler):
+        """Wrap a route so its lifecycle lands in the request log. The id is opaque and per request; every
+        line of one request carries it, so `grep <id>` follows the request across the queue and the worker."""
+        @functools.wraps(handler)
+        async def wrapper(request: web.Request) -> web.StreamResponse:
+            rid = f"r{uuid.uuid4().hex[:12]}"
+            token = current_req.set(rid)
+            started = time.perf_counter()
+            track(rid, "parse")
+            reqlog.log("req_start", req=rid, path=request.path, method=request.method,
+                       bytes=request.content_length)
+            try:
+                response = await handler(request)
+            except web.HTTPException as exc:
+                reqlog.log("req_refused", req=rid, path=request.path, status=exc.status,
+                           reason=refusal_text(exc), elapsed_s=round(time.perf_counter() - started, 3))
+                raise
+            except asyncio.CancelledError:
+                reqlog.log("client_left", req=rid, path=request.path, stage="handler")
+                raise
+            except Exception as exc:                                  # noqa: BLE001
+                reqlog.log("req_error", req=rid, path=request.path, error=sanitize(exc),
+                           elapsed_s=round(time.perf_counter() - started, 3))
+                raise
+            else:
+                reqlog.log("req_done", req=rid, path=request.path, status=response.status,
+                           elapsed_s=round(time.perf_counter() - started, 3))
+                return response
+            finally:
+                inflight.pop(rid, None)
+                current_req.reset(token)
+        return wrapper
+
     def salt_of(body: dict[str, Any]) -> str | None:
         try:
             salt = serve_compat.cache_salt(body)
@@ -981,15 +1085,25 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         while True:
             body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
+            rid = body.get("_reqid")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
+                reqlog.log("job_skipped", req=rid, queued_s=round(time.perf_counter() - body.get("_queued_at", time.perf_counter()), 3))
                 out.put_nowait(None)
                 queue.task_done()
                 continue
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
+            started = time.perf_counter()
+            first_token = False             # flipped once, so the log gets exactly one job_first_token line
             try:
                 async with admit(body.get("_cache_salt")):
                     running += 1
+                    track(rid, "prefill", prompt_tokens=body.get("_prompt_tokens"),
+                          images=len(body.get("_images") or ()))
+                    reqlog.log("job_start", req=rid, wait_s=round(started - body.get("_queued_at", started), 3),
+                               prompt_tokens=body.get("_prompt_tokens"), images=len(body.get("_images") or ()),
+                               messages=body.get("_messages"), sessions=sessions, processing=processing,
+                               running=running)
                     if store is not None:
                         store.busy = True
                     if sessions == 1:
@@ -999,10 +1113,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             body["_prompt"],
                             max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                             top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                            cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {}),
+                            cancel=body.get("_cancel"), img_stats=body.get("_img_stats"),
+                            **({"images": body["_images"]} if body.get("_images") else {}),
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"stats": request_stats} if sessions > 1 else {})):
+                            if not first_token:
+                                first_token = True
+                                track(rid, "decode")
+                                reqlog.log("job_first_token", req=rid, elapsed_s=round(time.perf_counter() - started, 3))
                             out.put_nowait(delta)
                     finally:
                         running -= 1
@@ -1012,8 +1131,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
+                    log_job_done(rid, body, request_stats, started)
                     out.put_nowait(None)
             except Exception as exc:
+                reqlog.log("job_error", req=rid, error=sanitize(exc),
+                           elapsed_s=round(time.perf_counter() - started, 3))
                 out.put_nowait(exc)
             finally:
                 processing -= 1
@@ -1021,13 +1143,33 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     store.busy = False
                 queue.task_done()
 
+    def log_job_done(rid: str | None, body: dict[str, Any], st: dict[str, Any], started: float) -> None:
+        """One line per finished job: what the prompt cache did (cache_n vs prompt tokens) and how long each
+        phase took. This is the line that turns 'the client saw nothing for 290 s' into a number."""
+        prompt_tokens = int(st.get("prompt_tokens") or body.get("_prompt_tokens") or 0)
+        cache_n = int(st.get("cached_tokens") or 0)
+        reqlog.log("job_done", req=rid, elapsed_s=round(time.perf_counter() - started, 3),
+                   prompt_tokens=prompt_tokens, cache_n=cache_n,
+                   cache_pct=round(100.0 * cache_n / prompt_tokens, 1) if prompt_tokens else 0.0,
+                   new_tokens=int(st.get("new_tokens") or 0),
+                   prefill_s=round(float(st.get("time_prefill") or 0.0), 3),
+                   decode_s=round(float(st.get("time_generate") or 0.0), 3))
+        if body.get("_img_stats"):
+            reqlog.log("img_cache", req=rid, **body["_img_stats"])
+
     async def start(_: web.Application) -> None:
         app["worker_tasks"] = [asyncio.create_task(worker()) for _ in range(sessions)]
         app["worker_task"] = app["worker_tasks"][0]
+        if reqlog.enabled and reqlog.heartbeat_s > 0:
+            background["heartbeat"] = asyncio.create_task(heartbeat())
 
     async def close(app_: web.Application) -> None:
         for t in app_["worker_tasks"]:
             t.cancel()
+        beat = background.pop("heartbeat", None)
+        if beat is not None:
+            beat.cancel()
+        reqlog.close()
 
     async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
@@ -1050,6 +1192,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     def client_left(cancel: asyncio.Event, path: str) -> web.Response:
         cancel.set()
+        reqlog.log("client_left", req=reqid(), path=path, stage="waiting")
         print(f"serve: client left {path}, job cancelled", file=sys.stderr, flush=True)
         return web.Response(status=499)
 
@@ -1095,7 +1238,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         out: asyncio.Queue = asyncio.Queue()
         request_stats: dict[str, Any] = {}
         cancel = body["_cancel"] = asyncio.Event()
+        body["_reqid"] = reqid()
+        body["_messages"] = len(body["messages"])
+        body["_img_stats"] = {} if images else None
+        body["_queued_at"] = time.perf_counter()
+        ahead = queue.qsize()                       # requests already waiting when this one arrived
         await queue.put((body, out, request_stats))
+        track(body["_reqid"], "queued", prompt_tokens=prompt_tokens)
+        reqlog.log("req_queued", req=body["_reqid"], path="/v1/chat/completions", queued_ahead=ahead,
+                   prompt_tokens=prompt_tokens, messages=body["_messages"], images=len(images), stream=bool(body.get("stream")))
         prefix = "<think>" if opens_thinking(prompt) else ""
 
         def deltas() -> AsyncIterator[str]:
@@ -1125,10 +1276,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            track(body["_reqid"], "stream", prompt_tokens=prompt_tokens)
+            reqlog.log("sse_headers", req=body["_reqid"], path="/v1/chat/completions")
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
             hold = max([len("</think>"), len(TOOL_OPEN)] + [len(x) for x in body["_stop"]]) - 1
+            visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
 
             async def flush(final: bool) -> None:
                 nonlocal done, mode
@@ -1138,6 +1292,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - hold))
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
+                        if not visible:
+                            visible.append(time.perf_counter())
+                            reqlog.log("sse_first_content", req=body["_reqid"], first_s=round(visible[0] - body["_queued_at"], 3))
                         key = "reasoning_content" if mode == "reasoning" else "content"
                         await response.write(sse(event({key: piece})))
                     done = end
@@ -1162,6 +1319,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                reqlog.log("sse_done", req=body["_reqid"], out_tokens=int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 client_left(cancel, "stream")                        # client left: nothing to send
                 return response
@@ -1170,6 +1328,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise
             except Exception as exc:                                   # noqa: BLE001
                 cancel.set()
+                reqlog.log("stream_error", req=body["_reqid"], error=sanitize(exc))
                 # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
                 # "stream ended without finish_reason" and retry when the connection just drops.
                 try:
@@ -1351,7 +1510,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         out: asyncio.Queue = asyncio.Queue()
         request_stats: dict[str, Any] = {}
         cancel = job["_cancel"] = asyncio.Event()
+        job["_reqid"] = reqid()
+        job["_queued_at"] = time.perf_counter()
+        ahead = queue.qsize()
         await queue.put((job, out, request_stats))
+        track(job["_reqid"], "queued", prompt_tokens=prompt_tokens)
+        reqlog.log("req_queued", req=job["_reqid"], path="/v1/completions", queued_ahead=ahead,
+                   prompt_tokens=prompt_tokens, images=0, stream=bool(body.get("stream")))
 
         def chunk(text: str, finish: str | None) -> dict[str, Any]:
             return {"id": request_id, "object": "text_completion", "created": created, "model": model_id,
@@ -1367,6 +1532,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            track(job["_reqid"], "stream", prompt_tokens=prompt_tokens)
+            reqlog.log("sse_headers", req=job["_reqid"], path="/v1/completions")
             try:
                 text, sent, stopped = "", 0, None
                 async for delta in drain(request, cancel, out):
@@ -1378,6 +1545,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         break
                     safe = max(sent, len(text) - hold)
                     if safe > sent:
+                        if not sent:
+                            reqlog.log("sse_first_content", req=job["_reqid"],
+                                       first_s=round(time.perf_counter() - job["_queued_at"], 3))
                         await response.write(sse(chunk(text[sent:safe], None)))
                         sent = safe
                 if len(text) > sent:
@@ -1386,6 +1556,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 await response.write(sse(chunk("", reason) | {"usage": usage}))
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                reqlog.log("sse_done", req=job["_reqid"], out_tokens=int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 client_left(cancel, "stream")
             except asyncio.CancelledError:
@@ -1393,6 +1564,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise
             except Exception as exc:                                   # noqa: BLE001
                 cancel.set()
+                reqlog.log("stream_error", req=job["_reqid"], error=sanitize(exc))
                 try:
                     await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     await response.write_eof()
@@ -1459,10 +1631,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/metrics", metrics_view)
-    app.router.add_post("/v1/chat/completions", completions)
+    app.router.add_post("/v1/chat/completions", logged(completions))
     app.router.add_post("/apply-template", apply_template)
     app.router.add_post("/tokenize", tokenize)
-    app.router.add_post("/v1/completions", v1_completions)
+    app.router.add_post("/v1/completions", logged(v1_completions))
     app.router.add_post("/completion", completion)
     app.on_startup.append(start)
     app.on_cleanup.append(close)
@@ -1574,6 +1746,20 @@ def main() -> None:
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     app = create_app(engine, args.model_id, template)
+    # Which run this is, in the log itself: ctx, sessions and the image-cache budget are what a later
+    # "why was this request slow" question turns on, and they are not visible in the client's request.
+    reqlog = app["reqlog"]
+    print(f"serve: {reqlog.describe()}", flush=True)
+    emb_cache = getattr(engine, "emb_cache", None)
+    reqlog.log("serve_start", model=Path(args.model).name, model_id=args.model_id, pid=os.getpid(),
+               ctx=args.max_ctx, cache_tokens=getattr(getattr(engine, "cache", None), "max_num_tokens", None),
+               sessions=args.sessions, num_draft=args.num_draft, row_budget=getattr(engine, "row_budget", 0),
+               max_history=args.max_history or max(args.num_draft, 1), vision=bool(engine.supports_vision),
+               conv_gemm=os.environ.get("EXL3_CONV_GEMM"), dense_tune=os.environ.get("EXL3_DENSE_GEMM_TUNE"),
+               moe_fused=os.environ.get("EXL3_MOE_FUSED", "0"),
+               image_cache_mb=round(emb_cache.max_bytes / 2 ** 20, 1) if emb_cache is not None else None,
+               image_cache_items=getattr(emb_cache, "max_items", None),
+               heartbeat_s=reqlog.heartbeat_s)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
         web.run_app(app, sock=sock)

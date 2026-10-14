@@ -175,6 +175,53 @@ simply absent. GLM tool calls are emitted by the model as `<\u200btool_call>name
 deliberate so plain prose never triggers the parser; arg values are JSON-parsed when they
 parse, otherwise kept as strings.
 
+## Diagnostics: the request log
+
+**It is off unless you ask for it.** With `KYOJIN_REQLOG` unset, nothing is opened and every call is a
+no-op: a default deployment behaves exactly as before and writes no file. The server prints which of the
+two it is at start-up, so the switch stays discoverable:
+
+```
+serve: request log off (set KYOJIN_REQLOG=<path> to enable, numbers and event names only)
+serve: request log /home/you/.cache/kyojin/requests.log (heartbeat 10 s, numbers and event names only, no prompt or reply text)
+```
+
+| variable | default | meaning |
+|---|---|---|
+| `KYOJIN_REQLOG` | **unset = off** | a path, or `1`/`on`/`yes` for `~/.cache/kyojin/requests.log`; `0`/`off`/`none`/`no`/`false` also disable it |
+| `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | seconds between `alive` lines while a job is queued, prefilling or decoding; `0` disables the heartbeat |
+
+Every line is `<local ISO timestamp with ms> <event> srv=glm key=value ...`, and every line of one request
+carries the same opaque `req=` id, so `grep <id>` follows one request from arrival to reply across the
+queue and the worker. Events, in the order a request that goes through produces them:
+
+| event | written when | useful fields |
+|---|---|---|
+| `serve_start` | server ready, once | `ctx`, `cache_tokens`, `sessions`, `num_draft`, `row_budget`, `vision`, `conv_gemm`, `dense_tune`, `image_cache_mb`, `image_cache_items` |
+| `req_start` | request arrives | `path`, `method`, `bytes` |
+| `req_refused` | 400/404/... answer | `status`, `reason` (the server's own text; a JSON parse error is reduced to line/column) |
+| `req_queued` | handed to the worker queue | `queued_ahead`, `prompt_tokens`, `messages`, `images`, `stream` |
+| `job_start` | worker picks it up | `wait_s` (queue time), `prompt_tokens`, `images`, `sessions`, `processing`, `running` |
+| `alive` | every `KYOJIN_REQLOG_HEARTBEAT_S` while tracked | `phase` (`parse`/`queued`/`prefill`/`decode`/`stream`), `elapsed_s`, `processing`, `running` |
+| `job_first_token` | first generated token | `elapsed_s` — when the model first produced anything |
+| `sse_headers` / `sse_first_content` | streaming: headers sent / first frame with text | `first_s` since arrival — the gap the client experiences as silence |
+| `job_done` | job finished | `prompt_tokens`, `cache_n`, `cache_pct`, `new_tokens`, `prefill_s`, `decode_s`, `elapsed_s` |
+| `img_cache` | image request, after `job_done` | `imgs`, `hits`, `misses`, `first_missing`, `entries`, `mb`, `budget_mb`, `item_cap`, `evicted` |
+| `sse_done` / `req_done` | stream closed / response returned | `out_tokens`, `status`, `elapsed_s` |
+| `client_left` | client hung up first | `path`, `stage` |
+| `job_skipped` / `job_error` / `stream_error` / `req_error` | cancelled before start / failure | `error` (type plus a truncated message) |
+
+`img_cache` is the line for image sessions: `hits` and `misses` are the embeddings the cache already held
+and the ones it re-encoded, and **`first_missing` is the index of the first picture that had to be
+re-encoded — the paged KV prefix can only match up to it.** A full hit has no `first_missing` field at all;
+`evicted` counts entries this call pushed out. Nothing in the log reports prompt, reply, tool or
+image-path text; the one exception is the server's own refusal `reason`, which is why a JSON parse error is
+reduced to line/column (its message quotes the body).
+
+Cost when enabled: one `write`+`flush` per event on the event loop, tens of bytes per line. When a request
+is slow, `grep -E 'alive|job_first_token|job_done' requests.log` shows whether it was waiting in the queue,
+prefilling a prompt the cache could not serve, or decoding.
+
 ## Start-up progress on `/health`
 
 The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
