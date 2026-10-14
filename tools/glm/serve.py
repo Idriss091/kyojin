@@ -123,6 +123,11 @@ IMAGE_CACHE_FORMATS = ("fp32", "fp16", "q8")
 # evict, so it is deliberately independent of --image-cache-mb: 4 GiB is 87 manga pages as fp32, 175 as fp16 and
 # 349 as q8, which covers the sessions this server is run for. 0 = no cap.
 IMAGE_CACHE_DIR_MAX_GB = 4.0
+# How long a conversation keeps the room its picture cache took on disk (--image-cache-dir-lock-s). The clock
+# starts when the files are written and is not refreshed by later requests, so a conversation that grabbed the
+# cache cannot keep it for ever; within the window a cyclic workload cannot evict each conversation just before
+# it is served again.
+IMAGE_CACHE_DIR_LOCK_S = 300.0
 
 
 def physical_ram_bytes() -> int:
@@ -475,7 +480,8 @@ class ResidentEngine:
                  vision: bool = True, sessions: int = 1,
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
                  image_cache_format: str = "fp32",
-                 image_cache_dir: str | None = None, image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB):
+                 image_cache_dir: str | None = None, image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
+                 image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -534,7 +540,8 @@ class ResidentEngine:
             self.emb_disk = ImageEmbeddingDisk(
                 image_cache_dir, int(max(0.0, float(image_cache_dir_max_gb)) * 2 ** 30),
                 start_token=int(getattr(self.config, "vision_start_token_id", 0) or 0),
-                end_token=int(getattr(self.config, "vision_end_token_id", 0) or 0))
+                end_token=int(getattr(self.config, "vision_end_token_id", 0) or 0),
+                lock_s=max(0.0, float(image_cache_dir_lock_s)))
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -1768,6 +1775,12 @@ def main() -> None:
                              "a file read instead of a vision pass plus a re-prefill of everything after it. "
                              "Off by default (nothing is written). Holds rows derived from the images the "
                              "clients send, never an image file or a path")
+    parser.add_argument("--image-cache-dir-lock-s", type=float, default=IMAGE_CACHE_DIR_LOCK_S,
+                        help=f"seconds a conversation keeps its files on disk before another conversation may "
+                             f"take the room (default {IMAGE_CACHE_DIR_LOCK_S:g} = 5 min, 0 = no tenure). Tenure "
+                             "is what keeps a set of conversations taking turns from evicting each one just "
+                             "before it is served again; while it holds, a new picture that would have to push a "
+                             "recent conversation out is simply not cached")
     parser.add_argument("--image-cache-dir-max-gb", type=float, default=IMAGE_CACHE_DIR_MAX_GB,
                         help=f"cap on that directory, in GiB (default {IMAGE_CACHE_DIR_MAX_GB:g}; 0 = no cap). The "
                              "pictures the memory cache is most likely to need again are the earliest ones, so "
@@ -1833,7 +1846,8 @@ def main() -> None:
                               vision=not args.no_vision, sessions=args.sessions,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
                               image_cache_format=args.image_cache_format,
-                              image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb)
+                              image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
+                              image_cache_dir_lock_s=args.image_cache_dir_lock_s)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
@@ -1894,6 +1908,7 @@ def main() -> None:
                image_cache_format=getattr(engine, "image_cache_format", "fp32"),
                image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
+               image_cache_dir_lock_s=engine.emb_disk.lock_s if getattr(engine, "emb_disk", None) else None,
                heartbeat_s=reqlog.heartbeat_s)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:

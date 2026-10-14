@@ -87,7 +87,8 @@ def vision_engine():
     return eng, calls
 
 
-def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True):
+def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True,
+                lock_s: float = 0.0):
     """An engine whose _embed() runs over a real memory cache *and* a real second-level cache on disk.
 
     The fake pictures carry everything a restore needs (identity, token list, MRoPE metadata) so a test can ask
@@ -126,7 +127,7 @@ def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_byte
     eng.emb_disk = None
     if on_disk:
         from image_cache_disk import ImageEmbeddingDisk
-        eng.emb_disk = ImageEmbeddingDisk(directory, max_bytes=cap_bytes, start_token=7, end_token=8)
+        eng.emb_disk = ImageEmbeddingDisk(directory, max_bytes=cap_bytes, start_token=7, end_token=8, lock_s=lock_s)
     return eng, calls
 
 
@@ -141,7 +142,15 @@ class ImageDiskCacheTests(unittest.TestCase):
 
     def test_the_default_cap_is_four_gib(self):
         self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 4.0)
+        self.assertEqual(serve.IMAGE_CACHE_DIR_LOCK_S, 300.0)     # 5 minutes of tenure for a conversation's files
         self.assertNotIn("EXL3_IMAGE_CACHE_DIR", os.environ)      # a flag, not an environment variable
+
+    def test_the_tenure_reaches_the_disk_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, _ = disk_engine(tmp, budget_bytes=384, lock_s=42.0)
+            self.assertEqual(eng.emb_disk.lock_s, 42.0)
+            eng, _ = disk_engine(tmp, budget_bytes=384, lock_s=0.0)
+            self.assertEqual(eng.emb_disk.lock_s, 0.0)
 
     def test_only_what_memory_gave_up_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,6 +189,31 @@ class ImageDiskCacheTests(unittest.TestCase):
             self.assertEqual(list(pathlib.Path(tmp).rglob("*.pt")), [])
             self.assertEqual(len(calls), 6)                        # 4 cold, then the 2 that memory dropped
 
+    def test_a_batch_that_does_not_fit_writes_nothing_at_all(self):
+        # What matters for wear: a conversation that cannot be cached should cost *no* bytes at all, rather than
+        # being written and deleted again on the next request.
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, calls = disk_engine(tmp, budget_bytes=768, cap_bytes=1)     # room for nothing
+            serve.ResidentEngine._embed(eng, tiny_pictures(4))
+            report = eng.emb_disk.report()
+            self.assertEqual(report["files"], 0)
+            self.assertEqual(report["written_bytes"], 0)
+            self.assertEqual(report["dropped"], 0)
+            self.assertGreater(report["skipped"], 0)
+            self.assertEqual(list(pathlib.Path(tmp).glob("*.pt")), [])
+
+    def test_every_picture_is_written_once_when_it_fits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, calls = disk_engine(tmp, budget_bytes=768, cap_bytes=1 << 20)
+            serve.ResidentEngine._embed(eng, tiny_pictures(4))
+            first = eng.emb_disk.report()
+            self.assertEqual((first["stored"], first["dropped"], first["skipped"]), (2, 0, 0))
+            serve.ResidentEngine._embed(eng, tiny_pictures(4))               # the same two are evicted again
+            again = eng.emb_disk.report()
+            self.assertEqual(again["stored"], 2)                            # already on disk: not rewritten
+            self.assertEqual(again["written_bytes"], first["written_bytes"])
+            self.assertEqual(again["dropped"], 0)
+
     def test_an_unusable_directory_does_not_stop_a_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             blocker = pathlib.Path(tmp) / "blocker"
@@ -189,17 +223,6 @@ class ImageDiskCacheTests(unittest.TestCase):
             out = serve.ResidentEngine._embed(eng, tiny_pictures(2))
             self.assertEqual(len(out), 2)
             self.assertEqual(len(calls), 2)
-
-    def test_the_collector_runs_from_the_request_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            eng, _ = disk_engine(tmp, budget_bytes=384, cap_bytes=1)   # cap for nothing at all
-            serve.ResidentEngine._embed(eng, tiny_pictures(2))
-            self.assertEqual(list(pathlib.Path(tmp).glob("*.pt")), [])
-            self.assertGreaterEqual(eng.emb_disk.report()["dropped"], 1)
-
-
-class ImageCacheBudgetTests(unittest.TestCase):
-    """--image-cache-mb / --image-cache-items, and the automatic budget behind them."""
 
     def test_auto_budget_is_a_share_of_ram_clamped_to_this_box(self):
         low, high = serve.IMAGE_CACHE_AUTO_MIN_MB, serve.IMAGE_CACHE_AUTO_MAX_MB

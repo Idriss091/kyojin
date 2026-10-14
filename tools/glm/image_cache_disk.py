@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import time
 import torch
 
 from exllamav3.tokenizer.mm_embedding import MMEmbedding, QuantizedMMRows
@@ -43,6 +44,16 @@ def _rows_payload(emb: Any) -> dict | None:
     if rows is not None and hasattr(rows, "element_size"):
         return {"rows": rows.detach().clone()}
     return None
+
+
+def rows_nbytes(emb: Any) -> int:
+    """Bytes the rows of one picture take, without building the payload."""
+    rows = getattr(emb, "embeddings", None)
+    if isinstance(rows, QuantizedMMRows):
+        return int(rows.nbytes)
+    if rows is not None and hasattr(rows, "element_size"):
+        return int(rows.numel()) * int(rows.element_size())
+    return 0
 
 
 def as_live(live) -> list | None:
@@ -65,10 +76,16 @@ class ImageEmbeddingDisk:
     for why, and for the order it uses.
     """
 
-    def __init__(self, directory: str, max_bytes: int = 0, start_token: int = 0, end_token: int = 0):
+    def __init__(self, directory: str, max_bytes: int = 0, start_token: int = 0, end_token: int = 0,
+                 lock_s: float = 0.0):
         self.path = pathlib.Path(directory).expanduser()
         self.max_bytes = max(0, int(max_bytes))
         self.start_token, self.end_token = int(start_token), int(end_token)
+        # A conversation keeps the room its cache took for this long (0 = no tenure). The clock starts when the
+        # file is written and is *not* refreshed by later requests: refreshing it would let whichever
+        # conversation grabbed the cache first keep it for ever. Tenure is what stops a cyclic workload
+        # (four conversations taking turns) from evicting each one just before it is served again.
+        self.lock_s = max(0.0, float(lock_s))
         self.enabled = False
         self.error: str | None = None
         self._identity: dict[str, dict] = {}
@@ -76,7 +93,11 @@ class ImageEmbeddingDisk:
         self._live: list | None = None               # conversations the memory cache last said it refers to
         self._bytes = 0
         self._files = 0
-        self.stats = {"loaded": 0, "stored": 0, "dropped": 0, "errors": 0}
+        self._locked: dict[str, float] = {}          # content key -> time its tenure ends
+        # written_mb / skipped_mb are the numbers to watch when what matters is how much the server writes:
+        # a batch that would not fit is not written at all, so bytes are never written just to be deleted.
+        self.stats = {"loaded": 0, "stored": 0, "dropped": 0, "skipped": 0,
+                      "written_bytes": 0, "skipped_bytes": 0, "errors": 0}
         try:
             self.path.mkdir(parents=True, exist_ok=True)
             self.enabled = True
@@ -98,11 +119,26 @@ class ImageEmbeddingDisk:
         if not self.enabled:
             return f"picture cache on disk off ({self.error})"
         cap = f"{self.max_bytes / 2 ** 30:.1f} GiB cap" if self.max_bytes else "no cap"
-        return f"picture cache on disk {self.path} ({self._files} files, {self._bytes / 2 ** 20:.1f} MiB, {cap})"
+        tenure = f", {self.lock_s / 60:.0f} min tenure" if self.lock_s else ""
+        return f"picture cache on disk {self.path} ({self._files} files, {self._bytes / 2 ** 20:.1f} MiB, {cap}{tenure})"
 
     def report(self) -> dict:
         return {"files": self._files, "mb": round(self._bytes / 2 ** 20, 1),
-                "cap_mb": round(self.max_bytes / 2 ** 20, 1), **self.stats}
+                "written_mb": round(self.stats["written_bytes"] / 2 ** 20, 3),
+                "skipped_mb": round(self.stats["skipped_bytes"] / 2 ** 20, 3),
+                "cap_mb": round(self.max_bytes / 2 ** 20, 1),
+                "locked": sum(1 for key, until in self._locked.items()
+                              if until > time.time() and key in self._present()),
+                **self.stats}
+
+    def _present(self) -> set:
+        try:
+            return {entry.name.split(".")[0] for entry in self.path.glob("*.pt")}
+        except OSError:
+            return set()
+
+    def _locked_now(self, key: str) -> bool:
+        return self.lock_s > 0 and self._locked.get(key, 0.0) > time.time()
 
     # -- identity --------------------------------------------------------------------------------------------
 
@@ -172,31 +208,57 @@ class ImageEmbeddingDisk:
 
         `live` is `ImageEmbeddingCache.live_orders` (remembered conversations, newest first) and `protect` is the
         conversation this request is serving, so that concurrent requests cannot release each other's cache.
+
+        The batch is judged **before** anything is written: room is made first (whole conversations, per
+        `collect`), and if the batch still does not fit it is not written at all. A conversation that is cached
+        only in part has no reuse anyway — it would hold room a complete one needs — so there is no point writing
+        it, and no point writing bytes that would have to be deleted again a moment later.
         """
         if not self.enabled or not evicted:
             return
         if live is not None:
             self._live = as_live(live)      # the conversations the cache still refers to (see collect)
+        pending = []
         for key, emb, position in evicted:
             self.position(key, position)
+            if getattr(emb, "deepstack_embeddings", None) is not None:
+                continue                                    # not stored: only the merger rows are (GLM has none)
+            if self._file(key, mode).exists():
+                continue                                    # same picture evicted again: already on disk
+            pending.append((key, emb))
+        if not pending:
+            self.collect(live, protect)
+            return
+        # 4 KiB covers what the container adds around the rows (measured ~3 KiB for a 12 MiB payload)
+        estimate = sum(rows_nbytes(emb) + 4096 for _, emb in pending)
+        if self.max_bytes:
+            # Make room *before* deciding: give up what is free to give up (unclaimed files first, then whole
+            # conversations whose tenure is over) so that the batch can be written, not written and deleted.
+            self.collect(live, protect, reserve=estimate)
+            if self._bytes + estimate > self.max_bytes:
+                self.stats["skipped"] += len(pending)       # does not fit: nothing is written for this batch
+                self.stats["skipped_bytes"] += estimate
+                self.collect(live, protect)
+                return
+        for key, emb in pending:
             payload = _rows_payload(emb)
             if payload is None:
                 continue
-            if getattr(emb, "deepstack_embeddings", None) is not None:
-                continue                                    # not stored: only the merger rows are (GLM has none)
             payload |= {"grid_thw": getattr(emb, "grid_thw", None),
                         "mrope_merge_size": getattr(emb, "mrope_merge_size", None),
                         "metadata": dict(getattr(emb, "metadata", None) or {})}
             path = self._file(key, mode)
-            if path.exists():
-                continue                                    # same picture evicted again: already on disk
             tmp = path.with_suffix(".tmp")
             try:
                 torch.save(payload, tmp)
                 os.replace(tmp, path)
-                self._bytes += path.stat().st_size
+                size = path.stat().st_size
+                self._bytes += size
                 self._files += 1
                 self.stats["stored"] += 1
+                self.stats["written_bytes"] += size
+                if self.lock_s:
+                    self._locked[key] = time.time() + self.lock_s
             except Exception:                               # disk full, permissions, ...: keep serving
                 self.stats["errors"] += 1
                 try:
@@ -206,6 +268,7 @@ class ImageEmbeddingDisk:
         self.collect(live, protect)
 
     def _unlink(self, path: pathlib.Path) -> None:
+        self._locked.pop(path.name.split(".")[0], None)
         try:
             size = path.stat().st_size
             path.unlink()
@@ -214,7 +277,7 @@ class ImageEmbeddingDisk:
         except OSError:
             pass
 
-    def collect(self, live: list | set | None = None, protect: set | None = None) -> int:
+    def collect(self, live: list | set | None = None, protect: set | None = None, reserve: int = 0) -> int:
         """Enforce the cap. The unit of eviction is a *conversation*, not a file.
 
         A conversation's pictures are only worth keeping together: the engine resumes at a checkpoint only when a
@@ -235,7 +298,7 @@ class ImageEmbeddingDisk:
         just because some other request happened to be served more recently. Without `protect` the newest
         remembered conversation plays that part.
         """
-        if not self.enabled or not self.max_bytes or self._bytes <= self.max_bytes:
+        if not self.enabled or not self.max_bytes or self._bytes + reserve <= self.max_bytes:
             return 0
         live = self._live if live is None else as_live(live)
         protected = set(protect) if protect is not None else (set(live[0]) if live else set())
@@ -258,10 +321,13 @@ class ImageEmbeddingDisk:
         if live is None:                              # nobody said which conversations are live: position only
             for entry in sorted(files, key=lambda e: (0, age(e)) if self._position.get(e.name.split(".")[0]) is None
                                 else (1, -self._position[e.name.split(".")[0]])):
-                if self._bytes <= self.max_bytes:
+                if self._bytes + reserve <= self.max_bytes:
                     break
+                if self._locked_now(entry.name.split(".")[0]):
+                    continue
                 self._unlink(entry)
                 dropped += 1
+            dropped += self._break_tenure(files, reserve)
             self.stats["dropped"] += dropped
             return dropped
 
@@ -281,22 +347,39 @@ class ImageEmbeddingDisk:
             groups.setdefault(group_of(entry.name.split(".")[0]), []).append(entry)
 
         for group in sorted(groups, reverse=True):    # least wanted first
-            if self._bytes <= self.max_bytes:
+            if self._bytes + reserve <= self.max_bytes:
                 break
             entries = groups[group]
             if group == unclaimed:                    # nobody claims these: the oldest goes first
-                ordered = sorted(entries, key=age)
-                whole = False
+                ordered, whole = sorted(entries, key=age), False
             elif group == 0:                          # the one being served: only as a last resort, tail first
-                ordered = sorted(entries, key=within)
-                whole = False
+                ordered, whole = sorted(entries, key=within), False
             else:                                     # a remembered conversation: it goes as a unit
-                ordered = sorted(entries, key=age)
-                whole = True
+                ordered, whole = sorted(entries, key=age), True
+            if whole and any(self._locked_now(e.name.split(".")[0]) for e in entries):
+                continue                              # still within its tenure: leave it alone for now
             for entry in ordered:
-                if not whole and self._bytes <= self.max_bytes:
+                if not whole and self._bytes + reserve <= self.max_bytes:
                     break
+                if not whole and self._locked_now(entry.name.split(".")[0]):
+                    continue
                 self._unlink(entry)
                 dropped += 1
+        # Tenure is only broken when the directory is already over the cap (a cap lowered under it, say): it is
+        # not broken to make room for a new batch, which is exactly what it exists to prevent. That batch is
+        # simply not written and waits for the tenure to run out.
+        dropped += self._break_tenure(files, reserve if self._bytes > self.max_bytes else 0)
         self.stats["dropped"] += dropped
+        return dropped
+
+    def _break_tenure(self, files: list, reserve: int = 0) -> int:
+        """Last resort: the cap has to hold, so the tenures closest to expiring go first."""
+        dropped = 0
+        for entry in sorted(files, key=lambda e: self._locked.get(e.name.split(".")[0], 0.0)):
+            if self._bytes + reserve <= self.max_bytes:
+                break
+            if not entry.exists():
+                continue
+            self._unlink(entry)
+            dropped += 1
         return dropped
