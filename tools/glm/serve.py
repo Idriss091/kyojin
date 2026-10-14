@@ -88,6 +88,12 @@ SPEED_ENV = {
     "EXL3_PF_GLUE": "1",
     "EXL3_PF_MSPLIT": "2048",
     "EXL3_PF_SKIP": "1",
+    # 14/10: verify of 5..8 rows (GLM_NGRAM lookup rounds of 4..7 copied tokens), the Qwen server's switches: MoE row split,
+    # one-launch 8-row fused MoE, one-launch 6-row dense GEMV. Bit-identical per row, rows <= 4 untouched (--num-draft 2 rounds).
+    # Harness, one load each: 6-row round +6.9 % (RM6), 8-row round +2.6 %, ids equal. 0 = off.
+    "EXL3_VERIFY_ROW_SPLIT": "2",
+    "EXL3_MOE_R8": "1",
+    "EXL3_GEMV_R_RM6": "1",
 }
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
