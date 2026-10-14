@@ -443,10 +443,12 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         return orig_fwd(*a, **k)
     def sfs(state, params):
         ids = orig_sfs(state, params)
+        dp = params.pop("draft_p", None)      # EXL3_DRAFT2S head: its max probability (lm.forward did not run: cap["lg"] is stale)
         if st["mode"] == "mtp" and not getattr(rule, "needs_p", True):
             return ids
         if st["mode"] == "mtp":
-            pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
+            if dp is not None: pt = dp.reshape(())
+            else: pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
             i = st["i"]
             if fixed is not None:
                 st["ps"].append(pt); st["i"] = i + 1
