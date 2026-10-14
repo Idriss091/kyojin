@@ -159,7 +159,8 @@ void mpw_gather_had_kernel
     int assignments,
     int top_k,
     int width,
-    int projections
+    int projections,
+    int lda                              // A row pitch (elements, >= width)
 )
 {
     const int blocks = width / 128;
@@ -170,7 +171,7 @@ void mpw_gather_had_kernel
     const int blk = job % blocks;
     const int r = (job / blocks) % rows;
     const int proj = job / ((int64_t) rows * blocks);
-    const half4 v0 = ((const half4*) (A + (int64_t) r * width + blk * 128))[t];
+    const half4 v0 = ((const half4*) (A + (int64_t) r * lda + blk * 128))[t];
     for (int k = 0; k < top_k; ++k)
     {
         const int64_t orig = (int64_t) r * top_k + k;
@@ -326,7 +327,8 @@ void mpw_gather_had2_kernel
     const int64_t* __restrict__ suh_1,
     int assignments,
     int top_k,
-    int width
+    int width,
+    int lda
 )
 {
     const int blocks = width / 128;
@@ -345,7 +347,7 @@ void mpw_gather_had2_kernel
         p0_l = suh_0[e];
         p1_l = suh_1[e];
     }
-    const half4 v0 = ((const half4*) (A + r * width + blk * 128))[t];
+    const half4 v0 = ((const half4*) (A + (int64_t) r * lda + blk * 128))[t];
     #pragma unroll 5
     for (int k = 0; k < top_k; ++k)
     {
@@ -1633,9 +1635,12 @@ void exl3_moe_prefill_wmma
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(A.dtype() == at::kHalf && A.is_contiguous() && A.dim() == 2, "A must be fp16 [rows, H]");
+    // A may be a producer's row-padded view (exl3.row_pad_pitch): unit column stride, row pitch >= H, 8-byte rows
+    TORCH_CHECK(A.dtype() == at::kHalf && A.dim() == 2 && A.stride(1) == 1 && A.stride(0) >= A.size(1) &&
+                A.stride(0) % 4 == 0, "A must be fp16 [rows, H] with unit column stride");
     const int rows = A.size(0);
     const int H = A.size(1);
+    const int lda = (int) A.stride(0);
     TORCH_CHECK(selected.dtype() == at::kLong && selected.is_contiguous() && selected.dim() == 2 &&
                 selected.size(0) == rows, "selected must be int64 [rows, top_k]");
     const int top_k = selected.size(1);
@@ -1694,14 +1699,14 @@ void exl3_moe_prefill_wmma
         const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
         mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
         ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-         assignments, top_k, H);
+         assignments, top_k, H, lda);
     }
     else
     {
     const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
     mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
     ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-     assignments, top_k, H, 2);
+     assignments, top_k, H, 2, lda);
     }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,

@@ -155,7 +155,11 @@ class TransformerBlock(Module):
                 if hc_pending is not None and not self.mlp_norm and not gr_pend:
                     HyperConnection.flush_pending(x, hc_pending)
                     hc_pending = None
-                fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                params["hc_pad_ok"] = "mlp"         # MLP site: GEMMs and the MoE gather take a row-padded input
+                try:
+                    fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:
@@ -255,7 +259,11 @@ class TransformerBlock(Module):
 
         if self.attn:
             if self.attn_hc:
-                fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                params["hc_pad_ok"] = True          # the attention site accepts a row-padded block input
+                try:
+                    fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:

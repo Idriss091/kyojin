@@ -1221,7 +1221,17 @@ class GatedDeltaNet(Module):
                             n.rms_norm_eps, n.constant_bias, n.groups, n.gate_first, 1)
             return y
         z = self.g_b_proj.forward(gaf[0].view(*core_attn_out.shape[:-2], gaf.shape[-1]), params)
-        return n.forward(core_attn_out, params, gate = z.view(core_attn_out.shape))
+        z = z.view(core_attn_out.shape)
+        # EXL3_NC2_KDA_OPAD=1 (read per call): write the norm output at the o_proj row pitch, so o_proj skips its
+        # pad_copy_in (same kernel, only the store address moves: bit-exact)
+        o_pitch = 0
+        _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
+        if os.environ.get("EXL3_NC2_KDA_OPAD", "0") == "1" and _pad_ok is not None and not n.gate_first and \
+                _pad_ok(core_attn_out, n.weight, n.out_dtype or torch.half, z, n.groups,
+                        1 if n.gate_activation == "sigmoid" else 0):
+            o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
+                                     core_attn_out.numel() // (self.num_v_heads * self.v_head_dim), params)
+        return n.forward(core_attn_out, params, gate = z, out_pitch = o_pitch)
 
     def _kda_gates_f16(self, x: torch.Tensor, params: dict, small_first: bool):
         h = torch.half

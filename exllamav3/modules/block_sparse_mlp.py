@@ -1704,7 +1704,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # decoded inside the GEMM; replaces the per-expert reconstruct + hgemm loop at prefill
         elif (
             self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
-            y.dtype == torch.half and y.is_contiguous() and
+            y.dtype == torch.half and (y.is_contiguous() or                 # or a row-padded producer view
+                                       (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
             os.environ.get("EXL3_MOE_WMMA", "1") != "0" and
             not params.get("activate_all_experts") and
             not params.get("reconstruct") and not params.get("autosplit_measure")
