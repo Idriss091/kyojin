@@ -204,11 +204,11 @@ class RoleTests(unittest.TestCase):
 
 
 class HttpTests(unittest.TestCase):
-    def chat(self, engine, payload, stream=False):
+    def chat(self, engine, payload, stream=False, template=THINK_TEMPLATE):
         async def fn(client):
             r = await client.post("/v1/chat/completions", json={"stream": stream, "model": "m"} | payload)
             return r.status, (await r.text() if stream else await r.json())
-        return with_client(engine, fn)
+        return with_client(engine, fn, template=template)
 
     def test_models_and_health(self):
         async def fn(client):
@@ -340,8 +340,116 @@ class HttpTests(unittest.TestCase):
         st, body = self.chat(eng, {"messages": msgs})
         self.assertIn("vision", body["error"]["message"])
 
+    def test_tool_text_matching_image_placeholder_is_not_an_image(self):
+        eng = FakeEngine("x")
+        marker = serve.IMAGE_PAD
+        st, body = self.chat(eng, {"messages": [{"role": "tool", "content": "tool output: " + marker}]})
+        self.assertEqual(st, 200, body)
+        self.assertEqual(len(eng.calls), 1)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_tool_call_argument_image_url_key_is_escaped(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.tool_calls[0].function.arguments.image_url }}")
+        eng = FakeEngine("x")
+        messages = [{"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "f", "arguments": {"image_url": marker}}}]}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+        self.assertNotIn(marker, eng.calls[0][0])
+
+    def test_input_text_part_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        eng = FakeEngine("x")
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": [
+            {"type": "input_text", "text": marker}]}]}, template=THINK_TEMPLATE.replace(
+                "{{ m.content }}", "{{ m.content[0].text }}"))
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_tool_schema_property_key_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools|tojson }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {marker: {"type": "string"}}}}}]
+        original_tools = json.loads(json.dumps(tools))
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+        self.assertIn(marker, tools[0]["function"]["parameters"]["properties"])
+        self.assertEqual(tools, original_tools)
+
+    def test_tool_schema_description_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools[0].function.description }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "description": marker,
+                  "parameters": {"type": "object", "properties": {}}}}]
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_reasoning_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.reasoning_content }}")
+        eng = FakeEngine("x")
+        messages = [{"role": "assistant", "content": "", "reasoning_content": marker}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_image_part_count_ignores_placeholder_in_tool_text(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker + "' }}")
+        eng = FakeEngine("x")
+
+        async def fn(client):
+            msgs = [{"role": "tool", "content": marker},
+                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image"}},
+                                                       {"type": "input_text", "text": "note: " + marker}]}]
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": msgs})
+            return r.status
+
+        self.assertEqual(with_client(eng, fn, template=tpl), 200)
+        self.assertEqual(eng.calls[0][1]["images"], ["data:image"])
+
+    def test_image_field_only_parts_are_counted_and_passed_in_order(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker * 2 + "' }}")
+        eng = FakeEngine("ok")
+        image_urls = ["https://example.test/first.png", "data:second"]
+        messages = [{"role": "user", "content": [
+            {"image": image_urls[0]},
+            {"type": "image_url", "image_url": {"url": image_urls[1]}},
+        ]}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], image_urls)
+
+    def test_tool_property_sanitization_collision_is_rejected_without_mutation(self):
+        marker = serve.IMAGE_PAD
+        escaped_marker = marker[:1] + "\\" + marker[1:]
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools|tojson }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {marker: {"type": "string"},
+                                                  escaped_marker: {"type": "integer"}}}}}]
+        original_tools = json.loads(json.dumps(tools))
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 400, body)
+        self.assertIn("collision", body["error"]["message"].lower())
+        self.assertEqual(eng.calls, [])
+        self.assertEqual(tools, original_tools)
+
     def test_images_reach_the_engine_in_order(self):
-        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '<|image_pad|>' }}")
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker + "' }}")
         eng = FakeEngine("ok")
 
         async def fn(client):
