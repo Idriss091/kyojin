@@ -380,10 +380,12 @@ class ResidentEngine:
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
         slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
-        # GLM_NGRAM = "gram,K,match[,cmin]" (off by default): n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
+        # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
-        # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot).
-        v = (os.environ.get("GLM_NGRAM") or "off").strip().lower()
+        # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot). Default 2,7,16,3 with
+        # one session (copy / edit turns +26 %, +0.67 GiB; greedy text may change at an fp16 tie), off with more sessions
+        # (lookup rounds need a single active request and the history cost grows per slot). GLM_NGRAM=off turns it off.
+        v = (os.environ.get("GLM_NGRAM") or ("2,7,16,3" if sessions == 1 else "off")).strip().lower()
         self.lookup = None if v in ("off", "0", "none") or num_draft < 1 else tuple(int(x) for x in v.split(","))
         if self.lookup:
             if not (3 <= len(self.lookup) <= 4 and 1 <= self.lookup[0] <= 16 and self.lookup[1] >= 1 and self.lookup[2] >= self.lookup[0]):
