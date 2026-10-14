@@ -98,6 +98,8 @@ class GDNState:
 
     # Prompt-end checkpoints (Job._tail_stash) are validated for this state class only
     supports_tail_ckpt = True
+    # RecurrentCache.put may call stash(async_ = True) (EXL3_NC2_ASYNC_STASH)
+    supports_async_stash = True
 
     def __init__(
         self,
@@ -156,13 +158,24 @@ class GDNState:
         return 0
 
 
-    def stash(self):
+    def stash(self, async_: bool = False, pin_pool: dict = None):
+        """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
+        current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
+        (RecurrentCache._finish, worker thread) before any reader sees the entry."""
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
+            layers = self.cache.get_all_recurrent_layers()
+            if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+                for k, l in layers.items():
+                    stashed[k] = l.stash_async(self.slot, pin_pool)
+                ev = torch.cuda.Event()
+                ev.record()
+                stashed["_ev"] = ev
+                return stashed
+            for k, l in layers.items():
                 stashed[k] = l.stash(self.slot)
         else:
             cp_handle = new_checkpoint_handle()
@@ -311,6 +324,19 @@ class GDNLayerState:
             self.recurrent_state[slot, :1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
+
+
+    def stash_async(self, slot, pin_pool: dict = None):
+        """Non-blocking D2H into pinned host tensors, reused from pin_pool ((shape, dtype) -> free list) when given:
+        a pinned allocation costs ~1 ms of host time, more than the blocking copy it replaces."""
+        cdim = self.module.conv_kernel_size
+        out = []
+        for src in (self.recurrent_state[slot, :1], self.conv_state[slot, :, :cdim]):
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
 
 
     def unstash(self, slot, stashed, position: int = 0):

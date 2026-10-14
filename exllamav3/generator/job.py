@@ -1931,8 +1931,13 @@ class Job:
         t = _ttrace_begin()
         carry = seq.mtp_carry_hidden
         if _TT: print(f"trace:   tail checkpoint size {self.recurrent_state.checkpoint_size / 2**20:.0f} MiB", flush=True)
+        rc = g.recurrent_cache
+        if rc is not None and rc.async_stash_ok(self.recurrent_state):
+            stashed = rc.stash_async(self.recurrent_state)   # EXL3_NC2_ASYNC_STASH: settled before _tail_restore reads it
+        else:
+            stashed = self.recurrent_state.stash()
         g.tail_ckpts.append({
-            "prev_hash": prev_hash, "ids": ids, "stashed": self.recurrent_state.stash(),
+            "prev_hash": prev_hash, "ids": ids, "stashed": stashed,
             "carry": None if carry is None else carry.clone(), "page": seq.allocated_pages[p0],
             # EXL3_PF_DEFER: the draft K/V of this page is written after the first token, maybe never
             "draft_ok": not self.mtp_defer,
@@ -1993,6 +1998,8 @@ class Job:
                 dst.can_revert = False
                 _ttrace_end(f"tail restore page copy rows={L}", t)
             self.free_recurrent_state()
+            if g.recurrent_cache is not None:
+                g.recurrent_cache.settle()
             self.recurrent_state = g.cache.new_from_stashed(e["stashed"], position = pos + L)
             self.last_recurrent_checkpoint_pos = pos + L
             if e["carry"] is not None:
