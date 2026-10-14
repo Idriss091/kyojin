@@ -180,9 +180,10 @@ class FusedMoEHalf:
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, 0, MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
             return x
         if x.shape[0] * x.shape[1] > MAX_ROWS:
-            assert x.shape[0] == 1
-            for lo in range(0, x.shape[1], MAX_ROWS):
-                self(x[:, lo:lo + MAX_ROWS])
+            # several jobs (b > 1, e.g. the MTP drafter at 5+ sessions) split over their rows like one job: rows are independent
+            xf = x.view(1, x.shape[0] * x.shape[1], *x.shape[2:])
+            for lo in range(0, xf.shape[1], MAX_ROWS):
+                self(xf[:, lo:lo + MAX_ROWS])
             return x
         gr = self.gr
         fq, fsc, uq, usc = gr.q8_set()
