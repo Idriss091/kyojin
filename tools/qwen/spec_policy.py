@@ -354,6 +354,15 @@ def install_lookup(g, ngram, stats=None):
     needs max_history >= K. Returns an uninstall function."""
     fol = SeqFollower(ngram[0]); K, lmin = ngram[1], ngram[2]; cmin = ngram[3] if len(ngram) > 3 else 0
     orig = type(g).iterate_draftmodel_mtp_gen.__get__(g)
+    orig_enqueue = g.enqueue
+    def enq(job):
+        # prime the index at enqueue (as install()): its cold build lands in time-to-first-token, not in the first decode round
+        r = orig_enqueue(job)
+        if os.environ.get("QWSPEC_NGRAM_IDX", "1") != "0":
+            for j in (job if isinstance(job, list) else [job]):
+                if len(getattr(j, "sequences", ())) == 1: fol.sync(j.sequences[0].sequence_ids)
+        return r
+    g.enqueue = enq
     def wrapped(results):
         cont = None
         if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
@@ -372,7 +381,9 @@ def install_lookup(g, ngram, stats=None):
         if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + len(cont)
         return torch.tensor([cont], dtype=torch.long)
     g.iterate_draftmodel_mtp_gen = wrapped
-    def uninstall(): g.__dict__.pop("iterate_draftmodel_mtp_gen", None)
+    def uninstall():
+        g.__dict__.pop("iterate_draftmodel_mtp_gen", None)
+        if g.__dict__.get("enqueue") is enq: g.__dict__.pop("enqueue")
     return uninstall
 
 def rule_from_env(thf, thv, maxd):

@@ -177,6 +177,18 @@ class T(unittest.TestCase):
         g.active_jobs = [g.job, FakeJob()]
         self.assertEqual(g.iterate_draftmodel_mtp_gen([]).shape[-1], 2)                      # two requests: no lookup
         un(); self.assertNotIn("iterate_draftmodel_mtp_gen", g.__dict__)
+        self.assertNotIn("enqueue", g.__dict__)
+        # the index is primed at enqueue: the first decode round finds it built (no rebuild)
+        g = gen(row(1000) + list(range(100, 118))); fols = []
+        orig_sf = sp.SeqFollower
+        class Spy(orig_sf):
+            def __init__(s, n): orig_sf.__init__(s, n); fols.append(s)
+        sp.SeqFollower = Spy
+        try: sp.install_lookup(g, (2, 3, 16, 1))
+        finally: sp.SeqFollower = orig_sf
+        g.enqueue(g.job)
+        self.assertEqual((fols[0].sid is g.job.sequences[0].sequence_ids, len(fols[0].idx)), (True, 42))
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).tolist(), [[118, 119, 1000]])
 
     def test_witness_len(self):
         # a templated list: the constant part is copied, the copy stops at the value that changes from row to row
