@@ -737,6 +737,8 @@ class GatedMLP(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         bsz, q_len, dim = x.shape
+        # EXL3_NC2_SHARED_FUSE: the MoE reduce widens and adds the down GEMM's fp16 output itself
+        nc2_half = bool(params.get("nc2_down_half")) and self.num_slices == 1 and not self.tp_reduce
 
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
@@ -770,7 +772,7 @@ class GatedMLP(Module):
                         [g.view(rows, -1), u.view(rows, -1)], scratch, counters, [gi.K, ui.K], False)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)
-                    d_ = self.downs[s].forward(a, params)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
                     if d is None: d = d_
                     else: d += d_
                     del d_
@@ -786,7 +788,7 @@ class GatedMLP(Module):
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)
-                    d_ = self.downs[s].forward(a, params)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
 
                     if d is None: d = d_
                     else: d += d_
@@ -818,7 +820,7 @@ class GatedMLP(Module):
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)
-                    d_ = self.downs[s].forward(a, params)
+                    d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
 
                     if d is None: d = d_
                     else: d += d_
@@ -827,6 +829,8 @@ class GatedMLP(Module):
             if self.tp_reduce:
                 params["backend"].all_reduce(d)
 
+        if nc2_half and d.dtype == torch.half:
+            return d
         return to2(d, out_dtype, self.out_dtype)
 
 
