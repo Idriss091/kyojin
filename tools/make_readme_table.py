@@ -6,7 +6,9 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 F = json.load(open(os.path.join(root, "doc", "figures.json"))); HP, HC = F["headline_prompt"], F["headline_prefill_ctx"]
 def f(v): return "n/a" if v is None else (f"{v:.1f}" if v < 100 else f"{v:.0f}")
 def ck(c): return f"{int(c) // 1024}K"
-rows = "".join(f'<tr><td><b>{m["name"]}</b></td><td align="right">{m["pack_gb"]:g} GB</td><td align="right">{m["table"]["prefill"]}</td><td align="right"><b>{m["table"]["decode"]}</b></td></tr>\n' for m in F["models"])
+def b(m, v): return v if m.get("earlier") else f"<b>{v}</b>"
+def label(m): return f'{m["name"]} <sub>({m["earlier"]})</sub>' if m.get("earlier") else f'<b>{m["name"]}</b>'
+rows = "".join(f'<tr><td>{label(m)}</td><td align="right">{m["pack_gb"]:g} GB</td><td align="right">{m["table"]["prefill"]}</td><td align="right">{b(m, m["table"]["decode"])}</td></tr>\n' for m in F["models"])
 table = ('<table align="center">\n<tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>\n' + rows + '</table>')
 CT = sorted({int(c) for m in F["models"] for c in m["prefill"]})
 in_main = F["models"]

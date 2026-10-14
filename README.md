@@ -1,30 +1,38 @@
 <p align="center"><img src="assets/yamz-banner.svg" alt="Yamz" width="640"></p>
 
-<h1 align="center">Kyojin</h1>
-<p align="center"><b>Large language models on an AMD Strix Halo mini PC.</b><br>
-An inference engine built on <a href="https://github.com/turboderp-org/exllamav3">ExLlamaV3</a>, with speculative decoding, for 100 GB-class models in 128 GB.</p>
+<p align="center">
+Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https://github.com/turboderp-org/exllamav3">ExLlamaV3</a>, with speculative decoding, for 100 GB-class models in 128 GB.</p>
 
 <p align="center">
-<a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-3FD0B0"></a>
-<img alt="gfx1151" src="https://img.shields.io/badge/AMD-gfx1151%20%7C%20ROCm%207-9C8CFF">
-<img alt="Python" src="https://img.shields.io/badge/python-3.12-6F7F9A">
-<a href="https://huggingface.co/yamz-labs"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-F0B04A"></a>
-<a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-101014"></a>
+<a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-444444"></a>
+<img alt="gfx1151" src="https://img.shields.io/badge/AMD-gfx1151%20%7C%20ROCm%207-444444">
+<img alt="Python" src="https://img.shields.io/badge/python-3.12-444444">
+<a href="https://huggingface.co/yamz-labs"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-444444"></a>
+<a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
 </p>
 
 <table align="center">
 <tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>
 <tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1481 at 8K</td><td align="right"><b>45.7 to 66.8</b></td></tr>
 <tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">634 at 8K</td><td align="right"><b>26.2 to 33.4</b></td></tr>
-<tr><td><b>MiMo-V2.6-Flash</b></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right"><b>28.9 to 37.0</b></td></tr>
+<tr><td>MiMo-V2.6-Flash <sub>(1.5)</sub></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right">28.9 to 37.0</td></tr>
 </table>
+
 
 <p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
 
 <p align="center">
-<img src="doc/img/prefill.svg" alt="Prefill speed against context length" width="49%">
-<img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
+<img src="doc/img/readme_prefill.svg" alt="Prefill speed against context length" width="49%">
+<img src="doc/img/readme_decode.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
+
+## Made with our models
+
+One prompt each, written by the model running on Kyojin and published as it came out. [Open the gallery](https://yamz-labs.github.io/gallery/).
+
+<table align="center">
+<tr><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/glm-pagoda.webp" alt="Voxel pagoda, GLM-5.3-Flash"></a><br><sub><b>Voxel pagoda</b><br>GLM-5.3-Flash</sub></td><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/qwen-pagoda.webp" alt="Voxel pagoda, Qwen3.8-Flash-Next"></a><br><sub><b>Voxel pagoda</b><br>Qwen3.8-Flash-Next</sub></td><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/mimo-pagoda.webp" alt="Voxel pagoda, MiMo-V2.6-Flash"></a><br><sub><b>Voxel pagoda</b><br>MiMo-V2.6-Flash</sub></td></tr>
+</table>
 
 **Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset inside the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
 
