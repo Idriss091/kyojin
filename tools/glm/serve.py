@@ -107,6 +107,53 @@ SPEED_ENV = {
     "EXL3_SPEC_SAMPLED": "1",
 }
 
+# Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.7 MiB for a
+# 3179-token manga page and 1 MB for a 224x224 crop, so pictures, not bytes, are what a conversation spends.
+# The automatic budget is a share of RAM clamped to this range; the ceiling is what a Strix Halo box can spare
+# next to ~104 GB of weights and the KV pool: 2 GiB holds 41 manga pages (49.7 MiB each), measured.
+IMAGE_CACHE_AUTO_MIN_MB = 512
+IMAGE_CACHE_AUTO_MAX_MB = 2048
+IMAGE_CACHE_AUTO_SHARE = 0.02
+
+
+def physical_ram_bytes() -> int:
+    """Installed RAM, or 0 when the platform will not say."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def auto_image_cache_bytes(ram_bytes: int | None = None) -> int:
+    """Default byte budget for the image embedding cache: 2 % of RAM, clamped to [512 MiB, 2 GiB].
+
+    The budget has to cover the pictures of the conversation being served: the paged prefix stops at the first
+    picture whose embedding was evicted, so a budget that is one picture short costs the whole prompt, and how
+    many pictures a history holds cannot be predicted from a request. A share of RAM therefore beats a constant,
+    and the clamp keeps it sane on a small box (never below 512 MiB) and on a large one (never above 2 GiB,
+    which is 41 manga pages and what a 128 GB Strix Halo can spare next to the weights).
+    """
+    if ram_bytes is None:
+        ram_bytes = physical_ram_bytes()
+    mb = ram_bytes / 2 ** 20 * IMAGE_CACHE_AUTO_SHARE
+    if not ram_bytes:
+        mb = IMAGE_CACHE_AUTO_MIN_MB
+    return int(min(IMAGE_CACHE_AUTO_MAX_MB, max(IMAGE_CACHE_AUTO_MIN_MB, mb))) * 2 ** 20
+
+
+def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: int = 0,
+                     sessions: int = 1) -> ImageEmbeddingCache:
+    """The picture cache of the process (--image-cache-mb / --image-cache-items).
+
+    One cache for the whole server, shared by every session exactly like the KV pool `-c` sizes, with the
+    eviction policy of image_cache_glm.py: the tail of a prompt is given up before its head, and the policy
+    remembers one prompt order per concurrent request plus one, so a conversation is not forgotten between two
+    of its own turns when another session slips in between.
+    """
+    return ImageEmbeddingCache(max_items=image_cache_items, max_orders=max(2, sessions),
+                               **({} if image_cache_bytes is None else {"max_bytes": image_cache_bytes}))
+
+
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
     """Pick the optional unquantized MTP eh_proj sidecar and log which source is used.
 
@@ -416,7 +463,8 @@ class ResidentEngine:
     row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True, sessions: int = 1):
+                 vision: bool = True, sessions: int = 1,
+                 image_cache_bytes: int | None = None, image_cache_items: int = 0):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -466,7 +514,7 @@ class ResidentEngine:
         else:   # --num-draft 0: plain decode, no drafter
             self.draft_model = self.draft_cache = None
         self.vision = None
-        self.emb_cache = ImageEmbeddingCache()
+        self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -1661,6 +1709,13 @@ def main() -> None:
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
+    parser.add_argument("--image-cache-mb", type=int, default=None,
+                        help="host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this is one pool "
+                             "shared by every --sessions request. Default: a share of RAM (2 percent) clamped to "
+                             f"[{IMAGE_CACHE_AUTO_MIN_MB}, {IMAGE_CACHE_AUTO_MAX_MB}] MiB, which is {IMAGE_CACHE_AUTO_MAX_MB} MiB on a 128 GB "
+                             "Strix Halo: about 50 MiB per manga page, 1 MB per small crop")
+    parser.add_argument("--image-cache-items", type=int, default=0,
+                        help="optional cap on how many pictures are held at once (0 = only the byte budget)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
     parser.add_argument("--chat-template", default=None,
@@ -1704,12 +1759,25 @@ def main() -> None:
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
+        if args.image_cache_mb is None:
+            ram = physical_ram_bytes()
+            image_cache_bytes = auto_image_cache_bytes(ram)
+            image_cache_src = (f"auto: {IMAGE_CACHE_AUTO_SHARE:.0%} of {ram / 2 ** 30:.1f} GiB RAM, "
+                              f"clamped to [{IMAGE_CACHE_AUTO_MIN_MB}, {IMAGE_CACHE_AUTO_MAX_MB}] MiB")
+        else:
+            image_cache_bytes = max(0, args.image_cache_mb) * 2 ** 20
+            image_cache_src = f"--image-cache-mb {args.image_cache_mb}"
+        image_cache_size = (f"{image_cache_bytes / 2 ** 20:.0f} MiB of host memory ({image_cache_src})"
+                            if image_cache_bytes else f"unlimited host memory ({image_cache_src})")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision, sessions=args.sessions)
+                              vision=not args.no_vision, sessions=args.sessions,
+                              image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
+        print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
+              f"shared by {args.sessions} session(s)", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":

@@ -30,6 +30,8 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
+| `--image-cache-mb` | 2 GiB on a 128 GB Strix Halo | host memory for the decoded image embeddings, shared by all sessions; `0` = no byte limit. Default is 2 percent of RAM clamped to `[512, 2048]` MiB (see [Images](#images)) |
+| `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = only the byte budget |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
@@ -114,9 +116,18 @@ Ignored (accepted, no effect): `n`, `seed`, `logprobs`, `top_k`, `presence_penal
 
 The server loads the vision tower of the pack at start (+0.35 GB GPU memory, about 2 s) and prints `vision=True`.
 An image goes in a user message as an OpenAI `image_url` part; the URL is a `data:` URI or a local file path (the
-server does not fetch remote URLs). One image takes 40 to about 1,500 tokens depending on its size. An image that is
-sent again in a later turn keeps the prompt cache. `--no-vision` skips the tower; an image request then gets HTTP 400,
-as do video and audio parts.
+server does not fetch remote URLs). One image takes 40 to about 8,000 tokens depending on its size (a 1568x1568
+page is 3,136). `--no-vision` skips the tower; an image request then gets HTTP 400, as do video and audio parts.
+
+An image that is sent again in a later turn keeps the prompt cache **while its embedding is still held**. The
+server keeps the decoded embeddings of recent pictures in host memory (GLM's merger emits fp32: 49.7 MiB for a
+3,179-token manga page, 1 MB for a 224x224 crop) and re-encodes a picture it had to give up, which gives that
+picture fresh pseudo token ids and breaks the paged prefix *from that picture on*. `--image-cache-mb` sizes the
+cache: 2 GiB by default on a 128 GB Strix Halo, 41 manga pages at 49.7 MiB each, one pool shared by all sessions like `-c`.
+A conversation larger than the budget keeps its **earliest** pictures and gives up the last ones, so the match
+still runs from the first page to where the cache ended rather than collapsing to nothing. The request log's
+`img_cache` line reports `hits`, `misses` and `first_missing`, the index the prefix could match up to;
+`--image-cache-items` adds an optional cap on the number of pictures.
 
 The first image of a new size costs seconds: the server runs the vision spatial-merge convolution as a GEMM
 (`EXL3_CONV_GEMM=1`) and skips the dense GEMM screening (`EXL3_DENSE_GEMM_TUNE=0`). Both are server defaults
@@ -286,12 +297,23 @@ models:
 ## Tests
 
 ```bash
-python -m pytest -q tools/glm/test_serve.py tools/test_serve_compat.py tools/test_startup_health.py
+# unittest: no extra dependency, which is what this checkout's venv has
+python -m unittest tools.glm.test_serve tools.glm.test_serve_glm_additional \
+                  tools.test_serve_compat tools.test_startup_health
+# the same under pytest, if it is installed
+python -m pytest -q tools/glm/test_serve.py tools/glm/test_serve_glm_additional.py \
+                    tools/test_serve_compat.py tools/test_startup_health.py
 ```
 
 Model-free: a `FakeEngine` emits deterministic GLM XML in 3-character chunks so tags are
 split mid-token, covering template rendering, think/tool parsing, stop strings, SSE
 framing, `/v1/models`, usage, and the streamed open-`<think>` path. No GPU needed.
+
+`test_serve_glm_additional.py` holds the tests for what this checkout adds locally: the
+request log (`KYOJIN_REQLOG`, off by default, no request text) and the image cache budget
+(`--image-cache-mb` / `--image-cache-items`, the automatic share of RAM, what `img_cache`
+reports). It is a file of its own so upstream's `test_serve.py` stays untouched and merges
+cleanly; fold it back in if the features are ever proposed upstream.
 
 ## Lane launcher
 
