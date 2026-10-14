@@ -16,6 +16,7 @@ import asyncio
 import base64
 import io
 import os
+import pathlib
 import sys
 import tempfile
 import unittest
@@ -84,6 +85,117 @@ def vision_engine():
     eng = object.__new__(serve.ResidentEngine)
     eng.emb_cache, eng.vision, eng.tokenizer = ImageEmbeddingCache(), Tower(), None
     return eng, calls
+
+
+def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True):
+    """An engine whose _embed() runs over a real memory cache *and* a real second-level cache on disk.
+
+    The fake pictures carry everything a restore needs (identity, token list, MRoPE metadata) so a test can ask
+    whether the prompt would be reproduced: unlike the tower, the disk has to give back the same pseudo ids.
+    """
+    import itertools
+
+    import torch
+    from image_cache import ImageEmbeddingCache
+
+    ids, calls = itertools.count(1_000_000_000, 100), []
+
+    class Emb:
+        def __init__(self):
+            self.first_index = next(ids)
+            self.mm_length = 3
+            self.last_index = self.first_index + self.mm_length
+            self.embeddings = torch.zeros(3, 64, dtype=torch.half)
+            self.deepstack_embeddings = None
+            self.grid_thw = (1, 1, 1)
+            self.mrope_merge_size = 2
+            self.metadata = {"original_size": (8, 8)}
+            self.token_string = torch.tensor([[7] + list(range(self.first_index, self.last_index)) + [8]])
+            self.token_list = self.token_string[0].tolist()
+            self.text_alias = f"<$EMB_{self.first_index}$>"
+
+    class Tower:
+        def get_image_embeddings(self, *args, **kw):
+            calls.append(1)
+            return Emb()
+
+    eng = object.__new__(serve.ResidentEngine)
+    eng.emb_cache = ImageEmbeddingCache(max_bytes=budget_bytes)
+    eng.vision, eng.tokenizer = Tower(), None
+    eng.image_cache_format = mode
+    eng.emb_disk = None
+    if on_disk:
+        from image_cache_disk import ImageEmbeddingDisk
+        eng.emb_disk = ImageEmbeddingDisk(directory, max_bytes=cap_bytes, start_token=7, end_token=8)
+    return eng, calls
+
+
+def tiny_pictures(count: int):
+    """Whatever `_embed` needs: a PIL image and its content key."""
+    from PIL import Image
+    return [(Image.new("RGB", (8, 8), (i * 30 % 255, 0, 0)), f"key{i}") for i in range(count)]
+
+
+class ImageDiskCacheTests(unittest.TestCase):
+    """--image-cache-dir: what leaves memory is written once, and comes back with its identity."""
+
+    def test_the_default_cap_is_four_gib(self):
+        self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 4.0)
+        self.assertNotIn("EXL3_IMAGE_CACHE_DIR", os.environ)      # a flag, not an environment variable
+
+    def test_only_what_memory_gave_up_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, calls = disk_engine(tmp, budget_bytes=768)        # room for two of the four pictures
+            images = tiny_pictures(4)
+            serve.ResidentEngine._embed(eng, images)
+            self.assertEqual(len(calls), 4)                        # a cold pass encodes all four
+            self.assertEqual(len(list(pathlib.Path(tmp).glob("*.pt"))), 2)   # ... and two were evicted
+            self.assertEqual(eng.emb_disk.report()["stored"], 2)
+
+            serve.ResidentEngine._embed(eng, images)               # same conversation again
+            self.assertEqual(len(calls), 4)                        # two from memory, two from disk: no vision pass
+            self.assertEqual(eng.emb_disk.report()["loaded"], 2)
+
+    def test_a_restored_picture_keeps_the_ids_the_prompt_was_built_from(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, calls = disk_engine(tmp, budget_bytes=384)        # room for one
+            images = tiny_pictures(2)
+            first = serve.ResidentEngine._embed(eng, images)
+            self.assertEqual(len(list(pathlib.Path(tmp).glob("*.pt"))), 1)
+            self.assertEqual(first[1].embeddings.shape, (3, 64))   # the second picture went to disk
+
+            again = serve.ResidentEngine._embed(eng, images)
+            self.assertEqual(len(calls), 2)                        # no second vision pass
+            self.assertEqual(again[1].first_index, first[1].first_index)
+            self.assertEqual(again[1].token_list, first[1].token_list)
+            self.assertEqual(again[1].text_alias, first[1].text_alias)
+            self.assertEqual(again[1].grid_thw, first[1].grid_thw)
+
+    def test_without_a_directory_nothing_is_written_and_the_tower_runs_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, calls = disk_engine(tmp, budget_bytes=768, on_disk=False)
+            images = tiny_pictures(4)
+            serve.ResidentEngine._embed(eng, images)
+            serve.ResidentEngine._embed(eng, images)
+            self.assertEqual(list(pathlib.Path(tmp).rglob("*.pt")), [])
+            self.assertEqual(len(calls), 6)                        # 4 cold, then the 2 that memory dropped
+
+    def test_an_unusable_directory_does_not_stop_a_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = pathlib.Path(tmp) / "blocker"
+            blocker.write_text("not a directory")
+            eng, calls = disk_engine(str(blocker), budget_bytes=384)
+            self.assertFalse(eng.emb_disk.enabled)
+            out = serve.ResidentEngine._embed(eng, tiny_pictures(2))
+            self.assertEqual(len(out), 2)
+            self.assertEqual(len(calls), 2)
+
+    def test_the_collector_runs_from_the_request_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, _ = disk_engine(tmp, budget_bytes=384, cap_bytes=1)   # cap for nothing at all
+            serve.ResidentEngine._embed(eng, tiny_pictures(2))
+            self.assertEqual(list(pathlib.Path(tmp).glob("*.pt")), [])
+            self.assertGreaterEqual(eng.emb_disk.report()["dropped"], 1)
 
 
 class ImageCacheBudgetTests(unittest.TestCase):

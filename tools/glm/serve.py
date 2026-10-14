@@ -119,6 +119,10 @@ IMAGE_CACHE_AUTO_SHARE = 0.02
 # because serve.py must not import exllamav3 before SPEED_ENV is applied; a test checks it matches
 # exllamav3.tokenizer.mm_embedding.MM_QUANT_MODES.
 IMAGE_CACHE_FORMATS = ("fp32", "fp16", "q8")
+# Cap on the second-level picture cache (--image-cache-dir). It holds only the pictures the memory budget had to
+# evict, so it is deliberately independent of --image-cache-mb: 4 GiB is 87 manga pages as fp32, 175 as fp16 and
+# 349 as q8, which covers the sessions this server is run for. 0 = no cap.
+IMAGE_CACHE_DIR_MAX_GB = 4.0
 
 
 def physical_ram_bytes() -> int:
@@ -470,7 +474,8 @@ class ResidentEngine:
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
                  vision: bool = True, sessions: int = 1,
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
-                 image_cache_format: str = "fp32"):
+                 image_cache_format: str = "fp32",
+                 image_cache_dir: str | None = None, image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -522,6 +527,14 @@ class ResidentEngine:
         self.vision = None
         self.image_cache_format = image_cache_format
         self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
+        # Second-level cache: the rows of the pictures the memory cache evicts (--image-cache-dir, off by default)
+        self.emb_disk = None
+        if image_cache_dir:
+            from image_cache_disk import ImageEmbeddingDisk      # imports exllamav3: only once it is wanted
+            self.emb_disk = ImageEmbeddingDisk(
+                image_cache_dir, int(max(0.0, float(image_cache_dir_max_gb)) * 2 ** 30),
+                start_token=int(getattr(self.config, "vision_start_token_id", 0) or 0),
+                end_token=int(getattr(self.config, "vision_end_token_id", 0) or 0))
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -609,9 +622,14 @@ class ResidentEngine:
         match up to it, so `first_missing` (index of the first picture not held) is the number to watch. This
         only reports: the cache policy itself is untouched."""
         cache = self.emb_cache
-        entries_before = len(cache)
+        disk = getattr(self, "emb_disk", None)
         built: set[int] = set()
+        evicted: list = []
         mode = getattr(self, "image_cache_format", "fp32")
+
+        def fetch(image, key):
+            """One picture back from the second-level cache, or None: its identity comes back with it."""
+            return disk.fetch(key, mode) if disk is not None else None
 
         def build(image):
             t0 = time.perf_counter()
@@ -625,7 +643,20 @@ class ResidentEngine:
             print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             return emb
 
-        out = cache.get_many(images, build)
+        mine: set = set()          # the pictures of *this* prompt: the conversation this request serves
+        out = cache.get_many(images, build, evicted, fetch, mine)
+        if disk is not None:
+            # Every picture of this request keeps its identity, so a later restore reproduces the prompt; then
+            # the ones that just left memory are written, outside the cache lock. A session that fits in
+            # --image-cache-mb writes nothing, one that does not writes each evicted picture once
+            # (see image_cache_disk.py). The cache hands over (key, embedding, position-in-this-prompt), the
+            # conversations it still remembers and the keys of this one, so the collector can give up an
+            # abandoned conversation first and never release the cache of a conversation that is being served.
+            for (_, key), emb in zip(images, out):
+                disk.remember(key, emb)
+            disk.store(evicted, mode, live=cache.live_orders, protect=mine)
+            if stats is not None:
+                stats["disk"] = disk.report()
         if stats is not None:
             missed = [id(emb) in built for emb in out]
             misses = sum(missed)
@@ -635,7 +666,9 @@ class ResidentEngine:
                 "entries": len(cache), "mb": round(cache.nbytes / 2 ** 20, 1),
                 "budget_mb": round(float(getattr(cache, "max_bytes", 0)) / 2 ** 20, 1),
                 "item_cap": int(getattr(cache, "max_items", 0) or 0),
-                "evicted": max(0, entries_before + misses - len(cache)),
+                # real evictions, not a difference of counts: a picture that came back from disk also enters
+                # the cache, so entries_before + misses - len() would miss those
+                "evicted": len(evicted),
             })
         return out
 
@@ -1729,6 +1762,16 @@ def main() -> None:
                              "Strix Halo: about 50 MiB per manga page, 1 MB per small crop")
     parser.add_argument("--image-cache-items", type=int, default=0,
                         help="optional cap on how many pictures are held at once (0 = only the byte budget)")
+    parser.add_argument("--image-cache-dir", default=None,
+                        help="directory of a second-level picture cache: the rows of the pictures the memory "
+                             "budget evicts are written there and read back, so a picture that comes back costs "
+                             "a file read instead of a vision pass plus a re-prefill of everything after it. "
+                             "Off by default (nothing is written). Holds rows derived from the images the "
+                             "clients send, never an image file or a path")
+    parser.add_argument("--image-cache-dir-max-gb", type=float, default=IMAGE_CACHE_DIR_MAX_GB,
+                        help=f"cap on that directory, in GiB (default {IMAGE_CACHE_DIR_MAX_GB:g}; 0 = no cap). The "
+                             "pictures the memory cache is most likely to need again are the earliest ones, so "
+                             "the collector drops the end of a prompt first")
     parser.add_argument("--image-cache-format", choices=IMAGE_CACHE_FORMATS, default="fp32",
                         help="how the cached image embeddings are stored in host memory: fp32 as the vision merger "
                              "emits them (default), fp16 (half the bytes, bit-exact on this pack) or q8 (8 bit with one fp16 scale per row, a quarter, "
@@ -1789,13 +1832,16 @@ def main() -> None:
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
                               vision=not args.no_vision, sessions=args.sessions,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
-                              image_cache_format=args.image_cache_format)
+                              image_cache_format=args.image_cache_format,
+                              image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
               f"{args.image_cache_format} rows, shared by {args.sessions} session(s)", flush=True)
+        if args.image_cache_dir:
+            print(f"serve: {engine.emb_disk.describe()}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
@@ -1846,6 +1892,8 @@ def main() -> None:
                image_cache_mb=round(emb_cache.max_bytes / 2 ** 20, 1) if emb_cache is not None else None,
                image_cache_items=getattr(emb_cache, "max_items", None),
                image_cache_format=getattr(engine, "image_cache_format", "fp32"),
+               image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
+               image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
                heartbeat_s=reqlog.heartbeat_s)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:

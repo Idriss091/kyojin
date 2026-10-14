@@ -32,6 +32,8 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
 | `--image-cache-mb` | 2 GiB on a 128 GB Strix Halo | host memory for the decoded image embeddings, shared by all sessions; `0` = no byte limit. Default is 2 percent of RAM clamped to `[512, 2048]` MiB (see [Images](#images)) |
 | `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = only the byte budget |
+| `--image-cache-dir` | none | a second-level picture cache on disk, **off by default**. The rows of the pictures the memory budget evicts are written there (and only those: a session that fits in `--image-cache-mb` writes nothing) and read back when the client sends the picture again. With the picture's identity kept for the life of the process, a restored picture reproduces the prompt token for token, so the paged prefix still matches. Holds rows derived from the images the clients send, never an image file or a path |
+| `--image-cache-dir-max-gb` | `4` | cap on that directory (0 = no cap). It is enforced per *conversation*, not per file: pictures no remembered conversation claims go first (oldest file first); then a conversation the server remembers but this request is not serving is released **whole**, oldest conversation first, so with `--sessions N` as many conversations as fit keep a complete cache instead of N half-caches; the conversation the request itself is serving is the last to be touched and only in part if its own files alone exceed the cap (end of its prompt first). Trimming also happens at start-up |
 | `--image-cache-format` | `fp32` | how the cached rows are stored: `fp32` as the vision merger emits them, `fp16` (half the bytes, **measured bit-exact on this pack**) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
@@ -155,6 +157,15 @@ With `EXL3_CONV_GEMM=0`, `MIOPEN_FIND_MODE=FAST` alone removes the convolution h
 pre-tuning, exactly as the default has them. Measurements, the offline pre-generation alternative, and
 the comparison with the default configuration: [doc/EXL3_CONV_GEMM.md](../../doc/EXL3_CONV_GEMM.md).
 
+With `--image-cache-dir`, the pictures the memory budget gives up are written to disk **when they are evicted**
+and read back the next time the client sends them. Because the server also keeps each picture's identity (its
+pseudo token ids) for the life of the process, a restored picture reproduces the prompt token for token and the
+paged KV prefix still matches: measured on 1568x1568 pages as q8 rows, the second and third request of the same
+six-picture conversation reused 98.8 % of the prompt with **no vision pass at all** (18.9 K tokens, 0.9 s prefill
+against 30.9 s cold), from 4 files of 12.3 MiB. A session that fits in `--image-cache-mb` writes nothing; a
+longer one writes each evicted picture once (files are keyed by content, so a picture evicted twice is not
+rewritten). Anything unreadable is dropped and re-encoded: the disk never becomes a reason for a request to fail.
+
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`
 name is emitted); frames are:
@@ -196,6 +207,7 @@ simply absent. GLM tool calls are emitted by the model as `<\u200btool_call>name
 <arg_key>k</arg_key><arg_value>v</arg_value></\u200btool_call>` — the zero-width space is
 deliberate so plain prose never triggers the parser; arg values are JSON-parsed when they
 parse, otherwise kept as strings.
+
 
 ## Diagnostics: the request log
 

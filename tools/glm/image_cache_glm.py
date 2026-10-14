@@ -75,6 +75,7 @@ class ImageEmbeddingCache:
         self._orders: collections.OrderedDict = collections.OrderedDict()  # prompt serial -> [slot, ...]
         self._seq = 0
         self._nbytes = 0
+        self._last_order: list = []          # slots of the prompt being served, in prompt order
         self._lock = threading.RLock()
 
     def __len__(self) -> int:
@@ -83,6 +84,17 @@ class ImageEmbeddingCache:
     @property
     def nbytes(self) -> int:
         return self._nbytes
+
+    @property
+    def live_orders(self) -> list:
+        """The pictures the remembered prompts refer to, newest prompt first, as a list of content-key sets.
+
+        A second-level store needs this to tell conversations apart: the newest entry is the one being served
+        (its pictures must stay complete or the prompt cannot be reproduced), older entries are conversations the
+        user may come back to, and a picture in none of them belongs to a conversation that is over. The cache
+        only remembers the last `max_orders` prompts, so a conversation the user has left ages out on its own.
+        """
+        return [{slot[0] for slot in slots} for slots in reversed(self._orders.values())]
 
     def clear(self) -> None:
         with self._lock:
@@ -118,26 +130,43 @@ class ImageEmbeddingCache:
         live.sort()
         return [slot for _, slot in stale] + [slot for *_, slot in live]
 
-    def _trim(self) -> int:
-        """Evict until both bounds hold. Returns how many entries went."""
-        evicted = 0
+    def _trim(self, evicted: list | None = None) -> int:
+        """Evict until both bounds hold. Returns how many entries went.
+
+        `evicted`, when given, collects the (key, embedding, position-in-this-prompt) of everything that left, so
+        a caller can put them somewhere cheaper than memory (the server writes them to its picture cache on
+        disk). Positions are the entries' ranks in the prompt being served, which is the order any second-level
+        store has to keep: the earliest pictures are the ones the paged prefix needs.
+        """
         if not self._over_budget():
             return 0
+        rank = {slot: i for i, slot in enumerate(self._last_order or [])} if evicted is not None else {}
+        gone = 0
         for slot in self._eviction_order():
             if not self._over_budget():
                 break
             item = self._items.pop(slot, None)
             if item is not None:
                 self._nbytes -= item[1]
-                evicted += 1
-        return evicted
+                gone += 1
+                if evicted is not None:
+                    evicted.append((slot[0], item[0], rank.get(slot)))
+        return gone
 
-    def get_many(self, images: list[tuple[Any, str]], build: Callable[[Any], Any]) -> list:
-        """One embedding per (image, key), in order. `build(image)` runs only for a picture not held yet.
-        The lock stays held while building, so two requests never encode the same picture twice.
+    def get_many(self, images: list[tuple[Any, str]], build: Callable[[Any], Any],
+                 evicted: list | None = None, fetch: Callable[[Any, str], Any] | None = None,
+                 mine: set | None = None) -> list:
+        """One embedding per (image, key), in order. For a picture not held yet, `fetch(image, key)` is tried
+        first (a second-level store, e.g. the one on disk) and `build(image)` runs only when it has nothing.
+        The lock stays held while both run, so two requests never encode the same picture twice.
 
         The prompt order of this call is remembered for the next `max_orders` calls: they are what the eviction
         policy weighs, so a conversation that keeps sending its whole history keeps its earliest pictures.
+
+        `evicted`, when given, is filled with what this call pushed out (see `_trim`), and `mine` with the
+        content keys of *this* prompt: a caller that writes the evicted pictures somewhere slower needs to know
+        which conversation it is serving, or concurrent requests would evict each other's caches. The caller must
+        not touch the cache from a `build` callback and does its own work with both after this returns.
         """
         out, seen = [], collections.Counter()
         order: list = []
@@ -146,9 +175,13 @@ class ImageEmbeddingCache:
                 slot = (key, seen[key])
                 seen[key] += 1
                 order.append(slot)
+                if mine is not None:
+                    mine.add(key)
                 hit = self._items.get(slot)
                 if hit is None:
-                    emb = build(image)
+                    emb = fetch(image, key) if fetch is not None else None
+                    if emb is None:
+                        emb = build(image)
                     n = embedding_nbytes(emb)
                     self._items[slot] = (emb, n)
                     self._nbytes += n
@@ -161,5 +194,6 @@ class ImageEmbeddingCache:
                 self._orders[self._seq] = order
                 while len(self._orders) > self.max_orders:
                     self._orders.popitem(last=False)
-            self._trim()
+            self._last_order = order
+            self._trim(evicted)
         return out

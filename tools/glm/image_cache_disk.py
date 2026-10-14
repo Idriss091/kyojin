@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Second-level picture cache on disk: the rows of the pictures the memory cache had to evict.
+
+The memory cache (`image_cache_glm.py`) keeps the *earliest* pictures of a prompt and gives up the tail, so the
+pictures a client re-sends a moment later are exactly the ones it dropped, and today they cost a vision pass
+plus the re-prefill of everything from their position on. Writing a picture out **when it is evicted** and
+reading it back later replaces that with a file read: the server also keeps the picture's identity (its pseudo
+token ids) for the life of the process, so a restored picture reproduces the prompt token for token and the
+paged KV prefix still matches.
+
+Why only evicted pictures: that is the set that ever needs to come back *within* a process, which is the only
+case where the re-prefill can be saved at all (after a restart the KV pool is empty). A session that fits in
+`--image-cache-mb` therefore writes nothing, and a session that does not writes each evicted picture once.
+
+Files hold the rows only (`--image-cache-format` decides their width) plus what the model needs to use them
+again (`grid_thw`); no identity, no image file, no path. Everything here is fail-soft: a missing, corrupt,
+unwritable or full directory means "no second-level cache", never a failed request.
+
+    --image-cache-dir DIR          off by default
+    --image-cache-dir-max-gb 4     cap on the directory: a conversation this server no longer remembers goes
+                                   first (oldest file first), then the end of the one it does. A directory left
+                                   over the cap by an earlier run is trimmed at start-up the same way.
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+import torch
+
+from exllamav3.tokenizer.mm_embedding import MMEmbedding, QuantizedMMRows
+
+
+def dtype_name(dtype: torch.dtype) -> str:
+    """`torch.float32` -> "float32": what a stored payload records about the rows it holds."""
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def _rows_payload(emb: Any) -> dict | None:
+    """The rows of one picture, in the form the memory cache holds them (plain tensor or packed holder)."""
+    rows = emb.embeddings
+    if isinstance(rows, QuantizedMMRows):
+        return {"rows_q": rows.q, "rows_scale": rows.scale, "rows_dtype": dtype_name(rows.dtype)}
+    if rows is not None and hasattr(rows, "element_size"):
+        return {"rows": rows.detach().clone()}
+    return None
+
+
+def as_live(live) -> list | None:
+    """`live` as a list of conversations (each a set of content keys), newest first; None means "not told"."""
+    if live is None:
+        return None
+    if isinstance(live, (set, frozenset)):
+        return [set(live)]
+    return [set(keys) for keys in live]
+
+
+class ImageEmbeddingDisk:
+    """Rows of evicted pictures, keyed by content hash, with a process-local identity map.
+
+    `remember()` is called for every picture the tower encodes: it keeps the identity (pseudo ids, alias, token
+    list, MRoPE metadata) that has to be put back for the prompt to be reproduced. `store()` writes the rows of
+    pictures the memory cache just evicted; `fetch()` reads a picture back, restoring the identity when this
+    process knows it (otherwise the picture comes back with fresh ids and only the vision pass is saved). When
+    the directory is over its cap, `collect()` gives up whole conversations rather than single files — see there
+    for why, and for the order it uses.
+    """
+
+    def __init__(self, directory: str, max_bytes: int = 0, start_token: int = 0, end_token: int = 0):
+        self.path = pathlib.Path(directory).expanduser()
+        self.max_bytes = max(0, int(max_bytes))
+        self.start_token, self.end_token = int(start_token), int(end_token)
+        self.enabled = False
+        self.error: str | None = None
+        self._identity: dict[str, dict] = {}
+        self._position: dict[str, int] = {}
+        self._live: list | None = None               # conversations the memory cache last said it refers to
+        self._bytes = 0
+        self._files = 0
+        self.stats = {"loaded": 0, "stored": 0, "dropped": 0, "errors": 0}
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            self.enabled = True
+            for entry in self.path.glob("*.pt"):
+                try:
+                    self._bytes += entry.stat().st_size
+                    self._files += 1
+                except OSError:
+                    pass
+            # A directory left over the cap by an earlier run (or a smaller cap now) is trimmed here, oldest
+            # first: at start-up no conversation is remembered yet, so nothing is preferred over anything.
+            self.collect(live=set())
+        except OSError as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    # -- reporting -------------------------------------------------------------------------------------------
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return f"picture cache on disk off ({self.error})"
+        cap = f"{self.max_bytes / 2 ** 30:.1f} GiB cap" if self.max_bytes else "no cap"
+        return f"picture cache on disk {self.path} ({self._files} files, {self._bytes / 2 ** 20:.1f} MiB, {cap})"
+
+    def report(self) -> dict:
+        return {"files": self._files, "mb": round(self._bytes / 2 ** 20, 1),
+                "cap_mb": round(self.max_bytes / 2 ** 20, 1), **self.stats}
+
+    # -- identity --------------------------------------------------------------------------------------------
+
+    def remember(self, key: str, emb: Any) -> None:
+        """Keep what a later restore needs to reproduce the prompt: the ids and the text that carries them."""
+        if not self.enabled:
+            return
+        self._identity[key] = {
+            "first_index": int(emb.first_index), "last_index": int(emb.last_index),
+            "text_alias": emb.text_alias, "token_string": emb.token_string,
+            "token_list": list(emb.token_list) if emb.token_list is not None else None,
+            "grid_thw": emb.grid_thw, "mrope_merge_size": emb.mrope_merge_size, "metadata": emb.metadata,
+        }
+
+    def position(self, key: str, position: int | None) -> None:
+        """Where the picture sat in the prompt that last used it: what the eviction order is built from."""
+        if position is not None:
+            self._position[key] = int(position)
+
+    # -- files -----------------------------------------------------------------------------------------------
+
+    def _file(self, key: str, mode: str) -> pathlib.Path:
+        return self.path / f"{key}.{mode}.pt"
+
+    def fetch(self, key: str, mode: str):
+        """The picture back, or None. Rows from the file; identity from this process when it is known."""
+        if not self.enabled:
+            return None
+        path = self._file(key, mode)
+        try:
+            blob = torch.load(path, weights_only=True)
+        except FileNotFoundError:
+            return None
+        except Exception:                                   # partial or foreign file: drop it and re-encode
+            self.stats["errors"] += 1
+            self._unlink(path)
+            return None
+        try:
+            rows = blob["rows"] if "rows" in blob else QuantizedMMRows(
+                blob["rows_q"], blob["rows_scale"], getattr(torch, blob["rows_dtype"], torch.float32))
+            rows_count = int(rows.shape[-2])
+            token_string = torch.tensor([[self.start_token] + [-1] * rows_count + [self.end_token]], dtype=torch.long)
+            emb = MMEmbedding(embeddings=rows, token_string=token_string, text_alias=None,
+                              grid_thw=blob.get("grid_thw"), mrope_merge_size=blob.get("mrope_merge_size"))
+            emb.metadata = dict(blob.get("metadata") or {})
+        except Exception:                                   # unreadable content: same treatment
+            self.stats["errors"] += 1
+            self._unlink(path)
+            return None
+        known = self._identity.get(key)
+        if known is not None:                               # put the identity back: the prompt is reproduced
+            emb.first_index, emb.last_index = known["first_index"], known["last_index"]
+            emb.text_alias, emb.token_string = known["text_alias"], known["token_string"]
+            emb.token_list = known["token_list"]
+            emb.grid_thw, emb.mrope_merge_size = known["grid_thw"], known["mrope_merge_size"]
+            emb.metadata = known["metadata"]
+        try:
+            os.utime(path, None)                            # used now: the last thing the collector takes
+        except OSError:
+            pass
+        self.stats["loaded"] += 1
+        return emb
+
+    def store(self, evicted: list, mode: str, live: list | set | None = None,
+              protect: set | None = None) -> None:
+        """Write the pictures that just left the memory cache. `evicted` is [(key, embedding, position), ...].
+
+        `live` is `ImageEmbeddingCache.live_orders` (remembered conversations, newest first) and `protect` is the
+        conversation this request is serving, so that concurrent requests cannot release each other's cache.
+        """
+        if not self.enabled or not evicted:
+            return
+        if live is not None:
+            self._live = as_live(live)      # the conversations the cache still refers to (see collect)
+        for key, emb, position in evicted:
+            self.position(key, position)
+            payload = _rows_payload(emb)
+            if payload is None:
+                continue
+            if getattr(emb, "deepstack_embeddings", None) is not None:
+                continue                                    # not stored: only the merger rows are (GLM has none)
+            payload |= {"grid_thw": getattr(emb, "grid_thw", None),
+                        "mrope_merge_size": getattr(emb, "mrope_merge_size", None),
+                        "metadata": dict(getattr(emb, "metadata", None) or {})}
+            path = self._file(key, mode)
+            if path.exists():
+                continue                                    # same picture evicted again: already on disk
+            tmp = path.with_suffix(".tmp")
+            try:
+                torch.save(payload, tmp)
+                os.replace(tmp, path)
+                self._bytes += path.stat().st_size
+                self._files += 1
+                self.stats["stored"] += 1
+            except Exception:                               # disk full, permissions, ...: keep serving
+                self.stats["errors"] += 1
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        self.collect(live, protect)
+
+    def _unlink(self, path: pathlib.Path) -> None:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            self._bytes = max(0, self._bytes - size)
+            self._files = max(0, self._files - 1)
+        except OSError:
+            pass
+
+    def collect(self, live: list | set | None = None, protect: set | None = None) -> int:
+        """Enforce the cap. The unit of eviction is a *conversation*, not a file.
+
+        A conversation's pictures are only worth keeping together: the engine resumes at a checkpoint only when a
+        whole prompt is reproduced, so a conversation that loses one file has already lost its reuse — what is
+        left of it saves a vision pass per picture but nothing else, and it occupies the room a complete
+        conversation would need. So, in order:
+
+        1. pictures no remembered conversation claims, oldest file first, one at a time (the leftovers of a
+           conversation the user has moved on from and the server has since forgotten);
+        2. a conversation the server remembers but that is not the one being served, released **whole**, oldest
+           conversation first — with `--sessions N` the caches of N conversations coexist, and this is what keeps
+           as many of them complete as the cap allows;
+        3. the conversation being served, last of all, and only in part if its own files alone exceed the cap:
+           the end of its prompt goes first, because the head is what a resume point needs.
+
+        `live` is the remembered conversations, newest first (`ImageEmbeddingCache.live_orders`); `protect` is the
+        conversation the calling request is serving (`mine` from `get_many`), which must never be released whole
+        just because some other request happened to be served more recently. Without `protect` the newest
+        remembered conversation plays that part.
+        """
+        if not self.enabled or not self.max_bytes or self._bytes <= self.max_bytes:
+            return 0
+        live = self._live if live is None else as_live(live)
+        protected = set(protect) if protect is not None else (set(live[0]) if live else set())
+        try:
+            files = list(self.path.glob("*.pt"))
+        except OSError:
+            return 0
+
+        def age(entry: pathlib.Path) -> float:
+            try:
+                return entry.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        def within(entry: pathlib.Path) -> float:
+            position = self._position.get(entry.name.split(".")[0])
+            return age(entry) if position is None else -position
+
+        dropped = 0
+        if live is None:                              # nobody said which conversations are live: position only
+            for entry in sorted(files, key=lambda e: (0, age(e)) if self._position.get(e.name.split(".")[0]) is None
+                                else (1, -self._position[e.name.split(".")[0]])):
+                if self._bytes <= self.max_bytes:
+                    break
+                self._unlink(entry)
+                dropped += 1
+            self.stats["dropped"] += dropped
+            return dropped
+
+        def group_of(key: str) -> int:
+            """0 = the conversation being served, 1..len(live) = remembered ones (older = larger),
+            len(live)+1 = claimed by none of them."""
+            if key in protected:
+                return 0
+            for rank, keys in enumerate(live):
+                if key in keys:
+                    return rank + 1
+            return len(live) + 1
+
+        unclaimed = len(live) + 1
+        groups: dict[int, list] = {}
+        for entry in files:
+            groups.setdefault(group_of(entry.name.split(".")[0]), []).append(entry)
+
+        for group in sorted(groups, reverse=True):    # least wanted first
+            if self._bytes <= self.max_bytes:
+                break
+            entries = groups[group]
+            if group == unclaimed:                    # nobody claims these: the oldest goes first
+                ordered = sorted(entries, key=age)
+                whole = False
+            elif group == 0:                          # the one being served: only as a last resort, tail first
+                ordered = sorted(entries, key=within)
+                whole = False
+            else:                                     # a remembered conversation: it goes as a unit
+                ordered = sorted(entries, key=age)
+                whole = True
+            for entry in ordered:
+                if not whole and self._bytes <= self.max_bytes:
+                    break
+                self._unlink(entry)
+                dropped += 1
+        self.stats["dropped"] += dropped
+        return dropped
