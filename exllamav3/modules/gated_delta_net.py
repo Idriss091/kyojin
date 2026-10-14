@@ -1317,6 +1317,8 @@ class GatedDeltaNet(Module):
         cdim = self.conv_kernel_size
         # EXL3_PF_NO_TAIL=1: the job also asks for the prompt's last full page, so up to 2 rows (kernel side-writes 2)
         max_rows = 2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1
+        if self.kda and os.environ.get("EXL3_NC2_CKPT4", "0") == "1":
+            max_rows = 4  # CK4 kernel build (vendor/fla/hip/kda_fused_h_hip.py): 8192-row chunks
         if len(rows) > max_rows or any(r % 64 or not cdim <= r < seqlen for r in rows):
             return None
         cks = [{

@@ -156,12 +156,20 @@ __device__ uint32_t kda_prof[4096 * 9];
 #define PFW 0  // 1..4: a 9th wave touches chunk c+1's rows (L2 / MALL prefetch) after barrier PFW of chunk c
 #endif
 
+#ifndef CK4
+#define CK4 0
+#endif
+
 extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const float* __restrict__ gk, const uint16_t* __restrict__ beta, const uint16_t* __restrict__ Akk,
     const uint16_t* __restrict__ Aqk, uint16_t* __restrict__ o, const float* __restrict__ h0,
     float* __restrict__ ht, float scale, int T, int H, int HV, float* __restrict__ hc, int ckpt_chunk,
-    float* __restrict__ hc2, int ckpt_chunk2)
+    float* __restrict__ hc2, int ckpt_chunk2
+#if CK4
+    , float* __restrict__ hc3, int ckpt_chunk3, float* __restrict__ hc4, int ckpt_chunk4
+#endif
+    )
 {
     __shared__ __attribute__((aligned(16))) uint16_t sW[BT * LDR];   // w [token][kdim]
     __shared__ __attribute__((aligned(16))) uint16_t sX[KD * LDT];   // kb^T [kdim][token], then qg [token][kdim]
@@ -579,6 +587,21 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
                     hc2[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+#if CK4
+        // third and fourth checkpoints (EXL3_NC2_CKPT4: 8192-row chunks), same store as above
+        if (hc3 && i_t + 1 == ckpt_chunk3)
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt)
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    hc3[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+        if (hc4 && i_t + 1 == ckpt_chunk4)
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt)
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    hc4[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+#endif
     }
 
 #if PROF
