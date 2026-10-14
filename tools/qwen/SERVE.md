@@ -57,6 +57,13 @@ scales (`EXL3_GR_GS=1`; `hc_gs_sidecar.safetensors` in the model directory is pi
 environment wins. The engine modules read several of these when they are imported, so the server refuses to start if
 `exllamav3` was imported before they were set.
 
+## Two-stage draft head
+
+If `draft2s.st` is in the model directory and its header matches `config.json` (vocabulary size and hidden width), qserve
+uses it as the two-stage draft head and logs it at start-up. No flag needed. Output does not change (every draft is
+verified); sampled jobs keep the full head. `EXL3_DRAFT2S=<path>` picks another pack; `EXL3_DRAFT2S=off` turns it off.
+The pack is tied to one set of weights: download it from the same model repo.
+
 ## API
 
 - `POST /v1/chat/completions`: stream (SSE) and non-stream, `tools` and `tool_calls`, `tool` role messages, images as

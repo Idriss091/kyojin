@@ -1264,10 +1264,23 @@ def _mla_ext():
     return exllamav3_ext
 
 
+_DEC_VALU_WARNED = False
+
+
 def _dec_valu_on() -> bool:
-    """EXL3_MLA_DEC_VALU=1 (default off, read per call): decode / verify rows (R <= 8) of the MLA absorb and unfold run on the
-    VALU dot2-chain kernels (ext.mla_absorb_dec / mla_unfold_dec). Bit-identical to the Triton WMMA kernels."""
-    return os.environ.get("EXL3_MLA_DEC_VALU", "0") == "1" and torch.version.hip is not None
+    """Decode / verify rows (R <= 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels (ext.mla_absorb_dec /
+    mla_unfold_dec), bit-identical to the Triton WMMA kernels. On by default (HIP); EXL3_MLA_DEC_VALU=0 turns it off (read per
+    call). An extension build without the kernels falls back to the Triton path with one log line."""
+    global _DEC_VALU_WARNED
+    if os.environ.get("EXL3_MLA_DEC_VALU", "1") == "0" or torch.version.hip is None:
+        return False
+    ext = _mla_ext()
+    if not (hasattr(ext, "mla_absorb_dec") and hasattr(ext, "mla_unfold_dec")):
+        if not _DEC_VALU_WARNED:
+            _DEC_VALU_WARNED = True
+            print(" -- MLA VALU decode kernels not in this extension build: using the Triton path (rebuild the extension to enable them)")
+        return False
+    return True
 
 
 def _dec_valu_ok(R, w_uk_flat, H, qk_nope, qk_dim, q) -> bool:

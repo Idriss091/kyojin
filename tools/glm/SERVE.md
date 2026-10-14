@@ -67,6 +67,16 @@ To build it yourself from the official GLM-5.3 checkpoint:
 python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model folder>/mtp_eh_proj.st
 ```
 
+### Two-stage draft head (faster drafting)
+
+If `draft2s.st` is in the model folder and its header matches `config.json` (vocabulary size and hidden width), the
+server uses it as the two-stage draft head. No flag needed. It changes only how the draft is found; target token ids
+stay equal. Sampled jobs keep the full head. One log line says which source was used. `EXL3_DRAFT2S=<path>` picks
+another pack; `EXL3_DRAFT2S=off` turns it off. Build one with `tools/qwen/draft2s_pack.py`.
+
+The GLM MLA decode kernels (VALU path, bitwise equal to the Triton path) are also on by default.
+`EXL3_MLA_DEC_VALU=0` turns them off.
+
 ## Endpoints
 
 ### `GET /health`

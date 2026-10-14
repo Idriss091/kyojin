@@ -129,6 +129,50 @@ def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
     return "absent"
 
 
+DRAFT2S_IN_PACK = "draft2s.st"  # safetensors layout, but not *.safetensors so the weight loader never indexes it
+
+
+def _draft2s_pack_matches(path: Path, model_dir: Path) -> bool:
+    """True when the pack header (tools/qwen/draft2s_pack.py metadata) was built for this model's vocabulary and width."""
+    import struct
+    try:
+        with open(path, "rb") as fh:
+            meta = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0])).get("__metadata__") or {}
+        cfg = json.loads((model_dir / "config.json").read_text())
+        cfg = cfg.get("text_config", cfg)
+        return meta.get("format") == "draft2s-v1" and int(meta["vocab"]) == cfg["vocab_size"] \
+            and int(meta["in_features"]) == cfg["hidden_size"]
+    except (OSError, ValueError, KeyError, struct.error):
+        return False
+
+
+def apply_draft2s_default(model_dir: str | None = None) -> str:
+    """Pick the optional two-stage draft head pack (EXL3_DRAFT2S, exllamav3/modules/draft2s.py) and log which source is used.
+
+    Order: explicit EXL3_DRAFT2S (never touched; "", "0" or "off" = off) > DRAFT2S_IN_PACK inside the model folder when its
+    header matches the model (vocab_size, hidden_size) > absent. The head only changes how the draft argmax is found, never
+    the output (every draft is verified). Returns the source: "explicit", "off", "pack", "mismatch" or "absent".
+    """
+    if "EXL3_DRAFT2S" in os.environ:
+        if os.environ["EXL3_DRAFT2S"].strip().lower() in ("", "0", "off"):
+            os.environ["EXL3_DRAFT2S"] = ""
+            print("serve: two-stage draft head: off (EXL3_DRAFT2S)", flush=True)
+            return "off"
+        print(f"serve: two-stage draft head: EXL3_DRAFT2S={os.environ['EXL3_DRAFT2S']} (explicit)", flush=True)
+        return "explicit"
+    if model_dir:
+        path = Path(model_dir).expanduser() / DRAFT2S_IN_PACK
+        if path.is_file():
+            if not _draft2s_pack_matches(path, Path(model_dir).expanduser()):
+                print(f"serve: two-stage draft head: {path} does not match this model (vocab / width): not used", flush=True)
+                return "mismatch"
+            os.environ["EXL3_DRAFT2S"] = str(path)
+            print(f"serve: two-stage draft head: {path} (model folder)", flush=True)
+            return "pack"
+    print(f"serve: two-stage draft head: none ({DRAFT2S_IN_PACK} not in the model folder): full draft head", flush=True)
+    return "absent"
+
+
 # The template deliberately uses a zero-width space so normal prose does not trigger tools.
 TOOL_OPEN = "<tool_call>"
 TOOL_CLOSE = "</tool_call>"
@@ -1478,6 +1522,7 @@ def main() -> None:
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
+    apply_draft2s_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and os.environ["EXL3_DENSE_GEMM_TUNE"] != "0" and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])

@@ -101,6 +101,12 @@ Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the co
 and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
 single-kernel absorbed-form prefill for A/B testing.
 
+### `EXL3_MLA_DEC_VALU` (default: `1` on HIP)
+
+Decode and verify rows (up to 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels. The output is
+bitwise equal to the Triton path. `0` turns it off. If the extension build lacks the kernels, the Triton path is used and
+one log line says so.
+
 ### `EXL3_PREFER_FA2` (default: `0`)
 
 Put the flash-attn-2 backends ahead of the built-in Triton attention kernels in the dispatch
@@ -830,6 +836,13 @@ Path of a safetensors sidecar holding an unquantized copy of the MTP `eh_proj`, 
 draft acceptance without changing target token ids. `0` turns it off; a path that does not exist
 stops the load. The GLM server looks for the file itself in three places, listed in
 [tools/glm/SERVE.md](../tools/glm/SERVE.md).
+
+#### `EXL3_DRAFT2S` (default: `<model folder>/draft2s.st` when present and matching)
+
+Two-stage draft head for the MTP drafters: it finds the draft argmax in two steps instead of one pass over the full
+vocabulary. Every draft is still verified, so the output does not change. The GLM and Qwen servers pick up
+`draft2s.st` from the model folder when its header (vocabulary size, hidden width) matches `config.json`. A path in the
+variable wins; `0`, `off` or an empty value uses the full head. Sampled jobs always use the full head.
 
 #### `EXL3_MIMO_LOSSLESS` (default: `1`)
 

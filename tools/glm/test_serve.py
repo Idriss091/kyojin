@@ -12,6 +12,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
 
+
+def _write_draft2s_pack(path, vocab, width):
+    """A header-only draft2s pack (tools/qwen/draft2s_pack.py metadata layout) for the sidecar tests."""
+    import json as _json, struct
+    hdr = _json.dumps({"__metadata__": {"format": "draft2s-v1", "vocab": str(vocab), "in_features": str(width), "m": "512"}}).encode()
+    path.write_bytes(struct.pack("<Q", len(hdr)) + hdr)
+
+
 class FakeGenerator:
     num_draft_tokens = 2  # /metrics derives the round count from the engine's window
 
@@ -119,6 +127,33 @@ class ServeTests(unittest.TestCase):
                     self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], value)
         self.assertNotIn("EXL3_MTP_EH_FP16", serve.SPEED_ENV)
         self.assertFalse(serve.EH_SIDECAR_IN_PACK.endswith(".safetensors"))
+
+    def test_draft2s_sidecar_source_order(self):
+        import os, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}):
+            pack = Path(d)
+            (pack / "config.json").write_text(json.dumps({"text_config": {"vocab_size": 154880, "hidden_size": 4096}}))
+            os.environ.pop("EXL3_DRAFT2S", None)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "absent")
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            # a pack built for another model (Qwen's head) is not used
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 248320, 2560)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "mismatch")
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 154880, 4096)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "pack")
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], str(pack / "draft2s.st"))
+            # explicit path never touched; "0" / "off" / "" = off (empty, so the engine's truthiness check skips the head)
+            os.environ["EXL3_DRAFT2S"] = "/nope/x.st"
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "explicit")
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], "/nope/x.st")
+            for value in ("0", "off", ""):
+                os.environ["EXL3_DRAFT2S"] = value
+                self.assertEqual(serve.apply_draft2s_default(str(pack)), "off")
+                self.assertEqual(os.environ["EXL3_DRAFT2S"], "")
+        self.assertNotIn("EXL3_DRAFT2S", serve.SPEED_ENV)
+        self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
 
     def test_stream_engine_error_still_ends_with_finish_reason(self):
         from aiohttp.test_utils import TestClient, TestServer
