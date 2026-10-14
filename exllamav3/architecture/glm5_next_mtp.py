@@ -282,6 +282,8 @@ class Glm5NextMTPModel(Model):
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
         logits = lm.forward(logits, params)
+        if params.get("export_draft_logits"):
+            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs
         if params.get("export_draft_conf"):
             # Per-position confidence for the generator's draft truncation: the argmax logit
             # value, over the unpadded vocabulary
