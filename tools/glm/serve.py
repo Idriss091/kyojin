@@ -356,9 +356,8 @@ class ResidentEngine:
         self.num_draft = num_draft
         # Concurrent requests batched through the one Generator. The recurrent (KDA) state is allocated per slot and per
         # history level (138 MiB each). The Cache default of 16 slots was allocated whatever --sessions said: 6.6 GiB at
-        # --num-draft 2, of which a single session uses 0.4 GiB. With one session the cache now gets one slot (the
-        # Generator caps its batch at the slot count); several sessions keep the 16 slots, that path was not re-measured.
-        # EXL3_GLM_SLOTS=16 restores the old layout. The paged KV pool (ctx + 4096 tokens) is shared by all sessions.
+        # --num-draft 2, of which a single session uses 0.4 GiB. The cache now gets one slot per session (the Generator
+        # caps its batch at the slot count, the admission gate at --sessions). EXL3_GLM_SLOTS=16 restores the old layout. The paged KV pool (ctx + 4096 tokens) is shared by all sessions.
         if not 1 <= sessions <= MAX_SESSIONS:
             raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
         self.sessions = sessions
@@ -370,7 +369,7 @@ class ResidentEngine:
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
-        slots = max(1 if sessions == 1 else MAX_SESSIONS, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
+        slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
         # GLM_NGRAM = "gram,K,match[,cmin]" (off by default): n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
         # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot).
