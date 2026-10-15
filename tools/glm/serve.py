@@ -54,6 +54,10 @@ SPEED_ENV = {
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",
     "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # plain chunks beyond 32K depth, lower peak memory at 512K ctx
+    # 15/10: 8192-row prefill chunks (an 8K prompt = one forward; 4-slot KDA checkpoints keep every tail boundary).
+    # Box 8K cold window -3.8 %, kamel served 8K 697 / 32K 681 tok/s, logits + restore hashes equal to 4096 chunks.
+    "EXL3_PREFILL_BIG_CHUNK": "8192",
+    "EXL3_NC2_CKPT4": "1",
     # 27/09: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
     # served accept +0.077 +- 0.008 (n=24), target ids 24/24 equal, serve_accept decode +4.8 %.
     # The pack ships the sidecar as mtp_eh_proj.st; loaded by default (see apply_eh_sidecar_default()).

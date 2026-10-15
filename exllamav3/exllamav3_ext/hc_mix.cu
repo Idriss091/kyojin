@@ -1622,7 +1622,9 @@ void hc_mix
 
 // One-pass hc_mix_norm (r35): per-device row tickets, zeroed at allocation (first eager call,
 // never under capture); runtime-settable via hc_mix_set_onepass for in-process A/B.
-#define HC_MAX_TICKETS 4096
+// 65536 = the forward row limit (grid.y): 8192-row prefill chunks keep the one-pass and fused site paths
+// (box1 run 32 K1: at 4096 tickets an 8191-row chunk fell back to partials + finalize + apply, mHC +65 %).
+#define HC_MAX_TICKETS 65536
 #define HC_DEC_ROWS 64
 static int g_hc_onepass = -1;
 static bool hc_onepass(int R)

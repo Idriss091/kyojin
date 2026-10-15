@@ -75,6 +75,13 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
         # default off. Name kept per brief; the 2-WG split (lever a) was ruled NO-GO by
         # construction (w/tril/vn couple all halves).
         defs = "BRL=1 UNI=1"
+    # ckpt: one dict or a list of up to 2 (EXL3_PF_NO_TAIL adds the prompt's last full page); up to 4 with the CK4 build
+    # (EXL3_NC2_CKPT4: an 8192-row chunk carries 3 interior checkpoints + the last full page)
+    cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
+    nslot = 4 if len(cks) > 2 else 2
+    assert len(cks) <= nslot
+    if nslot == 4:
+        defs = (defs + " CK4=1").strip()
     fn = _load(defs)
     if o is None:
         o = torch.empty_like(v)
@@ -88,13 +95,10 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
             P(Akk.data_ptr()), P(Aqk.data_ptr()), P(o.data_ptr()), P(0 if h0 is None else h0.data_ptr()),
             P(final_state.data_ptr() if output_final_state else 0), ctypes.c_float(scale), ctypes.c_int(T),
             ctypes.c_int(H), ctypes.c_int(HV)]
-    # ckpt: one dict or a list of up to 2 (EXL3_PF_NO_TAIL adds the prompt's last full page)
-    cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
-    assert len(cks) <= 2
     cks = [c for c in cks if 0 < c["chunk"] <= (T + 63) // 64]
     for c in cks:
         assert c["s"].dtype == torch.float32 and c["s"].is_contiguous() and c["s"].shape == (B, HV, K, V)
-    for i in range(2):
+    for i in range(nslot):
         c = cks[i] if i < len(cks) else None
         args += [P(0 if c is None else c["s"].data_ptr()), ctypes.c_int(-1 if c is None else c["chunk"])]
     params = (ctypes.c_void_p * len(args))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args])

@@ -1288,8 +1288,11 @@ class Job:
                     p for p in range((seq.kv_position // PAGE_SIZE + 1) * PAGE_SIZE, seq.kv_position + chunk, PAGE_SIZE)
                     if self.is_checkpoint_boundary(pos = p)
                 ]
-                if len(interior) > 1:
-                    chunk = interior[1] - seq.kv_position
+                # EXL3_NC2_CKPT4: the CK4 kernel build side-writes up to 4 rows = 3 interior boundaries + the last full
+                # page (EXL3_PF_NO_TAIL), so an 8K prompt under EXL3_PREFILL_BIG_CHUNK=8192 runs as one chunk
+                keep = 3 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else 1
+                if len(interior) > keep:
+                    chunk = interior[keep] - seq.kv_position
             elif big > chunk and big % chunk == 0 and remaining > big + chunk:
                 chunk = big
             prefill_end = seq.kv_position + chunk
