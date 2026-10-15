@@ -13,8 +13,8 @@ Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https:/
 
 <table align="center">
 <tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>
-<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1481 at 8K</td><td align="right"><b>45.7 to 66.8</b></td></tr>
-<tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">634 at 8K</td><td align="right"><b>26.2 to 33.4</b></td></tr>
+<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1494 at 8K</td><td align="right"><b>47.5 to 73.2</b></td></tr>
+<tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">652 at 8K</td><td align="right"><b>27.4 to 36.8</b></td></tr>
 <tr><td>MiMo-V2.6-Flash <sub>(1.5)</sub></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right">28.9 to 37.0</td></tr>
 </table>
 
