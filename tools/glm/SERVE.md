@@ -30,12 +30,12 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
-| `--image-cache-mb` | 2 GiB on a 128 GB Strix Halo | host memory for the decoded image embeddings, shared by all sessions; `0` = no byte limit. Default is 2 percent of RAM clamped to `[512, 2048]` MiB (see [Images](#images)) |
-| `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = only the byte budget |
-| `--image-cache-dir` | none | a second-level picture cache on disk, **off by default**. The rows of the pictures the memory budget evicts are written there (and only those: a session that fits in `--image-cache-mb` writes nothing) and read back when the client sends the picture again. With the picture's identity kept for the life of the process, a restored picture reproduces the prompt token for token, so the paged prefix still matches. Holds rows derived from the images the clients send, never an image file or a path |
-| `--image-cache-dir-max-gb` | `4` | cap on that directory (0 = no cap). It is enforced per *conversation*, not per file: pictures no remembered conversation claims go first (oldest file first); then a conversation the server remembers but this request is not serving is released **whole**, oldest conversation first, so with `--sessions N` as many conversations as fit keep a complete cache instead of N half-caches; the conversation the request itself is serving is the last to be touched and only in part if its own files alone exceed the cap (end of its prompt first). Trimming also happens at start-up |
-| `--image-cache-dir-lock-s` | `300` | seconds a conversation keeps the room its files took before another conversation may take it (0 = no tenure). The clock starts when the files are written and is **not** refreshed by later requests, so the conversation that grabbed the cache cannot keep it for ever. Tenure never costs a write: a batch that would have to push a recent conversation out is judged *before* anything is written and simply skipped (a conversation cached only in part has no reuse anyway), so the bytes stay on the client's side of the wire — which is what matters for wear |
-| `--image-cache-format` | `fp32` | how the cached rows are stored: `fp32` as the vision merger emits them, `fp16` (half the bytes, **measured bit-exact on this pack**) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
+| `--image-cache-mb` | `1024` | host memory for the decoded image embeddings, in MiB, one pool shared by all sessions; `0` = no byte limit |
+| `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = no limit |
+| `--image-cache-dir` | `~/.cache/kyojin/image-embeddings` | directory of the second-level picture cache; used only when `--image-cache-dir-max-gb` is set |
+| `--image-cache-dir-max-gb` | `0` | GiB cap on that directory; `0` = disabled. There is no unlimited setting |
+| `--image-cache-dir-lock-s` | `300` | seconds a conversation keeps the room its files took before another may take it; `0` = no tenure |
+| `--image-cache-format` | `fp32` | row storage: `fp32` as the vision merger emits them, `fp16` (half the bytes, bit-exact on this pack) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
@@ -124,22 +124,20 @@ server does not fetch remote URLs). One image takes 40 to about 8,000 tokens dep
 page is 3,136). `--no-vision` skips the tower; an image request then gets HTTP 400, as do video and audio parts.
 
 An image that is sent again in a later turn keeps the prompt cache **while its embedding is still held**. The
-server keeps the decoded embeddings of recent pictures in host memory (GLM's merger emits fp32: 49.7 MiB for a
-3,179-token manga page, 1 MB for a 224x224 crop) and re-encodes a picture it had to give up, which gives that
+server keeps the decoded embeddings of recent pictures in host memory (GLM's merger emits fp32: 49.0 MiB for a
+1568x1568 page, 3,136 tokens, 1 MB for a 224x224 crop) and re-encodes a picture it had to give up, which gives that
 picture fresh pseudo token ids and breaks the paged prefix *from that picture on*. `--image-cache-mb` sizes the
-cache: 2 GiB by default on a 128 GB Strix Halo, 41 manga pages at 49.7 MiB each, one pool shared by all sessions like `-c`.
+cache: 1024 MiB by default, about 20 pages of 1568x1568 at 49.0 MiB each, one pool shared by all sessions
+like `-c`.
 A conversation larger than the budget keeps its **earliest** pictures and gives up the last ones, so the match
 still runs from the first page to where the cache ended rather than collapsing to nothing. The request log's
 `img_cache` line reports `hits`, `misses` and `first_missing`, the index the prefix could match up to;
 `--image-cache-items` adds an optional cap on the number of pictures.
 
-`--image-cache-format` stores those rows packed instead of as fp32 (49.0 MiB for a 3179-token page): `fp16` is
-24.5 MiB and `q8` is 12.3 MiB. The rows are put back to their working dtype where the model gathers them — the
-same place the fp32 rows were read before, `mm_rows()` in `exllamav3/tokenizer/mm_embedding.py`, called from the
-embedding module, on the host because that module is a CPU module. Measured per picture that is actually
+`--image-cache-format` stores those rows packed instead of as fp32 (49.0 MiB for a 1568x1568 page): `fp16` is
+24.5 MiB and `q8` is 12.3 MiB. Measured per picture that is actually
 re-prefilled: `q8` +0.5 ms against the 5.2 ms the fp32 path takes, i.e. 0.01 % of a 40-page cold prefill and
-nothing at all on a turn the cache serves from the paged prefix. All of them are off by default. Measured against
-fp32 on this pack (12544 rows of four real pages): **`fp16` is bit-exact** — the
+nothing at all on a turn the cache serves from the paged prefix. All of them are off by default. **`fp16` is bit-exact** — the
 merger's fp32 output is an fp16 value widened, so nothing is rounded and the saving is free — and `q8` loses
 0.863 % (rms 1.3e-4, 41 dB).
 
@@ -158,14 +156,15 @@ With `EXL3_CONV_GEMM=0`, `MIOPEN_FIND_MODE=FAST` alone removes the convolution h
 pre-tuning, exactly as the default has them. Measurements, the offline pre-generation alternative, and
 the comparison with the default configuration: [doc/EXL3_CONV_GEMM.md](../../doc/EXL3_CONV_GEMM.md).
 
-With `--image-cache-dir`, the pictures the memory budget gives up are written to disk **when they are evicted**
-and read back the next time the client sends them. Because the server also keeps each picture's identity (its
-pseudo token ids) for the life of the process, a restored picture reproduces the prompt token for token and the
-paged KV prefix still matches: measured on 1568x1568 pages as q8 rows, the second and third request of the same
-six-picture conversation reused 98.8 % of the prompt with **no vision pass at all** (18.9 K tokens, 0.9 s prefill
-against 30.9 s cold), from 4 files of 12.3 MiB. A session that fits in `--image-cache-mb` writes nothing; a
-longer one writes each evicted picture once (files are keyed by content, so a picture evicted twice is not
-rewritten). Anything unreadable is dropped and re-encoded: the disk never becomes a reason for a request to fail.
+With `--image-cache-dir-max-gb` (off by default), the pictures the memory budget gives up are written to disk
+**when they are evicted** and read back when the client sends them again. It only ever helps a conversation with
+more pictures than `--image-cache-mb` holds: a session that fits writes nothing, and a longer one writes each
+evicted picture once (files are keyed by content, so a picture evicted twice is not rewritten). The directory is
+`--image-cache-dir`, `~/.cache/kyojin/image-embeddings` unless changed, and anything unreadable in it is dropped
+and re-encoded: the disk never becomes a reason for a request to fail. Note what it stores: the **rows derived
+from the input images stay on disk**, which is a privacy and disk-wear consideration. Two knobs bound it:
+`--image-cache-dir-max-gb` caps the directory and `--image-cache-dir-lock-s` caps how often a conversation can
+lose its place to another one.
 
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`
@@ -303,6 +302,10 @@ models:
   in the standalone MTP bench. The gap is content, not the server: mtp_round on the same prose prompt
   gives 24.6 t/s (draft acceptance 0.57) vs 28.2 on chat (0.79); server overhead is ~3%.
 - No auth, no CORS, no embeddings endpoint. Bind to 127.0.0.1.
+- **The image disk cache degrades with `--sessions > 1`.** With several conversations taking turns, a directory
+  too small for all of them makes each request rewrite what the previous one dropped. `--image-cache-dir-lock-s`
+  reduces that writing but does not remove it; a directory with room for every active conversation does. This
+  needs many pictures *and* concurrent conversations at once, so it is rare in practice.
 
 ## Open issues (found while documenting, NOT fixed)
 
@@ -335,10 +338,10 @@ split mid-token, covering template rendering, think/tool parsing, stop strings, 
 framing, `/v1/models`, usage, and the streamed open-`<think>` path. No GPU needed.
 
 `test_serve_glm_additional.py` holds the tests for what this checkout adds locally: the
-request log (`KYOJIN_REQLOG`, off by default, no request text) and the image cache budget
-(`--image-cache-mb` / `--image-cache-items`, the automatic share of RAM, what `img_cache`
-reports). It is a file of its own so upstream's `test_serve.py` stays untouched and merges
-cleanly; fold it back in if the features are ever proposed upstream.
+request log (`KYOJIN_REQLOG`, off by default, no request text) and the image cache
+(`--image-cache-mb` / `--image-cache-items`, the defaults of the `--image-cache-dir*` options,
+the row format, what `img_cache` reports). It is a file of its own so upstream's `test_serve.py`
+stays untouched and merges cleanly.
 
 ## Lane launcher
 

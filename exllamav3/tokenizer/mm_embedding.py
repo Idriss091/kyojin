@@ -159,7 +159,8 @@ class QuantizedMMRows:
         """Rows `index` in `out_dtype` (default: the dtype the rows had). `index` may live anywhere: the
         gather is on the host where the rows are, the scaling where the result is wanted. The scale is applied
         in place, which measured ~15 % faster than allocating the product: 6 ms against 5 ms for the same rows
-        as fp32, for one 3179-token page, so re-prefilling one picture costs about half a millisecond more."""
+        as fp32, for one 1568x1568 page (3,136 tokens), so re-prefilling one picture costs about half a
+        millisecond more."""
         out_dtype = out_dtype or self.dtype
         index = index.to(self.q.device)
         values = self.q[index].to(out_dtype).sub_(128.0)     # stored offset by half the range, so uint8

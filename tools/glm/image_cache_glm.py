@@ -21,7 +21,7 @@ prompt reused before the change, 0 % — the full 63K re-prefilled — after it)
 The cache is bounded by total bytes, with an optional entry count on top; the GLM server sizes the byte budget
 from RAM and its own flags (see `--image-cache-mb`). Each entry holds the embedding rows on the host plus the same
 again for each deepstack layer, so the budget is host memory, not VRAM: GLM's vision merger emits fp32, about
-49.7 MiB for one 3179-token manga page and 1 MB for a 224x224 crop.
+49.0 MiB for one 1568x1568 page (3,136 tokens) and 1 MB for a 224x224 crop.
 
 When the budget cannot hold every active conversation, each one keeps its head and re-encodes its tail: the loss
 is a few pictures per turn, not the prompt. `max_orders` is how many recent prompts the policy weighs, and among
@@ -35,7 +35,7 @@ import threading
 from typing import Any, Callable
 
 DEFAULT_MAX_ITEMS = 0            # the byte budget is the real bound; a count cap is optional on top of it
-DEFAULT_MAX_BYTES = 2 << 30      # 2 GiB of host memory (Strix Halo: ~104 GB of weights + the KV pool)
+DEFAULT_MAX_BYTES = 1 << 30      # 1 GiB of host memory, as upstream sizes it (--image-cache-mb overrides)
 DEFAULT_MAX_ORDERS = 2           # prompts whose picture order the eviction policy remembers
 
 

@@ -107,52 +107,23 @@ SPEED_ENV = {
     "EXL3_SPEC_SAMPLED": "1",
 }
 
-# Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.7 MiB for a
-# 3179-token manga page and 1 MB for a 224x224 crop, so pictures, not bytes, are what a conversation spends.
-# The automatic budget is a share of RAM clamped to this range; the ceiling is what a Strix Halo box can spare
-# next to ~104 GB of weights and the KV pool: 2 GiB holds 41 manga pages (49.7 MiB each), measured.
-IMAGE_CACHE_AUTO_MIN_MB = 512
-IMAGE_CACHE_AUTO_MAX_MB = 2048
-IMAGE_CACHE_AUTO_SHARE = 0.02
-
-# How the cached rows may be stored (--image-cache-format). Kept here rather than imported from the engine
-# because serve.py must not import exllamav3 before SPEED_ENV is applied; a test checks it matches
-# exllamav3.tokenizer.mm_embedding.MM_QUANT_MODES.
+# Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.0 MiB for a
+# 1568x1568 page (3,136 tokens) and 1 MB for a 224x224 crop, so pictures, not bytes, are what a conversation
+# spends: the default holds about 20 of those pages, as upstream's 1 GiB did.
+IMAGE_CACHE_MB_DEFAULT = 1024
+# How the cached rows are stored (--image-cache-format). fp32 is what the vision merger emits; fp16 is exactly
+# the same values (the tower computes in fp16) and q8 rounds at one part in 254 of the row's peak. Kept here
+# rather than imported from the engine, which serve.py must not import before SPEED_ENV is applied.
 IMAGE_CACHE_FORMATS = ("fp32", "fp16", "q8")
-# Cap on the second-level picture cache (--image-cache-dir). It holds only the pictures the memory budget had to
-# evict, so it is deliberately independent of --image-cache-mb: 4 GiB is 87 manga pages as fp32, 175 as fp16 and
-# 349 as q8, which covers the sessions this server is run for. 0 = no cap.
-IMAGE_CACHE_DIR_MAX_GB = 4.0
+IMAGE_CACHE_DIR_DEFAULT = "~/.cache/kyojin/image-embeddings"
+# GiB cap on the second-level picture cache directory. 0 means the disk cache is off, which is the default: the
+# memory cache above is what a normal session needs, and the disk cache exists for conversations with more
+# pictures than that budget holds. A positive value is always a real cap, there is no "unlimited".
+IMAGE_CACHE_DIR_MAX_GB = 0.0
 # How long a conversation keeps the room its picture cache took on disk (--image-cache-dir-lock-s). The clock
 # starts when the files are written and is not refreshed by later requests, so a conversation that grabbed the
-# cache cannot keep it for ever; within the window a cyclic workload cannot evict each conversation just before
-# it is served again.
+# cache cannot keep it for ever.
 IMAGE_CACHE_DIR_LOCK_S = 300.0
-
-
-def physical_ram_bytes() -> int:
-    """Installed RAM, or 0 when the platform will not say."""
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        return 0
-
-
-def auto_image_cache_bytes(ram_bytes: int | None = None) -> int:
-    """Default byte budget for the image embedding cache: 2 % of RAM, clamped to [512 MiB, 2 GiB].
-
-    The budget has to cover the pictures of the conversation being served: the paged prefix stops at the first
-    picture whose embedding was evicted, so a budget that is one picture short costs the whole prompt, and how
-    many pictures a history holds cannot be predicted from a request. A share of RAM therefore beats a constant,
-    and the clamp keeps it sane on a small box (never below 512 MiB) and on a large one (never above 2 GiB,
-    which is 41 manga pages and what a 128 GB Strix Halo can spare next to the weights).
-    """
-    if ram_bytes is None:
-        ram_bytes = physical_ram_bytes()
-    mb = ram_bytes / 2 ** 20 * IMAGE_CACHE_AUTO_SHARE
-    if not ram_bytes:
-        mb = IMAGE_CACHE_AUTO_MIN_MB
-    return int(min(IMAGE_CACHE_AUTO_MAX_MB, max(IMAGE_CACHE_AUTO_MIN_MB, mb))) * 2 ** 20
 
 
 def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: int = 0,
@@ -166,6 +137,22 @@ def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: in
     """
     return ImageEmbeddingCache(max_items=image_cache_items, max_orders=max(2, sessions),
                                **({} if image_cache_bytes is None else {"max_bytes": image_cache_bytes}))
+
+
+def make_image_disk(image_cache_dir: str | None, image_cache_dir_max_gb: float, image_cache_dir_lock_s: float,
+                    start_token: int = 0, end_token: int = 0):
+    """The second-level picture cache, or None when it is off (`--image-cache-dir-max-gb` 0 or less).
+
+    A cap is required: the disk cache is meant for conversations with more pictures than `--image-cache-mb`
+    holds, and an unbounded directory is not something a server should be able to create by omission.
+    """
+    if not image_cache_dir_max_gb or image_cache_dir_max_gb <= 0:
+        return None
+    from image_cache_disk import ImageEmbeddingDisk      # imports exllamav3: only once it is wanted
+    return ImageEmbeddingDisk(image_cache_dir or IMAGE_CACHE_DIR_DEFAULT,
+                              int(float(image_cache_dir_max_gb) * 2 ** 30),
+                              start_token=int(start_token or 0), end_token=int(end_token or 0),
+                              lock_s=max(0.0, float(image_cache_dir_lock_s)))
 
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
@@ -480,7 +467,8 @@ class ResidentEngine:
                  vision: bool = True, sessions: int = 1,
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
                  image_cache_format: str = "fp32",
-                 image_cache_dir: str | None = None, image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
+                 image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
+                 image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
                  image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
@@ -533,15 +521,11 @@ class ResidentEngine:
         self.vision = None
         self.image_cache_format = image_cache_format
         self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
-        # Second-level cache: the rows of the pictures the memory cache evicts (--image-cache-dir, off by default)
-        self.emb_disk = None
-        if image_cache_dir:
-            from image_cache_disk import ImageEmbeddingDisk      # imports exllamav3: only once it is wanted
-            self.emb_disk = ImageEmbeddingDisk(
-                image_cache_dir, int(max(0.0, float(image_cache_dir_max_gb)) * 2 ** 30),
-                start_token=int(getattr(self.config, "vision_start_token_id", 0) or 0),
-                end_token=int(getattr(self.config, "vision_end_token_id", 0) or 0),
-                lock_s=max(0.0, float(image_cache_dir_lock_s)))
+        # Second-level cache: the rows of the pictures the memory cache evicts. Off unless a cap is given
+        # (--image-cache-dir-max-gb > 0), because the memory budget above is what a normal session needs.
+        self.emb_disk = make_image_disk(image_cache_dir, image_cache_dir_max_gb, image_cache_dir_lock_s,
+                                        getattr(self.config, "vision_start_token_id", 0),
+                                        getattr(self.config, "vision_end_token_id", 0))
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -1762,19 +1746,15 @@ def main() -> None:
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
-    parser.add_argument("--image-cache-mb", type=int, default=None,
-                        help="host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this is one pool "
-                             "shared by every --sessions request. Default: a share of RAM (2 percent) clamped to "
-                             f"[{IMAGE_CACHE_AUTO_MIN_MB}, {IMAGE_CACHE_AUTO_MAX_MB}] MiB, which is {IMAGE_CACHE_AUTO_MAX_MB} MiB on a 128 GB "
-                             "Strix Halo: about 50 MiB per manga page, 1 MB per small crop")
+    parser.add_argument("--image-cache-mb", type=int, default=IMAGE_CACHE_MB_DEFAULT,
+                        help=f"host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this "
+                             f"is one pool shared by every --sessions request (default {IMAGE_CACHE_MB_DEFAULT}): "
+                             "about 49 MiB per 1568x1568 page, 1 MB per 224x224 crop")
     parser.add_argument("--image-cache-items", type=int, default=0,
-                        help="optional cap on how many pictures are held at once (0 = only the byte budget)")
-    parser.add_argument("--image-cache-dir", default=None,
-                        help="directory of a second-level picture cache: the rows of the pictures the memory "
-                             "budget evicts are written there and read back, so a picture that comes back costs "
-                             "a file read instead of a vision pass plus a re-prefill of everything after it. "
-                             "Off by default (nothing is written). Holds rows derived from the images the "
-                             "clients send, never an image file or a path")
+                        help="optional cap on how many pictures are held at once (0 = no limit)")
+    parser.add_argument("--image-cache-dir", default=IMAGE_CACHE_DIR_DEFAULT,
+                        help=f"directory of the second-level picture cache (default {IMAGE_CACHE_DIR_DEFAULT}); "
+                             "only used when --image-cache-dir-max-gb is set")
     parser.add_argument("--image-cache-dir-lock-s", type=float, default=IMAGE_CACHE_DIR_LOCK_S,
                         help=f"seconds a conversation keeps its files on disk before another conversation may "
                              f"take the room (default {IMAGE_CACHE_DIR_LOCK_S:g} = 5 min, 0 = no tenure). Tenure "
@@ -1782,13 +1762,12 @@ def main() -> None:
                              "before it is served again; while it holds, a new picture that would have to push a "
                              "recent conversation out is simply not cached")
     parser.add_argument("--image-cache-dir-max-gb", type=float, default=IMAGE_CACHE_DIR_MAX_GB,
-                        help=f"cap on that directory, in GiB (default {IMAGE_CACHE_DIR_MAX_GB:g}; 0 = no cap). The "
-                             "pictures the memory cache is most likely to need again are the earliest ones, so "
-                             "the collector drops the end of a prompt first")
+                        help=f"cap on that directory, in GiB; 0 = off, which is the default "
+                             f"({IMAGE_CACHE_DIR_MAX_GB:g}). No unlimited setting: a positive value is the cap")
     parser.add_argument("--image-cache-format", choices=IMAGE_CACHE_FORMATS, default="fp32",
                         help="how the cached image embeddings are stored in host memory: fp32 as the vision merger "
-                             "emits them (default), fp16 (half the bytes, bit-exact on this pack) or q8 (8 bit with one fp16 scale per row, a quarter, "
-                             "measured 0.86 percent error)")
+                             "emits them (default), fp16 (half the bytes, bit-exact on this pack) or q8 (8 bit with "
+                             "one fp16 scale per row, a quarter of the bytes, 0.86 percent error)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
     parser.add_argument("--chat-template", default=None,
@@ -1832,16 +1811,9 @@ def main() -> None:
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
-        if args.image_cache_mb is None:
-            ram = physical_ram_bytes()
-            image_cache_bytes = auto_image_cache_bytes(ram)
-            image_cache_src = (f"auto: {IMAGE_CACHE_AUTO_SHARE:.0%} of {ram / 2 ** 30:.1f} GiB RAM, "
-                              f"clamped to [{IMAGE_CACHE_AUTO_MIN_MB}, {IMAGE_CACHE_AUTO_MAX_MB}] MiB")
-        else:
-            image_cache_bytes = max(0, args.image_cache_mb) * 2 ** 20
-            image_cache_src = f"--image-cache-mb {args.image_cache_mb}"
-        image_cache_size = (f"{image_cache_bytes / 2 ** 20:.0f} MiB of host memory ({image_cache_src})"
-                            if image_cache_bytes else f"unlimited host memory ({image_cache_src})")
+        image_cache_bytes = max(0, int(args.image_cache_mb)) * 2 ** 20
+        image_cache_size = (f"{args.image_cache_mb} MiB of host memory (--image-cache-mb)" if image_cache_bytes
+                            else "no byte limit (--image-cache-mb 0)")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
                               vision=not args.no_vision, sessions=args.sessions,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
@@ -1854,7 +1826,7 @@ def main() -> None:
         print(f"serve: vision={engine.supports_vision}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
               f"{args.image_cache_format} rows, shared by {args.sessions} session(s)", flush=True)
-        if args.image_cache_dir:
+        if engine.emb_disk is not None:
             print(f"serve: {engine.emb_disk.describe()}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.

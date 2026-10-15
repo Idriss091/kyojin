@@ -140,10 +140,9 @@ def tiny_pictures(count: int):
 class ImageDiskCacheTests(unittest.TestCase):
     """--image-cache-dir: what leaves memory is written once, and comes back with its identity."""
 
-    def test_the_default_cap_is_four_gib(self):
-        self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 4.0)
-        self.assertEqual(serve.IMAGE_CACHE_DIR_LOCK_S, 300.0)     # 5 minutes of tenure for a conversation's files
-        self.assertNotIn("EXL3_IMAGE_CACHE_DIR", os.environ)      # a flag, not an environment variable
+    def test_the_disk_cache_is_a_flag_not_an_environment_variable(self):
+        self.assertNotIn("EXL3_IMAGE_CACHE_DIR", os.environ)
+        self.assertNotIn("EXL3_IMAGE_CACHE_MB", os.environ)
 
     def test_the_tenure_reaches_the_disk_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,31 +223,37 @@ class ImageDiskCacheTests(unittest.TestCase):
             self.assertEqual(len(out), 2)
             self.assertEqual(len(calls), 2)
 
-    def test_auto_budget_is_a_share_of_ram_clamped_to_this_box(self):
-        low, high = serve.IMAGE_CACHE_AUTO_MIN_MB, serve.IMAGE_CACHE_AUTO_MAX_MB
-        self.assertEqual(serve.auto_image_cache_bytes(8 << 30), low << 20)      # 2 % of 8 GiB would be 164 MiB
-        self.assertEqual(serve.auto_image_cache_bytes(123 << 30), high << 20)   # 2519 MiB, clamped to 2048
-        self.assertEqual(serve.auto_image_cache_bytes(128 << 30), high << 20)
-        self.assertEqual(serve.auto_image_cache_bytes(64 << 30), 1310 << 20)    # inside the range: 2 % of RAM
-        self.assertEqual(serve.auto_image_cache_bytes(0), low << 20)            # unreadable RAM: the floor
+    def test_the_defaults_match_upstream(self):
+        # The memory budget is upstream's 1 GiB, and the disk cache is off unless a cap is given: no auto share
+        # of RAM, and no way to ask for an unbounded directory.
+        self.assertEqual(serve.IMAGE_CACHE_MB_DEFAULT, 1024)
+        self.assertEqual(serve.make_image_cache(None).max_bytes, 1024 << 20)
+        self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 0.0)
+        self.assertTrue(serve.IMAGE_CACHE_DIR_DEFAULT.endswith(".cache/kyojin/image-embeddings"))
+        self.assertEqual(serve.IMAGE_CACHE_DIR_LOCK_S, 300.0)
 
-    def test_the_box_this_runs_on_gets_the_ceiling(self):
-        self.assertGreater(serve.physical_ram_bytes(), 0)
-        self.assertEqual(serve.auto_image_cache_bytes(), serve.IMAGE_CACHE_AUTO_MAX_MB << 20)
+    def test_the_disk_cache_needs_a_cap(self):
+        # `--image-cache-dir-max-gb 0` (the default) is off; any positive value is a real cap, never "unlimited".
+        self.assertIsNone(serve.make_image_disk(serve.IMAGE_CACHE_DIR_DEFAULT, 0, 300.0))
+        self.assertIsNone(serve.make_image_disk(None, 0.0, 300.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = serve.make_image_disk(tmp, 0.5, 60.0, start_token=7, end_token=8)
+            self.assertEqual(disk.max_bytes, int(0.5 * 2 ** 30))
+            self.assertEqual(disk.lock_s, 60.0)
 
     def test_flags_reach_the_cache(self):
         cache = serve.make_image_cache(1024 << 20, image_cache_items=7, sessions=3)
         self.assertEqual(cache.max_bytes, 1024 << 20)
         self.assertEqual(cache.max_items, 7)
         self.assertEqual(cache.max_orders, 3)                # one prompt order per session
-        self.assertEqual(serve.make_image_cache(None, sessions=1).max_orders, 2)
+        self.assertEqual(serve.make_image_cache(512 << 20, sessions=1).max_orders, 2)
         self.assertEqual(serve.make_image_cache(0, 0).max_bytes, 0)              # 0 = no bound
         self.assertEqual(serve.make_image_cache(0, 0).max_items, 0)
-        self.assertEqual(serve.make_image_cache().max_bytes, 2 << 30)            # engine default: 2 GiB
+        self.assertEqual(serve.make_image_cache().max_bytes, 1024 << 20)         # engine default: 1 GiB
 
     def test_the_cache_the_engine_would_build_reports_its_budget(self):
-        cache = serve.make_image_cache(serve.auto_image_cache_bytes(123 << 30), 0)
-        self.assertEqual(cache.max_bytes, 2048 << 20)
+        cache = serve.make_image_cache(serve.IMAGE_CACHE_MB_DEFAULT << 20, 0)
+        self.assertEqual(cache.max_bytes, 1024 << 20)
         self.assertEqual(cache.max_items, 0)
 
     def test_the_cli_format_list_covers_every_engine_mode(self):
@@ -449,7 +454,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertEqual((cache[0]["imgs"], cache[0]["hits"], cache[0]["misses"]), ("2", "0", "2"))
         self.assertEqual(cache[0]["first_missing"], "0")           # the prefix can only match from the start
         self.assertEqual((cache[0]["entries"], cache[0]["evicted"]), ("2", "0"))
-        self.assertEqual(cache[0]["budget_mb"], "2048")            # image_cache_glm's own default
+        self.assertEqual(cache[0]["budget_mb"], "1024")            # image_cache_glm's own default (upstream's 1 GiB)
         self.assertEqual(cache[0]["item_cap"], "0")
         self.assertEqual((cache[1]["hits"], cache[1]["misses"]), ("2", "0"))
         self.assertNotIn("first_missing", cache[1])                # a full hit has no gap
