@@ -26,6 +26,18 @@ Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https:/
 <img src="doc/img/readme_decode.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
 
+<p align="center"><b>Long context: up to 500K tokens</b></p>
+
+<table align="center">
+<tr><th align="left">Model</th><th>128K</th><th>256K</th><th>500K</th></tr>
+<tr><td><b>GLM-5.3-Flash</b></td><td align="right">608 / 30.1</td><td align="right">577 / 30.2</td><td align="right">541 / 29.2</td></tr>
+<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">1399 / 46.8</td><td align="right">1339 / 47.0</td><td align="right">1240 / 43.4</td></tr>
+</table>
+
+<p align="center"><sub>Prefill / speculative decode, tokens per second, Kyojin 1.5.3 on one Ryzen AI Max+ 395 with 128 GB. One real document read as a growing prompt (500K = 499,712 tokens); prefill as reported by the server. Both models recalled two facts hidden at 40 % and 85 % of a ~500K-token prompt (needle test, 15/10).</sub></p>
+
+500K needs <code>-c 524288</code> at launch. Qwen also needs <code>--cache-bits 8</code>: past 262K it uses the 8-bit cache.
+
 ## Made with our models
 
 One prompt each, written by the model running on Kyojin and published as it came out. [Open the gallery](https://yamz-labs.github.io/gallery/).
