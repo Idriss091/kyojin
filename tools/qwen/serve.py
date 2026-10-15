@@ -285,10 +285,51 @@ def extract_images(messages: list[dict[str, Any]]) -> list[str]:
         content = m.get("content")
         if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and (part.get("type") in ("image_url", "image") or "image_url" in part):
+                if _is_image_part(part):
                     iu = part.get("image_url", part.get("image"))
                     urls.append(iu.get("url") if isinstance(iu, dict) else iu)
     return urls
+
+
+def _escape_image_pad(text: str) -> str:
+    """Keep a textual mention from being interpreted as an image placeholder by validation."""
+    return text.replace(IMAGE_PAD, IMAGE_PAD[:1] + "\\" + IMAGE_PAD[1:])
+
+
+def _escape_render_text(value: Any) -> Any:
+    """Escape marker-like text in arbitrary values supplied to the chat template."""
+    if isinstance(value, str):
+        return _escape_image_pad(value)
+    if isinstance(value, list):
+        return [_escape_render_text(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_escape_render_text(item) for item in value)
+    if isinstance(value, dict):
+        escaped = {}
+        for key, item in value.items():
+            escaped_key = _escape_render_text(key) if isinstance(key, str) else key
+            if escaped_key in escaped:
+                raise BadRequest("sanitization collision between dictionary keys")
+            escaped[escaped_key] = _escape_render_text(item)
+        return escaped
+    return value
+
+
+def _is_image_part(part: Any) -> bool:
+    """Match the image-part shape accepted by extract_images."""
+    return (
+        isinstance(part, dict)
+        and (part.get("type") in ("image_url", "image") or "image_url" in part or "image" in part)
+    )
+
+
+def _sanitize_message_content(content: Any) -> Any:
+    """Escape text content, preserving only image parts in the content list."""
+    if isinstance(content, str):
+        return _escape_image_pad(content)
+    if isinstance(content, list):
+        return [part if _is_image_part(part) else _escape_render_text(part) for part in content]
+    return _escape_render_text(content)
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -296,10 +337,13 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for m in messages:
         if not isinstance(m, dict) or "role" not in m:
             raise BadRequest("each message needs a role")
-        if m.get("content") is None:
-            m = dict(m, content="")
+        content = _sanitize_message_content(m.get("content"))
+        m = {key: _escape_render_text(value) for key, value in m.items() if key != "content"}
+        if content is None:
+            content = ""
+        m["content"] = content
         if m["role"] == "developer":                                   # OpenAI's newer name for the system role
-            m = dict(m, role="system")
+            m["role"] = "system"
         out.append(m)
     return out
 
@@ -1373,7 +1417,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         messages = normalize_messages(body["messages"])
         kwargs = resolve_template_kwargs(body, defaults)
         try:
-            prompt = render_prompt(template, messages, body.get("tools"), **kwargs)
+            prompt = render_prompt(template, messages, _escape_render_text(body.get("tools")),
+                                   **_escape_render_text(kwargs))
         except (ValueError, TypeError, KeyError, AttributeError, jinja2.TemplateError) as exc:
             raise BadRequest(f"chat template: {exc}") from exc
         images = extract_images(messages)
@@ -1566,8 +1611,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             body = await request.json()
             if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
                 raise BadRequest("messages must be a non-empty array")
-            prompt = render_prompt(template, normalize_messages(body["messages"]), body.get("tools"),
-                                   **resolve_template_kwargs(body, defaults))
+            prompt = render_prompt(template, normalize_messages(body["messages"]),
+                                   _escape_render_text(body.get("tools")),
+                                   **_escape_render_text(resolve_template_kwargs(body, defaults)))
         except json.JSONDecodeError as exc:
             return err(400, f"invalid JSON: {exc}")
         except (BadRequest, ValueError, TypeError, KeyError, AttributeError, jinja2.TemplateError) as exc:
@@ -1592,8 +1638,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     raise BadRequest("messages must be a non-empty array")
                 if extract_images(body["messages"]):
                     raise BadRequest("images cannot be tokenized here")
-                text = render_prompt(template, normalize_messages(body["messages"]), body.get("tools"),
-                                     **resolve_template_kwargs(body, defaults))
+                text = render_prompt(template, normalize_messages(body["messages"]),
+                                     _escape_render_text(body.get("tools")),
+                                     **_escape_render_text(resolve_template_kwargs(body, defaults)))
                 add_special = bool(add_special)          # a rendered chat prompt carries its own special tokens
             else:
                 text = body.get("prompt")
