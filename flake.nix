@@ -524,10 +524,12 @@
           };
 
           # 9. kyojin serve package (house pattern 3: stdenv + makeWrapper).
-          # Ships the three serve entry points with their sibling modules
-          # (serve_metrics.py per flavor + shared startup_health.py) under
-          # $out/share/kyojin/, mirroring the repo tools/ layout so the
-          # scripts' sys.path bootstrap keeps working. Wrappers bake in the
+          # Docker parity: $out/share/kyojin IS tools/ (full tree, zero
+          # curation), mirroring docker/Dockerfile's COPY . . so the scripts'
+          # sys.path bootstrap keeps working. Never an allowlist: past
+          # outages (spec_policy, image_cache, serve_compat) all came from
+          # a new sibling import missing its cp line.
+          # Wrappers bake in the
           # engine venv python, provider/engine PYTHONPATH, EXL3_ROCM_SDK
           # and the Trap-1 LD_PRELOAD; CLI args pass straight through.
           # Runtime JIT (gr_mix/gdn/ple/qsa/kda --genco on first serve)
@@ -544,27 +546,14 @@
             installPhase = ''
               runHook preInstall
               mkdir -p $out/share/kyojin $out/bin
-              for flavor in glm mimo qwen; do
-                mkdir -p $out/share/kyojin/$flavor
-                cp $src/tools/$flavor/serve.py $src/tools/$flavor/serve_metrics.py \
-                  $out/share/kyojin/$flavor/
-                # qwen/serve.py imports spec_policy at draft-build time
-                # (sibling import, resolved relative to its own file).
-                # glm/serve.py imports the same file from ../qwen (path built
-                # from its own location), so the qwen flavor must ship too.
-                [ "$flavor" = qwen ] && cp $src/tools/$flavor/spec_policy.py \
-                  $out/share/kyojin/$flavor/
-                # chat templates live next to the scripts (qwen/mimo) or in
-                # lanes/assets (glm); the servers resolve them relative to
-                # their own file, so ship them at the same relative paths.
-                for tmpl in $src/tools/$flavor/chat_template.jinja; do
-                  [ -e "$tmpl" ] && cp "$tmpl" $out/share/kyojin/$flavor/
-                done
-              done
-              mkdir -p $out/share/kyojin/lanes/assets
-              cp $src/tools/lanes/assets/glm53-template-medium.jinja \
-                $out/share/kyojin/lanes/assets/
-              cp $src/tools/startup_health.py $out/share/kyojin/
+              # Docker parity (never allowlist): $out/share/kyojin IS tools/.
+              # serve.py resolves siblings via its own dir (script-dir) +
+              # tools/ (HERE.parent), and glm additionally appends ../qwen
+              # for spec_policy — all preserved by construction. -L
+              # dereferences the ../strix_halo symlinks (image_cache,
+              # serve_metrics). No curation: every future sibling ships.
+              cp -rL $src/tools/* $out/share/kyojin/
+              rm -rf $out/share/kyojin/__pycache__ $out/share/kyojin/*/__pycache__
               # startup_health loads exllamav3.util.hip_compiler by path
               # (without importing exllamav3, to avoid latching engine env);
               # mirror the repo-root layout it expects.
