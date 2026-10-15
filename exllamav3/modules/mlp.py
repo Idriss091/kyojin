@@ -791,13 +791,17 @@ class GatedMLP(Module):
                     # nc2 S1-rest (EXL3_NC2_SILU_PAD, default off): silu_mul writes its rows at the down projection's
                     # padded pitch, so the down GEMM skips its pad_copy_in (same values, bit-exact)
                     a_pitch = 0
-                    if os.environ.get("EXL3_NC2_SILU_PAD", "0") == "1" and self.activation_fn_call is ext.silu_mul and g.is_contiguous() and u.is_contiguous():
+                    # (only where ext.silu_mul itself runs fused_silu_mul, the kernel the pitched variant shares: ext.py)
+                    if os.environ.get("EXL3_NC2_SILU_PAD", "0") == "1" and self.activation_fn_call is ext.silu_mul and \
+                            hasattr(ext, "silu_mul_pitched") and os.environ.get("EXL3_FUSE_SILU", "1") != "0" and \
+                            not self.act_limit and g.dtype == u.dtype and g.dtype in (torch.half, torch.float) and \
+                            g.shape == u.shape and g.is_contiguous() and u.is_contiguous():
                         ik = u.shape[-1]
                         a_pitch = _row_pad_pitch(self.downs[s], ik, u.numel() // ik, params)
                     if a_pitch:
                         rows_ = u.numel() // ik
                         a = torch.empty((rows_, a_pitch), dtype = torch.half, device = u.device)[:, :ik]
-                        ext.silu_mul_pitched(g, u, a, self.act_limit)
+                        ext.silu_mul_pitched(g, u, a, 0.0)
                         a = a.view(*u.shape)
                     else:
                         a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u

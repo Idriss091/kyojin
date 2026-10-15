@@ -252,7 +252,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
-    m.def("silu_mul_pitched", &silu_mul_pitched, "silu_mul_pitched");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
@@ -428,6 +427,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mul_sigmoid_pad", &mul_sigmoid_pad, "mul_sigmoid_pad");
     m.def("pad_copy", &pad_copy, "pad_copy");
     m.def("fused_silu_mul", &fused_silu_mul, "fused_silu_mul");
+    m.def("silu_mul_pitched", &silu_mul_pitched, "silu_mul_pitched");
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
     m.def("kda_gate", &kda_gate, "kda_gate");
     m.def("kda_fb_gate", &kda_fb_gate, "kda_fb_gate");

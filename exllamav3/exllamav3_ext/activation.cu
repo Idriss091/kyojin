@@ -97,41 +97,6 @@ void silu_mul
     silu_mul_gr(x, y, z, act_limit, nullptr);
 }
 
-// nc2 S1-rest: silu_mul into z = (rows, cols) view of a (rows, pitch) buffer; x, y contiguous (rows, cols)
-void silu_mul_pitched
-(
-    const at::Tensor& x,
-    const at::Tensor& y,
-    at::Tensor& z,
-    const float act_limit
-)
-{
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-    bool float_input = x.dtype() == at::kFloat;
-    if (float_input) { TORCH_CHECK_DTYPE(y, kFloat); }
-    else { TORCH_CHECK_DTYPE(x, kHalf); TORCH_CHECK_DTYPE(y, kHalf); }
-    TORCH_CHECK_DTYPE(z, kHalf);
-    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "silu_mul_pitched: x, y must be contiguous");
-    TORCH_CHECK(z.dim() == 2 && z.stride(1) == 1, "silu_mul_pitched: z must be a 2D row view");
-    int64_t rows = z.size(0), cols = z.size(1), pitch = z.stride(0);
-    TORCH_CHECK(x.numel() == rows * cols && y.numel() == rows * cols, "silu_mul_pitched: shape mismatch");
-    TORCH_CHECK(cols % 2 == 0 && pitch % 2 == 0 && pitch >= cols, "silu_mul_pitched: cols, pitch must be even, pitch >= cols");
-    TORCH_CHECK(((uintptr_t) z.data_ptr()) % 4 == 0, "silu_mul_pitched: z misaligned");
-    TORCH_CHECK((z.storage_offset() + (rows - 1) * pitch + cols) * 2 <= (int64_t) z.storage().nbytes(), "silu_mul_pitched: z overruns storage");
-
-    size_t numel = x.numel();
-    size_t blocks = CEIL_DIVIDE(numel, 2 * NUM_THREADS);
-    if (float_input)
-        silu_mul_pitched_kernel_f<<<blocks, NUM_THREADS, 0, stream>>>
-            ((const float*) x.data_ptr(), (const float*) y.data_ptr(), (half*) z.data_ptr(), act_limit, numel, (int) (cols / 2), (int) (pitch / 2));
-    else
-        silu_mul_pitched_kernel_h<<<blocks, NUM_THREADS, 0, stream>>>
-            ((const half*) x.data_ptr(), (const half*) y.data_ptr(), (half*) z.data_ptr(), act_limit, numel, (int) (cols / 2), (int) (pitch / 2));
-    cuda_check(cudaPeekAtLastError());
-}
-
 // gpt-oss clamped swiglu: (clamp(y, -limit, limit) + 1) * g * sigmoid(1.702 * g),
 // g = min(x, limit) -> z, in-place if z == x or z == y
 
