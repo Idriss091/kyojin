@@ -59,7 +59,7 @@ The server speaks the OpenAI API on port 8000. GLM and MiMo commands: [doc/model
 
 ## Read more
 
-- [Install and first launch](doc/install.md): requirements, build, per-shell setup, first-launch tuning
+- [Install and first launch](doc/install.md): requirements, build, per-shell setup, first-launch tuning, [system settings for full speed](doc/install.md#system-settings-for-full-speed)
 - [Models](doc/models.md): Qwen, GLM and MiMo weights, serve commands, options
 - [Benchmarks](doc/benchmarks.md): how the figures are measured, where each comes from, full tables, share yours with `tools/bench.sh`
 - [Troubleshooting](doc/troubleshooting.md), [refusal hook](doc/refusal_hook.md), [development](doc/development.md), [credits and licence](doc/credits.md)

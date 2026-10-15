@@ -29,4 +29,20 @@ First GLM launch: the server tunes its dense GEMM kernels before it opens the po
 
 Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close browsers and other large processes first, or use a smaller `-c`.
 
+## System settings for full speed
+
+Our servers run with the three settings below. Each gain was measured on our Strix Halo machines, with the same generated text.
+
+1. **IOMMU off.** Add `amd_iommu=off` to the kernel command line (for example in `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then `sudo update-grub` and reboot). With the IOMMU on we measured 6 % less prefill and 2.5 % less decode. Note: the NPU needs the IOMMU, so this turns the NPU off.
+2. **GPU clock level `high` while serving.** It holds the GPU clock at its top level instead of letting it drop between kernels: GLM 8K prefill +5.7 %, decode +0.5 to +1.4 % (GLM and Qwen). Set it before you start the server and put it back to `auto` after, so the GPU does not stay at full clock when idle:
+   ```bash
+   echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
+   # ... serve ...
+   echo auto | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
+   ```
+   Do not use `profile_peak`: it pins every clock, uses the power budget and was 5 to 10 % slower.
+3. **Cooling.** The chip slows itself down when it runs hot. The same machine at 96-99 °C gave 15 to 20 % less GLM prefill than when cool. Keep the air inlets and outlet free; in a closed cabinet, a small fan that moves the hot air out helps.
+
+The CPU governor should be `performance` (check `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`); the GLM server is partly CPU-bound.
+
 Problems: [troubleshooting.md](troubleshooting.md).
