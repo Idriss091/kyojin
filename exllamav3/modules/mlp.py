@@ -7,6 +7,11 @@ from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
+from .. import ext as _ext_mod
+
+def _rocm_silu_lim() -> bool:
+    # ext.silu_mul on ROCm runs fused_silu_mul with the clamp (GLM swiglu_limit) while this knob is on (ext.py ROCM_KNOBS)
+    return bool(getattr(_ext_mod, "ROCM_KNOBS", {}).get("silu_lim"))
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
@@ -794,14 +799,14 @@ class GatedMLP(Module):
                     # (only where ext.silu_mul itself runs fused_silu_mul, the kernel the pitched variant shares: ext.py)
                     if os.environ.get("EXL3_NC2_SILU_PAD", "0") == "1" and self.activation_fn_call is ext.silu_mul and \
                             hasattr(ext, "silu_mul_pitched") and os.environ.get("EXL3_FUSE_SILU", "1") != "0" and \
-                            not self.act_limit and g.dtype == u.dtype and g.dtype in (torch.half, torch.float) and \
+                            (not self.act_limit or _rocm_silu_lim()) and g.dtype == u.dtype and g.dtype in (torch.half, torch.float) and \
                             g.shape == u.shape and g.is_contiguous() and u.is_contiguous():
                         ik = u.shape[-1]
                         a_pitch = _row_pad_pitch(self.downs[s], ik, u.numel() // ik, params)
                     if a_pitch:
                         rows_ = u.numel() // ik
                         a = torch.empty((rows_, a_pitch), dtype = torch.half, device = u.device)[:, :ik]
-                        ext.silu_mul_pitched(g, u, a, 0.0)
+                        ext.silu_mul_pitched(g, u, a, float(self.act_limit or 0.0))
                         a = a.view(*u.shape)
                     else:
                         a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
