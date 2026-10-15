@@ -52,10 +52,6 @@ collector freeze (`EXL3_GC_FREEZE`) are described in [doc/env_vars.md](../../doc
 The lookup code is `tools/qwen/spec_policy.py`, which the GLM server finds through its own file path, so `tools/qwen`
 must ship next to `tools/glm`.
 
-The picture cache's eviction policy is an environment variable rather than a flag:
-**`KYOJIN_IMAGE_CACHE_POLICY`**, `head` (the default, a plain LRU) or `tail` (keep the head of a prompt and give up its
-end); anything else is an error at start-up. See [Images](#images).
-
 ### MTP sidecar (higher draft acceptance)
 
 The pack stores the MTP `eh_proj` at 2 bits. The pack also ships an unquantized copy,
@@ -133,13 +129,14 @@ server keeps the decoded embeddings of recent pictures in host memory (GLM's mer
 picture fresh pseudo token ids and breaks the paged prefix *from that picture on*. `--image-cache-mb` sizes the
 cache: 1024 MiB by default, about 20 pages of 1568x1568 at 49.0 MiB each, one pool shared by all sessions
 like `-c`.
-Which pictures a full cache gives up is the eviction policy of the shared cache, `KYOJIN_IMAGE_CACHE_POLICY`:
-`head` (the default) is a plain LRU — the same behaviour this cache always had — and it drops the *earliest*
-pictures of a history, which are exactly the ones the paged prefix starts from; `tail` drops the *last* ones
-instead, so a conversation a client keeps re-sending keeps its head. The request log's `img_cache` line reports
-`hits`, `misses` and `first_missing`, the index the prefix could match up to; `--image-cache-items` caps the
-number of pictures held (32 by default, as upstream's shared cache; `0` = no limit), which for small crops binds
-before the byte budget does.
+Which pictures a full cache gives up is **`KYOJIN_IMAGE_CACHE_POLICY`**
+([doc/env_vars.md](../../doc/env_vars.md)). The default `head` is the plain LRU this server always had, and it
+drops the *earliest* pictures of a history — exactly the ones the paged prefix starts from. **A history the client
+keeps re-sending should be served with `tail`**, which keeps those earliest pictures and gives up the end of the
+prompt instead: 43.5 % of a 75K-token prompt reused (82.0 s for the warm turn) against 0 % (133.6 s) under the
+default. The request log's `img_cache` line reports `hits`, `misses` and `first_missing`, the index the prefix
+could match up to; `--image-cache-items` caps the number of pictures held (32 by default, as upstream's shared
+cache; `0` = no limit), which for small crops binds before the byte budget does.
 
 `--image-cache-format` stores those rows packed instead of as fp32 (49.0 MiB for a 1568x1568 page): `fp16` is
 24.5 MiB and `q8` is 12.3 MiB. Measured per picture that is actually

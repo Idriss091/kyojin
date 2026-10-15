@@ -985,6 +985,12 @@ The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE
 | `EXL3_GLM_SLOTS` | `0` (one recurrent state slot per session) | Minimum number of recurrent state slots the GLM server allocates. The default sizes them to `--sessions`, which frees about 6 GiB of GPU memory at one session. `16` restores the earlier layout. |
 | `EXL3_GC_FREEZE` | Qwen server `1`, GLM server `0` | Moves the loaded model and tokenizer objects out of the Python garbage collector before the first generator is built. Without it, rebuilding the generator (for example after a `cache_salt` change) pays a collector pass of about 0.5 s inside the time to first token. `0` leaves them in the collector. |
 
+#### Image embedding cache (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_IMAGE_CACHE_POLICY` | `head` | Which pictures a full image-embedding cache gives up. The cache is one shared module (`tools/strix_halo/image_cache.py`, with `image_cache.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), so this switch reaches all three servers, and it is read when a server builds its cache at start-up. `head` is the plain LRU a server always had: the picture whose last use is oldest goes first, which for a client that re-sends its whole history every turn is the earliest picture of the prompt. `tail` follows the prompt instead — a picture no remembered prompt refers to goes first, then the last pictures of the remembered prompts, and the head of the prompt is the last thing given up — which lets a history that keeps being re-sent keep the start of its prompt, so its warm turns prefill less and reach the first token sooner. Decoding is unaffected. Any other value stops the server at start-up. |
+
 ### Server state
 
 #### `KYOJIN_HEALTH_DIR` (default: `~/.cache/kyojin`)
