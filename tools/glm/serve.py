@@ -83,6 +83,10 @@ SPEED_ENV = {
     "EXL3_MLA_PF_FAST": "1",
     "EXL3_KDA_PF_SPLIT": "2",
     "EXL3_PF_NO_TAIL": "1",
+    # 15/10: a turn that resumes mid-page (tail checkpoint) and adds >= 1024 tokens no longer pays a separate last-page
+    # forward: served tool turn 4.34 -> 3.35 s, 2.58 -> 2.14 s; first-token KLD vs cold within the chunk-size floor
+    # (box1 Results 70-73). Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
+    "EXL3_TAIL_MAXGAP": "8192",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
