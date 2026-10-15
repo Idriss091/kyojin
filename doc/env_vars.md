@@ -993,6 +993,19 @@ The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE
 
 ### Server state
 
+#### Request log (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_REQLOG` | unset = off | Path of a per-request lifecycle log, or `1`/`on`/`yes` for `~/.cache/kyojin/requests.log` (`0`/`off`/`none`/`no`/`false` disable it). Numbers and event names only, never prompt or reply text; one line per event and a heartbeat (`alive`) while a job is queued, prefilling or decoding. For a streaming reply the heartbeat also carries the **output accounting** (`out_events`, `out_chars`, `last_out_s`) and the request ends with one `sse_summary` line, which is what tells "the client was sent nothing" from "the client showed nothing"; see [tools/glm/SERVE.md](../tools/glm/SERVE.md) for the event table. Shared by the three servers (`tools/strix_halo/serve_reqlog.py`, with `serve_reqlog.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`). |
+| `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | Seconds between `alive` lines; `0` disables the heartbeat (the log stays on). |
+
+#### SSE keep-alive (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_SSE_PING_S` | `0` = off | Seconds a stream may go without a data event before the server writes one SSE comment line (`: waiting <n> s`), which keeps a client that only watches its socket from treating a long prefill — or a long decode nothing is being written for — as a dead server. The comment counts from the request's arrival, comes once per interval and only after that much silence: a stream that is producing text never gets one, and one that stops gets them again (a reply holding a `<tool_call>` back until its XML closes is decoded for minutes while the client hears nothing). The `role` chunk a client gets immediately does not count as output, so the whole prefill is covered. Shared by the three servers (`tools/strix_halo/serve_ping.py`, with `serve_ping.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), read per request, reported on one start-up line. With the default nothing is written at all. Worth setting on any server that sees long prompts — an image conversation can prefill for minutes — together with a client-side timeout that is long enough; each comment is also an `sse_ping` line in the request log (`KYOJIN_REQLOG`) when that is on. |
+
 #### `KYOJIN_HEALTH_DIR` (default: `~/.cache/kyojin`)
 
 Where the three servers keep the per-model start-up timings they use to weight `/health` load

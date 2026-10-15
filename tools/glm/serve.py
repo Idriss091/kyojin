@@ -33,7 +33,11 @@ from serve_metrics import Metrics
 # lifecycle event (numbers and event names only, never prompt or reply text) plus a heartbeat while a job
 # is queued or prefilling, so "the client went silent" can be lined up with what the server was doing.
 # Off unless KYOJIN_REQLOG names a path; the server prints which of the two it is at start-up.
-from serve_reqlog import ReqLog, sanitize
+from serve_reqlog import ReqLog, StreamWriter, sanitize
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so the same silence is
+# visible to the client and not only in the log file.
+from serve_ping import ServePing
 from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
@@ -1030,6 +1034,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     background: dict[str, Any] = {}      # the heartbeat task, created at start-up (nothing when the log is off)
     current_req: contextvars.ContextVar[str | None] = contextvars.ContextVar("reqid", default=None)
 
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval, in which case a stream that has
+    # nothing to send yet (queued, or prefilling a long prompt) writes a ':' comment line every N
+    # seconds. The pinger is per request; the switch and the start-up line are shared by the three servers.
+    ping = ServePing.from_env(reqlog)
+    app.update(ping=ping)
+
     def reqid() -> str | None:
         """The log id of the request being handled (None outside a logged route)."""
         return current_req.get()
@@ -1041,13 +1051,23 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         st["phase"] = phase
         st.update(fields)
 
+    # The streaming writer of each in-flight request (nothing for a JSON reply). The heartbeat reads
+    # its counters, which is what tells "the client was sent nothing" from "the client showed nothing".
+    writers: dict[str, StreamWriter] = {}
+
     async def heartbeat() -> None:
         while True:
             await asyncio.sleep(reqlog.heartbeat_s)
             now = time.perf_counter()
             for rid, st in list(inflight.items()):
+                writer = writers.get(rid)
+                stats = writer.stats if writer is not None else None
                 reqlog.log("alive", req=rid, phase=st.get("phase"), elapsed_s=round(now - st["t0"], 2),
-                           prompt_tokens=st.get("prompt_tokens"), processing=processing, running=running)
+                           prompt_tokens=st.get("prompt_tokens"),
+                           out_events=stats.events if stats else None,
+                           out_chars=stats.bytes if stats else None,
+                           last_out_s=round(stats.since_data_s(), 1) if stats else None,
+                           processing=processing, running=running)
 
     def logged(handler):
         """Wrap a route so its lifecycle lands in the request log. The id is opaque and per request; every
@@ -1078,6 +1098,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                            elapsed_s=round(time.perf_counter() - started, 3))
                 return response
             finally:
+                writer = writers.pop(rid, None)
+                if writer is not None:
+                    # One line that says what this request sent: a stalled decode shows a flat
+                    # out_events with comments, a working stream a rate, a client that could not keep
+                    # up a growing graph error.
+                    for event, fields in writer.stats.lines():
+                        reqlog.log(event, req=rid, path=request.path, **fields)
                 inflight.pop(rid, None)
                 current_req.reset(token)
         return wrapper
@@ -1261,15 +1288,29 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             beat.cancel()
         reqlog.close()
 
-    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
+    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue,
+                    writer: StreamWriter | None = None, ping: ServePing | None = None,
+                    ping_at: float | None = None) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
         queued or prefilling (and never, for a non-streaming reply), so a client that hung up is noticed
-        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left."""
+        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left.
+
+        For a streaming reply (`writer`, `ping`, `ping_at` given), the keep-alive is asked before each
+        poll whether a comment is due: the client sees that the server is still working on a prompt (or
+        on a held-back tool call) it has not answered yet, which is all it can see until then."""
         while True:
             tr = request.transport
             if tr is None or tr.is_closing():
                 cancel.set()
+                if ping is not None:
+                    ping.limit()
                 raise ConnectionResetError("client left")
+            if ping is not None:
+                try:                              # before the wait, so a stall is covered from its start
+                    await ping.comment(writer, ping_at or 0.0)
+                except ConnectionResetError:
+                    cancel.set()
+                    raise
             try:
                 item = await asyncio.wait_for(out.get(), 0.5)
             except asyncio.TimeoutError:
@@ -1338,9 +1379,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         reqlog.log("req_queued", req=body["_reqid"], path="/v1/chat/completions", queued_ahead=ahead,
                    prompt_tokens=prompt_tokens, messages=body["_messages"], images=len(images), stream=bool(body.get("stream")))
         prefix = "<think>" if opens_thinking(prompt) else ""
+        # This request's SSE keep-alive, and the moment its wait started: every comment counts from
+        # there, which is what the client has actually been waiting for. Off (the default) this costs one
+        # comparison per empty poll. A JSON reply has no stream to write a comment to, so `deltas` takes
+        # the response per call instead of closing over one that a non-streaming request never sets.
+        ping = app["ping"].per_request() if body.get("stream", False) else None
+        ping_at = body["_queued_at"]
 
-        def deltas() -> AsyncIterator[str]:
-            return drain(request, cancel, out)
+        def deltas(writer: StreamWriter | None = None) -> AsyncIterator[str]:
+            return drain(request, cancel, out, writer, ping, ping_at)
 
         def usage(raw: str) -> dict[str, int]:
             return serve_compat.usage(prompt_tokens, engine.count_tokens(raw), int(request_stats.get("cached_tokens") or 0))
@@ -1366,6 +1413,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = writers[body["_reqid"]] = StreamWriter(response)   # what the heartbeat reports on
             track(body["_reqid"], "stream", prompt_tokens=prompt_tokens)
             reqlog.log("sse_headers", req=body["_reqid"], path="/v1/chat/completions")
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
@@ -1386,7 +1434,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             visible.append(time.perf_counter())
                             reqlog.log("sse_first_content", req=body["_reqid"], first_s=round(visible[0] - body["_queued_at"], 3))
                         key = "reasoning_content" if mode == "reasoning" else "content"
-                        await response.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
                         return
@@ -1395,8 +1444,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     mode = {"</think>": "content", "<think>": "reasoning", TOOL_OPEN: "tool"}[tag]
 
             try:
-                await response.write(sse(event({"role": "assistant", "content": ""})))
-                async for delta in deltas():
+                await writer.write(sse(event({"role": "assistant", "content": ""})))
+                ping.note_output()
+                async for delta in deltas(writer):
                     text += delta
                     await flush(False)
                 text, _ = stop_text(text, body["_stop"])
@@ -1404,10 +1454,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 message = parse_completion(text)
                 if "tool_calls" in message:
                     for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
-                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
-                await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
+                        await writer.write(sse(event({"tool_calls": [dict(call, index=n)]})))
+                await writer.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
                 reqlog.log("sse_done", req=body["_reqid"], out_tokens=int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
@@ -1422,9 +1472,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
                 # "stream ended without finish_reason" and retry when the connection just drops.
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
-                    await response.write(sse(event({}, "error")))
-                    await response.write(b"data: [DONE]\n\n")
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse(event({}, "error")))
+                    await writer.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1622,11 +1672,16 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = writers[job["_reqid"]] = StreamWriter(response)    # what the heartbeat reports on
             track(job["_reqid"], "stream", prompt_tokens=prompt_tokens)
             reqlog.log("sse_headers", req=job["_reqid"], path="/v1/completions")
+            # Same keep-alive as /v1/chat/completions, but this route writes no role chunk: the first
+            # thing the client sees is text, so a comment covers the whole wait before it.
+            ping = app["ping"].per_request()
+            ping_at = job["_queued_at"]
             try:
                 text, sent, stopped = "", 0, None
-                async for delta in drain(request, cancel, out):
+                async for delta in drain(request, cancel, out, writer, ping, ping_at):
                     text += delta
                     cut, stopped = stop_text(text, job["_stop"])
                     if stopped is not None:
@@ -1638,13 +1693,14 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         if not sent:
                             reqlog.log("sse_first_content", req=job["_reqid"],
                                        first_s=round(time.perf_counter() - job["_queued_at"], 3))
-                        await response.write(sse(chunk(text[sent:safe], None)))
+                        await writer.write(sse(chunk(text[sent:safe], None)))
+                        ping.note_output()
                         sent = safe
                 if len(text) > sent:
-                    await response.write(sse(chunk(text[sent:], None)))
+                    await writer.write(sse(chunk(text[sent:], None)))
                 reason, usage = finish_and_usage(text, stopped)
-                await response.write(sse(chunk("", reason) | {"usage": usage}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
                 reqlog.log("sse_done", req=job["_reqid"], out_tokens=int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
@@ -1656,7 +1712,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 cancel.set()
                 reqlog.log("stream_error", req=job["_reqid"], error=sanitize(exc))
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1873,7 +1929,9 @@ def main() -> None:
     # Which run this is, in the log itself: ctx, sessions and the image-cache budget are what a later
     # "why was this request slow" question turns on, and they are not visible in the client's request.
     reqlog = app["reqlog"]
+    ping = app["ping"]
     print(f"serve: {reqlog.describe()}", flush=True)
+    print(f"serve: {ping.describe()}", flush=True)
     emb_cache = getattr(engine, "emb_cache", None)
     reqlog.log("serve_start", model=Path(args.model).name, model_id=args.model_id, pid=os.getpid(),
                ctx=args.max_ctx, cache_tokens=getattr(getattr(engine, "cache", None), "max_num_tokens", None),
@@ -1888,7 +1946,8 @@ def main() -> None:
                image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_lock_s=engine.emb_disk.lock_s if getattr(engine, "emb_disk", None) else None,
-               heartbeat_s=reqlog.heartbeat_s)
+               heartbeat_s=reqlog.heartbeat_s,
+               sse_ping_s=ping.interval_s or None)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
         web.run_app(app, sock=sock)

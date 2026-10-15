@@ -91,6 +91,11 @@ The pack is tied to one set of weights: download it from the same model repo.
 - Debug extensions (all optional): `"speculative": false` decodes plain for that request, `"cache_prompt": false`
   forgets the prompt cache first (cold run), `"return_token_ids": true` adds the generated ids. Switching
   speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache (400 with `--sessions` > 1).
+- A turn is silent on the wire for as long as the server has nothing to send (headers and one empty role
+  chunk, then nothing until text is ready — including a decode that is holding a `<tool_call>` back until
+  its XML closes), so `KYOJIN_SSE_PING_S=<seconds>` makes the server write an SSE comment
+  (`: waiting <n> s`) after that much silence. Off by default, shared with the other two servers; the
+  switch and its start-up line are in [doc/env_vars.md](../../doc/env_vars.md).
 
 - vLLM-style extensions (also used by the RigMark benchmark): `POST /tokenize` (`{"prompt"|"messages", "add_special_tokens"}` ->
   `{"tokens", "count", "max_model_len"}`); `/v1/completions` takes `prompt` as a list of token ids (`[1, 2, 3]` or `[[1, 2, 3]]`):

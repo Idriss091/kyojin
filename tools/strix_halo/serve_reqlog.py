@@ -4,7 +4,9 @@
 A request that is refused, queued or prefilling produces **no client-visible output**, so a report of
 "the server went silent" cannot be lined up with what the server was doing. This writes one line per
 lifecycle event, plus a heartbeat while a job is queued or running, so the two timelines can be
-compared afterwards.
+compared afterwards. The heartbeat and the per-request summary carry the request's **output
+accounting** (`out_events`, `out_chars`, `last_out_s`), which is what separates "the server was
+writing to a client that did not show it" from "the server had nothing to write".
 
 **Off unless asked for.** With KYOJIN_REQLOG unset (or 0/off/none/no/false/empty) nothing is opened and
 every call is a no-op, so a default deployment behaves exactly as before. The server prints one line at
@@ -54,6 +56,78 @@ def _fmt(value: Any) -> str:
         return str(int(value)) if value.is_integer() else f"{value:.3f}"
     text = str(value)
     return f'"{text}"' if (" " in text or "=" in text) else text
+
+
+class StreamStats:
+    """What one streaming request actually wrote to its client: bytes, data events, silence.
+
+    A client that reports "the server went silent" is believed or not depending on whether the bytes
+    were on the wire, and the heartbeat alone cannot tell the two apart. Every write of a streaming
+    reply goes through this, so at any moment `out_events` / `out_chars` say what the client has been
+    sent and `last_out_s` how long ago; a reply whose engine is decoding into a held-back tool call
+    shows up as a flat line, and one that is streaming shows a rate.
+    """
+
+    def __init__(self) -> None:
+        self.bytes = 0
+        self.events = 0
+        self.comments = 0        # SSE keep-alive comments (not data events)
+        self.comment_bytes = 0
+        self.errors = 0
+        self.last_error: str | None = None
+        self.t0 = time.perf_counter()
+        self.last_data = self.t0
+        self.last_comment = self.t0
+
+    def note(self, n: int) -> None:
+        self.bytes += n
+        self.events += 1
+        self.last_data = time.perf_counter()
+
+    def note_comment(self, n: int) -> None:
+        self.comments += 1
+        self.comment_bytes += n
+        self.last_comment = time.perf_counter()
+
+    def fail(self, exc: BaseException) -> None:
+        self.errors += 1
+        self.last_error = sanitize(exc)
+
+    def since_data_s(self) -> float:
+        """Seconds since the last **data event**: comments do not count as content.
+
+        This is the number that matters when a client reports silence — a reply that is decoding into a
+        held-back tool call sends comments (which keep the socket alive) and no events at all, and this
+        says how long that has been going on.
+        """
+        return time.perf_counter() - self.last_data
+
+    def lines(self) -> list[tuple[str, dict[str, Any]]]:
+        """The summary event and its fields, in the order they read best."""
+        return [("sse_summary", {
+            "out_events": self.events, "out_chars": self.bytes, "last_out_s": round(self.since_data_s(), 2),
+            "comments": self.comments or None, "comment_chars": self.comment_bytes or None,
+            "last_comment_s": round(time.perf_counter() - self.last_comment, 2) if self.comments else None,
+            "errors": self.errors or None, "error": self.last_error})]
+
+
+class StreamWriter:
+    """A StreamResponse that records what it wrote (see `StreamStats`). One per streaming reply."""
+
+    def __init__(self, response: Any, stats: StreamStats | None = None) -> None:
+        self.response = response
+        self.stats = stats if stats is not None else StreamStats()
+
+    async def write(self, data: bytes) -> None:
+        try:
+            await self.response.write(data)
+        except BaseException as exc:                              # noqa: BLE001  counted, then re-raised
+            self.stats.fail(exc)
+            raise
+        self.stats.note(len(data))
+
+    async def write_eof(self) -> None:
+        await self.response.write_eof()
 
 
 class ReqLog:

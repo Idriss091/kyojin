@@ -50,6 +50,11 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   `stop` (string or list), `temperature`, `top_p`, `max_completion_tokens` or `max_tokens` (the first wins; default: all the free context, thinking included; `--default-max-tokens` sets a limit). A reply cut by the limit reports `finish_reason: "length"`. An engine failure mid-stream ends with an `error` frame, `finish_reason: "error"` and `[DONE]`. Tool calls are emitted only
   once the XML block closes, so a client never sees half a JSON payload.
 - `GET /v1/models` — one entry, `MiMo-2.6-EXL3`.
+- A turn is silent on the wire for as long as the server has nothing to send (headers and one empty role
+  chunk, then nothing until text is ready — including a decode that is holding a `<tool_call>` back until
+  its XML closes), so `KYOJIN_SSE_PING_S=<seconds>` makes the server write an SSE comment
+  (`: waiting <n> s`) after that much silence. Off by default, shared with the other two servers; the
+  switch and its start-up line are in [doc/env_vars.md](../../doc/env_vars.md).
 - `GET /health` — `{"status","model","generator","spec_gate"}` once ready (load progress while starting: see below); with the gate on, `spec_gate`
   carries the live counters `n_spec n_plain n_off n_shadow n_probe_fail t_plain t_spec
   tok_round`. Useful while tuning.

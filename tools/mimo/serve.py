@@ -35,6 +35,13 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
+# not look like a hung server to a client that only watches its socket.
+from serve_ping import ServePing
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: off unless
+# KYOJIN_REQLOG names a path. Its output accounting also feeds the end-of-stream summary here.
+from serve_reqlog import ReqLog, StreamWriter
 from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
@@ -504,6 +511,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     processing = 0  # admitted requests; closure, app config is immutable after startup
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
+    # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
+    app.update(ping=ServePing.from_env())
+    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only).
+    app.update(reqlog=ReqLog.from_env(server="mimo"))
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
         accepted = int(st.get("accepted_draft_tokens", 0))
@@ -576,15 +588,28 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     async def close(app_: web.Application) -> None:
         app_["worker_task"].cancel()
 
-    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
+    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue,
+                    writer: StreamWriter | None = None, ping: ServePing | None = None,
+                    ping_at: float = 0.0) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
         queued or prefilling (and never, for a non-streaming reply), so a client that hung up is noticed
-        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left."""
+        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left.
+        `ping` (a streaming request) is asked before every poll whether a keep-alive comment is due,
+        and `ping_at` is the moment the client's wait started: a comment is the only thing it can see
+        while the engine works on a prompt (or on a tool call) it has not answered yet."""
         while True:
             tr = request.transport
             if tr is None or tr.is_closing():
                 cancel.set()
+                if ping is not None:
+                    ping.limit()
                 raise ConnectionResetError("client left")
+            if ping is not None:
+                try:                              # before the wait, so a stall is covered from its start
+                    await ping.comment(writer, ping_at)
+                except ConnectionResetError:
+                    cancel.set()
+                    raise
             try:
                 item = await asyncio.wait_for(out.get(), 0.5)
             except asyncio.TimeoutError:
@@ -645,9 +670,14 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         cancel = body["_cancel"] = asyncio.Event()
         await queue.put((body, out, request_stats))
         # MiMo's generation prompt is "<|im_start|>assistant\n": no implicit <think> block.
+        # This request's SSE keep-alive and the moment its wait started (see tools/strix_halo/serve_ping.py);
+        # None for a JSON reply, which has nobody to write a comment to. `deltas` takes the reply's stream
+        # per call: closing over one that a non-streaming request never sets leaves the cell unbound.
+        ping = app["ping"].per_request() if body.get("stream", False) else None
+        ping_at = time.perf_counter()
 
-        def deltas() -> AsyncIterator[str]:
-            return drain(request, cancel, out)
+        def deltas(writer: StreamWriter | None = None) -> AsyncIterator[str]:
+            return drain(request, cancel, out, writer, ping, ping_at)
 
         def usage(raw: str) -> dict[str, int]:
             completion_tokens = engine.count_tokens(raw)
@@ -676,6 +706,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                   "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = StreamWriter(response)      # counts what the client is sent (see serve_reqlog)
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = "", 0, "content"
@@ -694,6 +725,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     if piece:
                         key = "reasoning_content" if mode == "reasoning" else "content"
                         await response.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
                         return
@@ -703,7 +735,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
             try:
                 await response.write(sse(event({"role": "assistant", "content": ""})))
-                async for delta in deltas():
+                ping.note_output()
+                async for delta in deltas(writer):
                     text += delta
                     await flush(False)
                 text, _ = stop_text(text, body["_stop"])
@@ -733,6 +766,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     await response.write_eof()
                 except ConnectionError:
                     pass
+            finally:
+                for event, fields in writer.stats.lines():
+                    reqlog.log(event, path="/v1/chat/completions", **fields)
             return response
 
         try:
@@ -985,6 +1021,8 @@ def main() -> None:
           f"spec_gate={engine.spec_gate_on} ctx={ctx} "
           f"max_position={config_max_position(engine.config)} vision={engine.supports_vision}", flush=True)
     app = create_app(engine, args.model_id, template)
+    print(f"msrv: {app['ping'].describe()}", flush=True)
+    print(f"msrv: {app['reqlog'].describe()}", flush=True)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
         web.run_app(app, sock=sock)

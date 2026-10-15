@@ -511,5 +511,162 @@ class RequestLogTests(unittest.TestCase):
         self.assertIn("job_done", self.names())
 
 
+class SSEKeepAliveTests(unittest.TestCase):
+    """KYOJIN_SSE_PING_S: a stream that has nothing to send yet writes a ':' comment (off by default)."""
+
+    def setUp(self):
+        os.environ.pop("KYOJIN_SSE_PING_S", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_SSE_PING_S", None)
+
+    def test_a_ping_reaches_the_client_before_the_first_token(self):
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.9)          # a prefill the client has to sit through
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(response.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            await client.close()
+            return b"".join(chunks)
+
+        body = run(check())
+        self.assertTrue([line for line in body.split(b"\n") if line.startswith(b":")], body[:400])
+        self.assertLess(body.index(b": waiting"), body.index(b"hello"))   # before the first token
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
+
+    def test_a_ping_covers_a_tool_call_the_server_holds_back(self):
+        """A reply that writes a file is withheld until the XML closes, so the client hears nothing for
+        the whole generation: that silence was aborting real agent turns, and it has to be commented."""
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+        from aiohttp.test_utils import TestClient, TestServer
+
+        # GLM's own tool-call shape (tools/glm/serve.py TOOL_OPEN): a big <arg_value> is what a
+        # "write this file" call looks like, and the whole block is held until </tool_call>.
+        tool_call = ("<tool_call>\nwrite_file<arg_key>path</arg_key><arg_value>/out/notes.md</arg_value>\n"
+                     "<arg_key>content</arg_key><arg_value>"
+                     + ("One transcribed line.\n" * 30) + "</arg_value>\n</tool_call>")
+
+        class Writer(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                for i in range(0, len(tool_call), 3):        # ~ a decode step per chunk, like the engine
+                    await asyncio.sleep(0.02)
+                    yield tool_call[i:i + 3]
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Writer(""), "m", TEMPLATE)))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(response.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            await client.close()
+            return b"".join(chunks)
+
+        body = run(check())
+        self.assertGreaterEqual(body.count(b": waiting"), 2, body[:400])   # not only before the first byte
+        # the call itself still arrives whole, once, and the stream still ends the OpenAI way
+        self.assertIn(b'"tool_calls"', body)                    # the held call still arrives, whole
+        self.assertLessEqual(body.count(b"tool_calls"), 2)      # once as a message, once in usage
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))
+
+    def test_the_log_says_whether_the_server_was_writing(self):
+        """The accounting that separates "the client showed nothing" from "the server sent nothing".
+
+        A streaming reply logs `out_events`/`out_chars` per heartbeat and one `sse_summary` at the end;
+        a held-back tool call is the case where the numbers stay flat while the engine decodes.
+        """
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.environ["KYOJIN_REQLOG"] = str(Path(tmp.name) / "requests.log")
+        os.environ["KYOJIN_REQLOG_HEARTBEAT_S"] = "0.2"
+        self.addCleanup(os.environ.pop, "KYOJIN_REQLOG", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_REQLOG_HEARTBEAT_S", None)
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(1.2)                 # heartbeats land while nothing is sent
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            body = await response.read()
+            await client.close()
+            return body
+
+        run(check())
+        events = []
+        for line in Path(os.environ["KYOJIN_REQLOG"]).read_text(encoding="utf-8").splitlines():
+            parts = line.split(" ")
+            fields = {}
+            for item in parts[2:]:
+                key, _, value = item.partition("=")
+                fields[key] = value.strip('"')
+            events.append((parts[1], fields))
+        alive = [f for name, f in events if name == "alive"]
+        self.assertTrue(alive)
+        self.assertTrue(all({"out_events", "out_chars", "last_out_s"} <= set(f) for f in alive), alive[:3])
+        # while the engine holds everything back, the counters stand still across heartbeats — which is
+        # exactly the evidence the incident was missing (it cannot be reconstructed after the fact)
+        stalled = [f for f in alive if f["phase"] in ("prefill", "decode")]
+        self.assertGreaterEqual(len(stalled), 2, alive[:3])
+        self.assertEqual({f["out_events"] for f in stalled}, {"1"}, stalled[:3])
+        summary = [f for name, f in events if name == "sse_summary"]
+        self.assertEqual(len(summary), 1, summary)
+        self.assertGreaterEqual(int(summary[0]["out_events"]), 2)             # role chunk + content
+        self.assertGreater(int(summary[0]["out_chars"]), 0)
+        self.assertEqual(summary[0].get("errors", "0"), "0")
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.5)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            body = await response.read()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
+        self.assertIn(b"hello", body)
+
+
 if __name__ == "__main__":
     unittest.main()

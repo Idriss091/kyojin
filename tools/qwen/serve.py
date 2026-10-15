@@ -42,6 +42,13 @@ sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
+# not look like a hung server to a client that only watches its socket.
+from serve_ping import ServePing  # noqa: E402
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: off unless
+# KYOJIN_REQLOG names a path. Its output accounting also feeds the end-of-stream summary here.
+from serve_reqlog import ReqLog, StreamWriter  # noqa: E402
 
 
 def _load_mimo():
@@ -1258,6 +1265,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     admit_lock = asyncio.Lock()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, defaults=defaults)
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
+    # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
+    app.update(ping=ServePing.from_env())
+    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only).
+    app.update(reqlog=ReqLog.from_env(server="qwen"))
 
     def err(status: int, message: str) -> web.Response:
         return web.json_response({"error": {"message": message, "type": "invalid_request_error", "code": status}},
@@ -1435,6 +1447,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 
         out: asyncio.Queue = asyncio.Queue()
         await queue.put((job, out))
+        queued_at = time.perf_counter()          # the wait a streaming client's comments count from
 
         def finish_and_stats(stats: dict[str, Any], text: str, has_calls: bool):
             n_new = int(stats.get("new_tokens") or engine.count_tokens(text))
@@ -1461,13 +1474,23 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 timings["rejected_draft_tokens"] = int(stats["rejected_draft_tokens"])
             return reason, usage, timings
 
-        async def pieces() -> AsyncIterator[str | dict]:
+        async def pieces(writer: StreamWriter | None = None, ping: ServePing | None = None,
+                         ping_at: float = 0.0) -> AsyncIterator[str | dict]:
             while True:
                 # a non-streaming client that hung up is only noticed here (nothing is written until the end)
                 tr = request.transport
                 if tr is None or tr.is_closing():
                     job["cancel"].set()
                     raise ConnectionResetError("client left")
+                if ping is not None:
+                    # A ':' comment while the engine works, checked before every poll: the only thing a
+                    # streaming client can see until the prompt (or a held-back tool call) is done. It is
+                    # None for a JSON reply.
+                    try:
+                        await ping.comment(writer, ping_at)
+                    except ConnectionResetError:
+                        job["cancel"].set()
+                        raise
                 try:
                     item = await asyncio.wait_for(out.get(), 1.0)
                 except asyncio.TimeoutError:
@@ -1483,10 +1506,13 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = StreamWriter(response)      # counts what the client is sent (see serve_reqlog)
+            ping, ping_at = app["ping"].per_request(), queued_at
             try:
-                await response.write(sse(event({"role": "assistant", "content": ""})))
+                await writer.write(sse(event({"role": "assistant", "content": ""})))
+                ping.note_output()
                 stats, full = {}, ""
-                async for item in pieces():
+                async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
                         continue
@@ -1500,20 +1526,21 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     full += item
                     for kind, piece in sp.feed(item):
                         key = "reasoning_content" if kind == "reasoning" else "content"
-                        await response.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                 for kind, piece in sp.finish():
                     key = "reasoning_content" if kind == "reasoning" else "content"
-                    await response.write(sse(event({key: piece})))
+                    await writer.write(sse(event({key: piece})))
                 calls = parse_tool_calls(sp.tool_text, job["tools"])
                 if calls:
                     for i, c in enumerate(calls):   # one stream message per call: some clients read only the first call of a message
-                        await response.write(sse(event({"tool_calls": [dict(c, index=i)]})))
+                        await writer.write(sse(event({"tool_calls": [dict(c, index=i)]})))
                 reason, usage, timings = finish_and_stats(stats, full, bool(calls))
                 final = event({}, reason) | {"usage": usage, "timings": timings}
                 if job["return_token_ids"]:
                     final["token_ids"] = stats.get("token_ids", [])
-                await response.write(sse(final))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(final))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
             except ConnectionResetError:  # client left: stop the job, no traceback
                 job["cancel"].set()
@@ -1523,13 +1550,16 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             except Exception as exc:                                  # noqa: BLE001
                 job["cancel"].set()
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     # End the stream the OpenAI way: a bare drop makes clients report "stream ended without finish_reason".
-                    await response.write(sse(event({}, "error")))
-                    await response.write(b"data: [DONE]\n\n")
+                    await writer.write(sse(event({}, "error")))
+                    await writer.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass
+            finally:
+                for event, fields in writer.stats.lines():
+                    reqlog.log(event, path="/v1/chat/completions", **fields)
             return response
 
         try:
@@ -1733,13 +1763,23 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 
         out: asyncio.Queue = asyncio.Queue()
         await queue.put((job, out))
+        queued_at = time.perf_counter()          # the wait a streaming client's comments count from
 
-        async def pieces() -> AsyncIterator[str | dict]:
+        async def pieces(writer: StreamWriter | None = None, ping: ServePing | None = None,
+                         ping_at: float = 0.0) -> AsyncIterator[str | dict]:
             while True:
                 tr = request.transport
                 if tr is None or tr.is_closing():
                     job["cancel"].set()
                     raise ConnectionResetError("client left")
+                if ping is not None:
+                    # A ':' comment while the engine works, checked before every poll: the only thing a
+                    # streaming client can see until the prompt (or a held-back tool call) is done.
+                    try:
+                        await ping.comment(writer, ping_at)
+                    except ConnectionResetError:
+                        job["cancel"].set()
+                        raise
                 try:
                     item = await asyncio.wait_for(out.get(), 1.0)
                 except asyncio.TimeoutError:
@@ -1754,17 +1794,19 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = StreamWriter(response)      # counts what the client is sent (see serve_reqlog)
+            ping, ping_at = app["ping"].per_request(), queued_at
             try:
                 stats, full = {}, ""
-                async for item in pieces():
+                async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
                     elif not isinstance(item, Retract):
                         full += item
-                        await response.write(sse(chunk(item, None)))
+                        await writer.write(sse(chunk(item, None)))
                 reason, usage = reason_usage(stats, full)
-                await response.write(sse(chunk("", reason) | {"usage": usage}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
             except ConnectionResetError:
                 job["cancel"].set()
@@ -1774,10 +1816,13 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             except Exception as exc:                                  # noqa: BLE001
                 job["cancel"].set()
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     await response.write_eof()
                 except ConnectionError:
                     pass
+            finally:
+                for event, fields in writer.stats.lines():
+                    reqlog.log(event, path="/v1/chat/completions", **fields)
             return response
 
         try:
@@ -1933,6 +1978,8 @@ def main() -> None:
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens)
+    print(f"qserve: {app['ping'].describe()}", flush=True)
+    print(f"qserve: {app['reqlog'].describe()}", flush=True)
 
     async def serve() -> None:
         runner = web.AppRunner(app)
