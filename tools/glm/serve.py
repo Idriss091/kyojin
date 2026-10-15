@@ -106,6 +106,16 @@ SPEED_ENV = {
     "EXL3_NC2_KDA_OPAD": "1",
     "EXL3_NC2_HC_YPAD": "1",
     "EXL3_NC2_HC_YPAD_MLP": "1",
+    # 15/10 (box1 nc2 S1-rest, S3, S1-kda): silu_mul, the MLA unfold and the KDA prefill norm write their GEMM input at the padded
+    # pitch; attention / MLA o_proj / the ablit projection keep fp16 output where the residual reads it. Bitwise (kamel, one load,
+    # ABBA, on top of the four above: first-token and restored-prompt logits equal, 3 x 8K + 1 x 32K); prefill +0.3 % at 8K (iGPU
+    # heat), +0.8 % at 32K. 0 = off.
+    "EXL3_NC2_SILU_PAD": "1",
+    "EXL3_NC2_MLA_OPAD": "1",
+    "EXL3_NC2_ATTN_F16": "1",
+    "EXL3_NC2_ABLIT_F16": "1",
+    "EXL3_NC2_MLA_OPROJ_F16": "1",
+    "EXL3_NC2_KDA_NPAD": "1",
 }
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
