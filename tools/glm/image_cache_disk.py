@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Second-level picture cache on disk: the rows of the pictures the memory cache had to evict.
 
-The memory cache (`image_cache_glm.py`) keeps the *earliest* pictures of a prompt and gives up the tail, so the
-pictures a client re-sends a moment later are exactly the ones it dropped, and today they cost a vision pass
-plus the re-prefill of everything from their position on. Writing a picture out **when it is evicted** and
+The memory cache (the shared `image_cache.py`) gives up the pictures its eviction policy weighs least, and with
+`KYOJIN_IMAGE_CACHE_POLICY=tail` those are the *last* ones of a prompt, so the pictures a client re-sends a moment
+later are exactly the ones it dropped — which today cost a vision pass plus the re-prefill of everything from
+their position on. (Under the default `head` policy the first pictures go instead, and then this directory can
+still save the vision pass for them, but not the prefix.) Writing a picture out **when it is evicted** and
 reading it back later replaces that with a file read: the server also keeps the picture's identity (its pseudo
 token ids) for the life of the process, so a restored picture reproduces the prompt token for token and the
 paged KV prefix still matches.

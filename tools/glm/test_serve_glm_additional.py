@@ -88,8 +88,11 @@ def vision_engine():
 
 
 def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True,
-                lock_s: float = 0.0):
+                lock_s: float = 0.0, policy: str = "tail"):
     """An engine whose _embed() runs over a real memory cache *and* a real second-level cache on disk.
+
+    The memory cache runs the `tail` policy the disk layer is built for: keeping the head of a prompt is what
+    lets a restored picture complete it. The server's own default is the shared cache's LRU (`head`).
 
     The fake pictures carry everything a restore needs (identity, token list, MRoPE metadata) so a test can ask
     whether the prompt would be reproduced: unlike the tower, the disk has to give back the same pseudo ids.
@@ -121,7 +124,7 @@ def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_byte
             return Emb()
 
     eng = object.__new__(serve.ResidentEngine)
-    eng.emb_cache = ImageEmbeddingCache(max_bytes=budget_bytes)
+    eng.emb_cache = ImageEmbeddingCache(max_bytes=budget_bytes, policy=policy)
     eng.vision, eng.tokenizer = Tower(), None
     eng.image_cache_format = mode
     eng.emb_disk = None
@@ -226,8 +229,13 @@ class ImageDiskCacheTests(unittest.TestCase):
     def test_the_defaults_match_upstream(self):
         # The memory budget is upstream's 1 GiB, and the disk cache is off unless a cap is given: no auto share
         # of RAM, and no way to ask for an unbounded directory.
+        from image_cache import DEFAULT_MAX_ITEMS
         self.assertEqual(serve.IMAGE_CACHE_MB_DEFAULT, 1024)
         self.assertEqual(serve.make_image_cache(None).max_bytes, 1024 << 20)
+        # The count cap defaults to the shared cache's, so the three servers behave the same out of the box.
+        self.assertEqual(serve.IMAGE_CACHE_ITEMS_DEFAULT, DEFAULT_MAX_ITEMS)
+        self.assertEqual(serve.make_image_cache(None).max_items, DEFAULT_MAX_ITEMS)
+        self.assertEqual(serve.make_image_cache(None, 0).max_items, 0)          # 0 = no limit, when asked for
         self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 0.0)
         self.assertTrue(serve.IMAGE_CACHE_DIR_DEFAULT.endswith(".cache/kyojin/image-embeddings"))
         self.assertEqual(serve.IMAGE_CACHE_DIR_LOCK_S, 300.0)
@@ -266,7 +274,7 @@ class ImageDiskCacheTests(unittest.TestCase):
         # counts the bytes of the form it actually holds (3 rows x 64 half values = 384 B as they are).
         from PIL import Image
         from exllamav3.tokenizer.mm_embedding import QuantizedMMRows
-        from image_cache_glm import embedding_nbytes
+        from image_cache import embedding_nbytes
         eng, _ = vision_engine()
         img = Image.new("RGB", (8, 8))
         counts, packed = {}, {}
@@ -454,8 +462,8 @@ class RequestLogTests(unittest.TestCase):
         self.assertEqual((cache[0]["imgs"], cache[0]["hits"], cache[0]["misses"]), ("2", "0", "2"))
         self.assertEqual(cache[0]["first_missing"], "0")           # the prefix can only match from the start
         self.assertEqual((cache[0]["entries"], cache[0]["evicted"]), ("2", "0"))
-        self.assertEqual(cache[0]["budget_mb"], "1024")            # image_cache_glm's own default (upstream's 1 GiB)
-        self.assertEqual(cache[0]["item_cap"], "0")
+        self.assertEqual(cache[0]["budget_mb"], "1024")            # the shared cache's own default (1 GiB)
+        self.assertEqual(cache[0]["item_cap"], "32")            # the shared cache's count default
         self.assertEqual((cache[1]["hits"], cache[1]["misses"]), ("2", "0"))
         self.assertNotIn("first_missing", cache[1])                # a full hit has no gap
         self.assertNotIn("data:image", "\n".join(self.lines()))     # the image URL is never written

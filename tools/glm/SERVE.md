@@ -31,7 +31,7 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
 | `--image-cache-mb` | `1024` | host memory for the decoded image embeddings, in MiB, one pool shared by all sessions; `0` = no byte limit |
-| `--image-cache-items` | `0` | optional cap on how many pictures are held at once; `0` = no limit |
+| `--image-cache-items` | `32` | cap on how many pictures are held at once; `0` = no limit |
 | `--image-cache-dir` | `~/.cache/kyojin/image-embeddings` | directory of the second-level picture cache; used only when `--image-cache-dir-max-gb` is set |
 | `--image-cache-dir-max-gb` | `0` | GiB cap on that directory; `0` = disabled. There is no unlimited setting |
 | `--image-cache-dir-lock-s` | `300` | seconds a conversation keeps the room its files took before another may take it; `0` = no tenure |
@@ -51,6 +51,10 @@ Copy lookup (`GLM_NGRAM`), sampled drafts (`EXL3_SPEC_SAMPLED`), the recurrent s
 collector freeze (`EXL3_GC_FREEZE`) are described in [doc/env_vars.md](../../doc/env_vars.md).
 The lookup code is `tools/qwen/spec_policy.py`, which the GLM server finds through its own file path, so `tools/qwen`
 must ship next to `tools/glm`.
+
+The picture cache's eviction policy is an environment variable rather than a flag:
+**`KYOJIN_IMAGE_CACHE_POLICY`**, `head` (the default, a plain LRU) or `tail` (keep the head of a prompt and give up its
+end); anything else is an error at start-up. See [Images](#images).
 
 ### MTP sidecar (higher draft acceptance)
 
@@ -129,10 +133,13 @@ server keeps the decoded embeddings of recent pictures in host memory (GLM's mer
 picture fresh pseudo token ids and breaks the paged prefix *from that picture on*. `--image-cache-mb` sizes the
 cache: 1024 MiB by default, about 20 pages of 1568x1568 at 49.0 MiB each, one pool shared by all sessions
 like `-c`.
-A conversation larger than the budget keeps its **earliest** pictures and gives up the last ones, so the match
-still runs from the first page to where the cache ended rather than collapsing to nothing. The request log's
-`img_cache` line reports `hits`, `misses` and `first_missing`, the index the prefix could match up to;
-`--image-cache-items` adds an optional cap on the number of pictures.
+Which pictures a full cache gives up is the eviction policy of the shared cache, `KYOJIN_IMAGE_CACHE_POLICY`:
+`head` (the default) is a plain LRU — the same behaviour this cache always had — and it drops the *earliest*
+pictures of a history, which are exactly the ones the paged prefix starts from; `tail` drops the *last* ones
+instead, so a conversation a client keeps re-sending keeps its head. The request log's `img_cache` line reports
+`hits`, `misses` and `first_missing`, the index the prefix could match up to; `--image-cache-items` caps the
+number of pictures held (32 by default, as upstream's shared cache; `0` = no limit), which for small crops binds
+before the byte budget does.
 
 `--image-cache-format` stores those rows packed instead of as fp32 (49.0 MiB for a 1568x1568 page): `fp16` is
 24.5 MiB and `q8` is 12.3 MiB. Measured per picture that is actually
@@ -161,8 +168,12 @@ With `--image-cache-dir-max-gb` (off by default), the pictures the memory budget
 more pictures than `--image-cache-mb` holds: a session that fits writes nothing, and a longer one writes each
 evicted picture once (files are keyed by content, so a picture evicted twice is not rewritten). The directory is
 `--image-cache-dir`, `~/.cache/kyojin/image-embeddings` unless changed, and anything unreadable in it is dropped
-and re-encoded: the disk never becomes a reason for a request to fail. Note what it stores: the **rows derived
-from the input images stay on disk**, which is a privacy and disk-wear consideration. Two knobs bound it:
+and re-encoded: the disk never becomes a reason for a request to fail. It is meant to be used with `KYOJIN_IMAGE_CACHE_POLICY=tail`: then the evicted
+pictures are the end of a prompt, restoring them completes the prompt again and the paged prefix survives, which
+is where the large win is (99.8 % of a 24-page prompt reused, 1.2 s against 82.0 s). Under the default `head`
+policy it still saves the vision pass for the pictures it holds, but the prefix is broken at the first of them.
+Note what it stores: the **rows derived from the input images stay on disk**, which is a privacy and disk-wear
+consideration. Two knobs bound it:
 `--image-cache-dir-max-gb` caps the directory and `--image-cache-dir-lock-s` caps how often a conversation can
 lose its place to another one.
 
@@ -336,6 +347,9 @@ python -m pytest -q tools/glm/test_serve.py tools/glm/test_serve_glm_additional.
 Model-free: a `FakeEngine` emits deterministic GLM XML in 3-character chunks so tags are
 split mid-token, covering template rendering, think/tool parsing, stop strings, SSE
 framing, `/v1/models`, usage, and the streamed open-`<think>` path. No GPU needed.
+
+`tools/strix_halo/test_image_cache.py` covers the shared cache itself, including both eviction policies (the
+default LRU and `KYOJIN_IMAGE_CACHE_POLICY=tail`).
 
 `test_serve_glm_additional.py` holds the tests for what this checkout adds locally: the
 request log (`KYOJIN_REQLOG`, off by default, no request text) and the image cache

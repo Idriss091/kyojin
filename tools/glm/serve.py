@@ -111,6 +111,9 @@ SPEED_ENV = {
 # 1568x1568 page (3,136 tokens) and 1 MB for a 224x224 crop, so pictures, not bytes, are what a conversation
 # spends: the default holds about 20 of those pages, as upstream's 1 GiB did.
 IMAGE_CACHE_MB_DEFAULT = 1024
+# Count cap on top of the byte budget, as upstream's shared cache defaults to it (0 = no limit). For big pages
+# the byte budget binds first; for small ones this keeps the entry count bounded.
+IMAGE_CACHE_ITEMS_DEFAULT = 32
 # How the cached rows are stored (--image-cache-format). fp32 is what the vision merger emits; fp16 is exactly
 # the same values (the tower computes in fp16) and q8 rounds at one part in 254 of the row's peak. Kept here
 # rather than imported from the engine, which serve.py must not import before SPEED_ENV is applied.
@@ -126,17 +129,19 @@ IMAGE_CACHE_DIR_MAX_GB = 0.0
 IMAGE_CACHE_DIR_LOCK_S = 300.0
 
 
-def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: int = 0,
-                     sessions: int = 1) -> ImageEmbeddingCache:
+def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: int = IMAGE_CACHE_ITEMS_DEFAULT,
+                     sessions: int = 1, policy: str | None = None) -> ImageEmbeddingCache:
     """The picture cache of the process (--image-cache-mb / --image-cache-items).
 
     One cache for the whole server, shared by every session exactly like the KV pool `-c` sizes, with the
-    eviction policy of image_cache_glm.py: the tail of a prompt is given up before its head, and the policy
-    remembers one prompt order per concurrent request plus one, so a conversation is not forgotten between two
-    of its own turns when another session slips in between.
+    eviction policy of the shared cache in tools/strix_halo/image_cache.py: the default gives up the head of a
+    prompt a client keeps re-sending (what the servers always did), and `KYOJIN_IMAGE_CACHE_POLICY=tail` gives up
+    its tail instead. The policy remembers one prompt order per concurrent request plus one, so a conversation is
+    not forgotten between two of its own turns when another session slips in between.
     """
     return ImageEmbeddingCache(max_items=image_cache_items, max_orders=max(2, sessions),
-                               **({} if image_cache_bytes is None else {"max_bytes": image_cache_bytes}))
+                               **({} if image_cache_bytes is None else {"max_bytes": image_cache_bytes}),
+                               **({} if policy is None else {"policy": policy}))
 
 
 def make_image_disk(image_cache_dir: str | None, image_cache_dir_max_gb: float, image_cache_dir_lock_s: float,
@@ -1750,8 +1755,9 @@ def main() -> None:
                         help=f"host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this "
                              f"is one pool shared by every --sessions request (default {IMAGE_CACHE_MB_DEFAULT}): "
                              "about 49 MiB per 1568x1568 page, 1 MB per 224x224 crop")
-    parser.add_argument("--image-cache-items", type=int, default=0,
-                        help="optional cap on how many pictures are held at once (0 = no limit)")
+    parser.add_argument("--image-cache-items", type=int, default=IMAGE_CACHE_ITEMS_DEFAULT,
+                        help=f"cap on how many pictures are held at once; 0 = no limit "
+                             f"(default {IMAGE_CACHE_ITEMS_DEFAULT}, as upstream)")
     parser.add_argument("--image-cache-dir", default=IMAGE_CACHE_DIR_DEFAULT,
                         help=f"directory of the second-level picture cache (default {IMAGE_CACHE_DIR_DEFAULT}); "
                              "only used when --image-cache-dir-max-gb is set")
@@ -1825,7 +1831,7 @@ def main() -> None:
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
-              f"{args.image_cache_format} rows, shared by {args.sessions} session(s)", flush=True)
+              f"{args.image_cache_format} rows, {engine.emb_cache.policy} policy, shared by {args.sessions} session(s)", flush=True)
         if engine.emb_disk is not None:
             print(f"serve: {engine.emb_disk.describe()}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
@@ -1878,6 +1884,7 @@ def main() -> None:
                image_cache_mb=round(emb_cache.max_bytes / 2 ** 20, 1) if emb_cache is not None else None,
                image_cache_items=getattr(emb_cache, "max_items", None),
                image_cache_format=getattr(engine, "image_cache_format", "fp32"),
+               image_cache_policy=getattr(getattr(engine, "emb_cache", None), "policy", None),
                image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_lock_s=engine.emb_disk.lock_s if getattr(engine, "emb_disk", None) else None,
