@@ -584,7 +584,25 @@ class MLAttention(Module):
                 x2 = x.reshape(rows, lin.in_features)
                 y = torch.cat([dec_proj_single(lin, x2[r : r + 1]) for r in range(rows)], dim = 0)
             return to2(y.view(x.shape[:-1] + (lin.out_features,)), None, lin.out_dtype)
+        if lin is self.o_proj and params.get("pfe_y_half") and self._nc2_oproj_f16(lin, x, params):
+            return lin.forward(x, params, torch.half)
         return lin.forward(x, params)
+
+
+    def _nc2_oproj_f16(self, m, x: torch.Tensor, params: dict) -> bool:
+        """EXL3_NC2_MLA_OPROJ_F16: the block's residual apply reads fp16 y (params["pfe_y_half"]), so o_proj may return
+        its fp16 GEMM output instead of the fp32 widen of it (same predicate as Attention.project_o): bit-exact."""
+        if os.environ.get("EXL3_NC2_MLA_OPROJ_F16", "0") != "1" or "capture" in params or "quant_preserve" in params:
+            return False
+        from .quant import exl3 as _exl3
+        rows = x.numel() // x.shape[-1]
+        return bool(
+            _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1)
+            and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None
+            and not self.config.infer_params.no_reconstruct and not params.get("reconstruct")
+            and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0
+            and m.softcap == 0.0 and m.out_features == m.out_features_unpadded
+        )
 
 
     @staticmethod
