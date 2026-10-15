@@ -1268,8 +1268,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
     # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
     app.update(ping=ServePing.from_env())
-    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only).
-    app.update(reqlog=ReqLog.from_env(server="qwen"))
+    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only). The name is
+    # bound here, not only stored on the app: the streaming routes log from inside their own scope, and
+    # an unbound name there raises after the reply is complete, which costs the client its connection.
+    reqlog = ReqLog.from_env(server="qwen")
+    app.update(reqlog=reqlog)
 
     def err(status: int, message: str) -> web.Response:
         return web.json_response({"error": {"message": message, "type": "invalid_request_error", "code": status}},

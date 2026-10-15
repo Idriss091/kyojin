@@ -514,8 +514,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
     # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
     app.update(ping=ServePing.from_env())
-    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only).
-    app.update(reqlog=ReqLog.from_env(server="mimo"))
+    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only). The name is
+    # bound here, not only stored on the app: the streaming route logs from inside its own scope, and
+    # an unbound name there raises after the reply is complete, which costs the client its connection.
+    reqlog = ReqLog.from_env(server="mimo")
+    app.update(reqlog=reqlog)
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
         accepted = int(st.get("accepted_draft_tokens", 0))

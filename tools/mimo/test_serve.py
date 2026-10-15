@@ -676,6 +676,35 @@ class SSEKeepAliveTests(unittest.TestCase):
         self.assertLess(body.index(b": waiting"), body.index(b"hello"))   # before the first token
         self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
 
+    def test_a_streaming_reply_does_not_cost_the_client_its_connection(self):
+        """The streaming route logs its summary while the reply is being closed: a name that is not
+        bound there raises after the body is complete, and the client loses the connection it was
+        reusing (the next request on it dies with ServerDisconnectedError, and the server logs a
+        traceback per stream). Three streams on one client session must all succeed."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.3)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            dropped = 0
+            for _ in range(3):
+                try:
+                    response = await client.post("/v1/chat/completions", json={
+                        "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                    await response.read()
+                except Exception:                                     # noqa: BLE001  the bug drops the socket
+                    dropped += 1
+            await client.close()
+            return dropped
+
+        self.assertEqual(run(check()), 0)
+
     def test_nothing_is_written_when_the_switch_is_off(self):
         from aiohttp.test_utils import TestClient, TestServer
 
