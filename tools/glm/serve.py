@@ -55,7 +55,7 @@ SPEED_ENV = {
     "EXL3_BIG_TAIL_DENSE": "1",
     "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # plain chunks beyond 32K depth, lower peak memory at 512K ctx
     # 15/10: 8192-row prefill chunks (an 8K prompt = one forward; 4-slot KDA checkpoints keep every tail boundary).
-    # Box 8K cold window -3.8 %, kamel served 8K 697 / 32K 681 tok/s, logits + restore hashes equal to 4096 chunks.
+    # Box 8K cold window -3.8 %, served 8K 697 / 32K 681 tok/s, logits + restore hashes equal to 4096 chunks.
     "EXL3_PREFILL_BIG_CHUNK": "8192",
     "EXL3_NC2_CKPT4": "1",
     # 27/09: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
@@ -89,7 +89,7 @@ SPEED_ENV = {
     "EXL3_PF_NO_TAIL": "1",
     # 15/10: a turn that resumes mid-page (tail checkpoint) and adds >= 1024 tokens no longer pays a separate last-page
     # forward: served tool turn 4.34 -> 3.35 s, 2.58 -> 2.14 s; first-token KLD vs cold within the chunk-size floor
-    # (box1 Results 70-73). Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
+    # Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
     "EXL3_TAIL_MAXGAP": "8192",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
@@ -106,16 +106,16 @@ SPEED_ENV = {
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
     "EXL3_SPEC_SAMPLED": "1",
-    # 14/10 (box1 nc2): prefill producers write GEMM-padded rows (KDA o_proj input, mHC norm outputs) and the shared expert is
+    # 14/10: prefill producers write GEMM-padded rows (KDA o_proj input, mHC norm outputs) and the shared expert is
     # added in the routed-MoE reduce epilogue: no pad copies, no separate widen + fp32 add. Bitwise: first-token and restored-
-    # prompt logits equal on vs off (kamel, 3 x 8K + 1 x 32K, one load, ABBA). 8K prefill +3.7..+6.2 % (these four + the async
+    # prompt logits equal on vs off (3 x 8K + 1 x 32K, one load, ABBA). 8K prefill +3.7..+6.2 % (these four + the async
     # stash, which alone shows no gain and stays off), 32K +0.3 % (shared fuse) / +2.2 % (pads). 0 = off.
     "EXL3_NC2_SHARED_FUSE": "1",
     "EXL3_NC2_KDA_OPAD": "1",
     "EXL3_NC2_HC_YPAD": "1",
     "EXL3_NC2_HC_YPAD_MLP": "1",
-    # 15/10 (box1 nc2 S1-rest, S3, S1-kda): silu_mul, the MLA unfold and the KDA prefill norm write their GEMM input at the padded
-    # pitch; attention / MLA o_proj / the ablit projection keep fp16 output where the residual reads it. Bitwise (kamel, one load,
+    # 15/10: silu_mul, the MLA unfold and the KDA prefill norm write their GEMM input at the padded
+    # pitch; attention / MLA o_proj / the ablit projection keep fp16 output where the residual reads it. Bitwise (one load,
     # ABBA, on top of the four above: first-token and restored-prompt logits equal, 3 x 8K + 1 x 32K); prefill +0.3 % at 8K (iGPU
     # heat), +0.8 % at 32K. 0 = off.
     "EXL3_NC2_SILU_PAD": "1",

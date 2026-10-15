@@ -290,7 +290,7 @@ class OnlineRule(CostRule):
         self.acc_ema = float(accepted) if self.acc_ema is None else (1 - a) * self.acc_ema + a * accepted
         if self.pred_ema > 1e-6: self.scale = min(self.hi, max(self.lo, self.acc_ema / self.pred_ema))
 
-# measured plain-batch step ms for 1..8 rows (kamel T52) + 3.1 ms per drafted depth + 2 ms of round overhead: cycle ms for D drafts
+# measured plain-batch step ms for 1..8 rows + 3.1 ms per drafted depth + 2 ms of round overhead: cycle ms for D drafts
 CYCLE_MS = [30.3 + 2.0, 41.6 + 3.1 + 2.0, 50.2 + 6.2 + 2.0, 58.6 + 9.3 + 2.0, 68.8 + 12.4 + 2.0, 75.1 + 15.5 + 2.0, 84.7 + 18.6 + 2.0, 92.9 + 21.7 + 2.0]
 
 class TableRule(ProductRule):
