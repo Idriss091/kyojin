@@ -1712,7 +1712,10 @@ class GatedDeltaNet(Module):
         else:
             o_pitch = 0
             _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
-            if _pad_ok is not None and not self.kda and not self.norm.gate_first and \
+            # EXL3_NC2_KDA_NPAD=1 (read per call): KDA prefill too (GLM: 34 layers, o_proj K 8192), so o_proj skips its
+            # pad_copy_in; same fused kernel, only the store address moves (bit-exact). The pitched forward needs fp16 out
+            kda_ok = not self.kda or (os.environ.get("EXL3_NC2_KDA_NPAD", "0") == "1" and self.norm.out_dtype == torch.half)
+            if _pad_ok is not None and kda_ok and not self.norm.gate_first and \
                     _pad_ok(core_attn_out, self.norm.weight, self.norm.out_dtype or torch.half, z, self.norm.groups,
                             1 if self.norm.gate_activation == "sigmoid" else 0):
                 o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
