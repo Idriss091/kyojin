@@ -657,6 +657,7 @@ def _mla_unfold_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,     # D_v tile (grid axis 2); D_v itself = one tile per head
+    OUT_PITCH: tl.constexpr = 0,   # nc2 S1-rest: row pitch of out in elements (0 = dense H * D_v)
 ):
     """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
     output so o_proj consumes it without a permute. The V columns are split over grid axis 2
@@ -676,8 +677,12 @@ def _mla_unfold_kernel(
                       mask = valid_m[:, None], other = 0.0)
         w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
         acc = tl.dot(o_t, w_t, acc = acc)
-    tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
-             acc.to(tl.float16), mask = valid_m[:, None])
+    if OUT_PITCH:
+        tl.store(out + offs_m[:, None] * OUT_PITCH + head * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
+    else:
+        tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
 
 
 @triton.jit
@@ -1361,11 +1366,18 @@ def _unfold_cfg(R: int, v_head_dim: int):
     return block_m, 128, v_head_dim, 2, 4
 
 
-def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
-    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major."""
+def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int, out: torch.Tensor = None):
+    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major.
+    out (nc2 S1-rest): optional (R, H * v_head_dim) fp16 row view with unit column stride and any row pitch."""
     H, R, D_c = o_lat.shape
-    out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
-    if _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim):
+    out_pitch = 0
+    if out is not None:
+        assert out.dtype == torch.half and out.dim() == 2 and out.shape == (R, H * v_head_dim) and out.stride(1) == 1 \
+            and out.stride(0) >= H * v_head_dim
+        out_pitch = out.stride(0) if out.stride(0) != H * v_head_dim else 0
+    else:
+        out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+    if out_pitch == 0 and _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim):
         _mla_ext().mla_unfold_dec(o_lat, w_uv_flat, out)    # see mla_absorb_dec
         return out
     block_m, block_k, block_n, stages, warps = _unfold_cfg(R, v_head_dim)
@@ -1380,7 +1392,7 @@ def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
                 _mla_unfold_kernel[grid](
                     o_lat, w_uv_flat, out, R,
                     H, D_c, v_head_dim,
-                    block_m, block_k, block_n,
+                    block_m, block_k, block_n, out_pitch,
                     num_warps = warps, num_stages = stages,
                 )
                 _unfold_block_k[fb_key] = block_k

@@ -98,6 +98,8 @@ class GDNState:
 
     # Prompt-end checkpoints (Job._tail_stash) are validated for this state class only
     supports_tail_ckpt = True
+    # RecurrentCache.put may call stash(async_ = True) (EXL3_NC2_ASYNC_STASH)
+    supports_async_stash = True
 
     def __init__(
         self,
@@ -156,13 +158,24 @@ class GDNState:
         return 0
 
 
-    def stash(self):
+    def stash(self, async_: bool = False, pin_pool: dict = None):
+        """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
+        current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
+        (RecurrentCache._finish, worker thread) before any reader sees the entry."""
         stashed = {
             "position": self.position,
             "checkpoint_size": self.checkpoint_size
         }
         if not self.cache.model.loaded_tp:
-            for k, l in self.cache.get_all_recurrent_layers().items():
+            layers = self.cache.get_all_recurrent_layers()
+            if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+                for k, l in layers.items():
+                    stashed[k] = l.stash_async(self.slot, pin_pool)
+                ev = torch.cuda.Event()
+                ev.record()
+                stashed["_ev"] = ev
+                return stashed
+            for k, l in layers.items():
                 stashed[k] = l.stash(self.slot)
         else:
             cp_handle = new_checkpoint_handle()
@@ -311,6 +324,19 @@ class GDNLayerState:
             self.recurrent_state[slot, :1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
+
+
+    def stash_async(self, slot, pin_pool: dict = None):
+        """Non-blocking D2H into pinned host tensors, reused from pin_pool ((shape, dtype) -> free list) when given:
+        a pinned allocation costs ~1 ms of host time, more than the blocking copy it replaces."""
+        cdim = self.module.conv_kernel_size
+        out = []
+        for src in (self.recurrent_state[slot, :1], self.conv_state[slot, :, :cdim]):
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
 
 
     def unstash(self, slot, stashed, position: int = 0):
@@ -1221,7 +1247,17 @@ class GatedDeltaNet(Module):
                             n.rms_norm_eps, n.constant_bias, n.groups, n.gate_first, 1)
             return y
         z = self.g_b_proj.forward(gaf[0].view(*core_attn_out.shape[:-2], gaf.shape[-1]), params)
-        return n.forward(core_attn_out, params, gate = z.view(core_attn_out.shape))
+        z = z.view(core_attn_out.shape)
+        # EXL3_NC2_KDA_OPAD=1 (read per call): write the norm output at the o_proj row pitch, so o_proj skips its
+        # pad_copy_in (same kernel, only the store address moves: bit-exact)
+        o_pitch = 0
+        _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
+        if os.environ.get("EXL3_NC2_KDA_OPAD", "0") == "1" and _pad_ok is not None and not n.gate_first and \
+                _pad_ok(core_attn_out, n.weight, n.out_dtype or torch.half, z, n.groups,
+                        1 if n.gate_activation == "sigmoid" else 0):
+            o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
+                                     core_attn_out.numel() // (self.num_v_heads * self.v_head_dim), params)
+        return n.forward(core_attn_out, params, gate = z, out_pitch = o_pitch)
 
     def _kda_gates_f16(self, x: torch.Tensor, params: dict, small_first: bool):
         h = torch.half
@@ -1676,7 +1712,10 @@ class GatedDeltaNet(Module):
         else:
             o_pitch = 0
             _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
-            if _pad_ok is not None and not self.kda and not self.norm.gate_first and \
+            # EXL3_NC2_KDA_NPAD=1 (read per call): KDA prefill too (GLM: 34 layers, o_proj K 8192), so o_proj skips its
+            # pad_copy_in; same fused kernel, only the store address moves (bit-exact). The pitched forward needs fp16 out
+            kda_ok = not self.kda or (os.environ.get("EXL3_NC2_KDA_NPAD", "0") == "1" and self.norm.out_dtype == torch.half)
+            if _pad_ok is not None and kda_ok and not self.norm.gate_first and \
                     _pad_ok(core_attn_out, self.norm.weight, self.norm.out_dtype or torch.half, z, self.norm.groups,
                             1 if self.norm.gate_activation == "sigmoid" else 0):
                 o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
@@ -1693,6 +1732,10 @@ class GatedDeltaNet(Module):
         if self.tp_reduce:
             params["backend"].all_reduce(x)
 
+        # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 

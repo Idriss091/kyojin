@@ -312,7 +312,8 @@ __device__ __forceinline__ void hcn_finalize_body
     const float constant_bias,
     const float constant_scale
 ,
-    const int r
+    const int r,
+    const int ldy                        // y row pitch (elements, >= D)
 )
 {
     constexpr int M = M_;
@@ -422,7 +423,7 @@ __device__ __forceinline__ void hcn_finalize_body
     for (int w_ = 0; w_ < NUM_THREADS / 32; ++w_) tot += nred[w_];
     const float nscale = rsqrtf(tot / (float) D + norm_eps) * constant_scale;
 
-    half* yr = y + (size_t) r * D;
+    half* yr = y + (size_t) r * ldy;
     #pragma unroll
     for (int j = 0; j < HCN_MAX; ++j)
     {
@@ -458,10 +459,11 @@ void hc_mix_finalize_norm_kernel
     const int sinkhorn_iters,
     const float norm_eps,
     const float constant_bias,
-    const float constant_scale
+    const float constant_scale,
+    const int ldy
 )
 {
-    hcn_finalize_body<H, M_>(streams, partials, base, scale, post, comb, y, w, wtype, D, chunksA, rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, blockIdx.x);
+    hcn_finalize_body<H, M_>(streams, partials, base, scale, post, comb, y, w, wtype, D, chunksA, rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, blockIdx.x, ldy);
 }
 
 /*
@@ -497,7 +499,8 @@ void hc_mix_norm_1pass_kernel
     const int sinkhorn_iters,
     const float norm_eps,
     const float constant_bias,
-    const float constant_scale
+    const float constant_scale,
+    const int ldy
 )
 {
     constexpr int M = M_;
@@ -575,7 +578,7 @@ void hc_mix_norm_1pass_kernel
     __threadfence();
     if (threadIdx.x == 0) tickets[r] = 0;
     hcn_finalize_body<H, M_>(streams, partials, base, scale, post, comb, y, w, wtype, D, chunksA,
-                             rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, r);
+                             rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, r, ldy);
 }
 
 
@@ -624,7 +627,8 @@ void hc_pf_apply_mix_norm_1pass_kernel
     const int sinkhorn_iters,
     const float norm_eps,
     const float constant_bias,
-    const float constant_scale
+    const float constant_scale,
+    const int ldy
 )
 {
     constexpr int M = M_;
@@ -761,7 +765,7 @@ void hc_pf_apply_mix_norm_1pass_kernel
     __threadfence();
     if (threadIdx.x == 0) tickets[r] = 0;
     hcn_finalize_body<H, M_>(sro, partials, base, scale, post, comb, y, w, wtype, D, 1,
-                             rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, r);
+                             rms_eps, hc_eps, sinkhorn_iters, norm_eps, constant_bias, constant_scale, r, ldy);
 }
 
 
@@ -1422,6 +1426,14 @@ static void hc_check_common
     TORCH_CHECK(tensor.is_contiguous(), op, ": ", name, " must be contiguous");
 }
 
+// y of the mix_norm ops: (R, D) half with contiguous columns and a row pitch >= D (a producer-padded view, see
+// exl3.row_pad_pitch); a contiguous y has pitch D.
+static void hc_check_y_rows(const at::Tensor& y, const at::Device& device, const char* op)
+{
+    TORCH_CHECK(y.is_cuda() && y.device() == device, op, ": y must be on the same CUDA device");
+    TORCH_CHECK(y.dim() == 2 && y.stride(1) == 1 && y.stride(0) >= y.size(1), op, ": y must be (R, D) with unit column stride");
+}
+
 static void hc_check_aligned(const at::Tensor& tensor, const char* op, const char* name)
 {
     TORCH_CHECK(
@@ -1677,12 +1689,13 @@ void hc_mix_norm
     hc_check_common(partials, device, op, "partials");
     hc_check_common(post, device, op, "post");
     hc_check_common(comb, device, op, "comb");
-    hc_check_common(y, device, op, "y");
+    hc_check_y_rows(y, device, op);
     TORCH_CHECK(streams.scalar_type() == at::kFloat && base.scalar_type() == at::kFloat &&
                 scale.scalar_type() == at::kFloat && partials.scalar_type() == at::kFloat &&
                 post.scalar_type() == at::kFloat && comb.scalar_type() == at::kFloat, op, ": dtype");
     TORCH_CHECK(fn.scalar_type() == at::kFloat || fn.scalar_type() == at::kHalf, op, ": fn dtype");
-    TORCH_CHECK(y.scalar_type() == at::kHalf && y.numel() == (int64_t) R * D, op, ": y must be half (R, D)");
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.dim() == 2 && y.size(0) == R && y.size(1) == D, op, ": y must be half (R, D)");
+    const int ldy = (int) y.stride(0);
     TORCH_CHECK(fn.dim() == 2 && fn.size(0) == M && fn.size(1) == H * D, op, ": fn shape");
     TORCH_CHECK(base.numel() == M && scale.numel() == 3 && post.numel() == R * H && comb.numel() == R * H * H, op, ": shapes");
     const int n_chunks_a = hc_mix_num_chunks(R, H * D);
@@ -1714,7 +1727,7 @@ void hc_mix_norm
             chunk_cols, tickets, (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
             (float*) post.data_ptr(), (float*) comb.data_ptr(), (half*) y.data_ptr(), \
             wtype ? w->data_ptr() : nullptr, wtype, D, (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters, \
-            (float) norm_eps, (float) constant_bias, (float) constant_scale
+            (float) norm_eps, (float) constant_bias, (float) constant_scale, ldy
         if (fn.dtype() == at::kHalf)
             hc_mix_norm_1pass_kernel<4, 24, half><<<grid_a, NUM_THREADS + 32, 0, stream>>>(HC1_ARGS(half));
         else
@@ -1736,7 +1749,7 @@ void hc_mix_norm
         (float*) post.data_ptr(), (float*) comb.data_ptr(), (half*) y.data_ptr(),
         wtype ? w->data_ptr() : nullptr, wtype, D, n_chunks_a,
         (float) rms_eps, (float) hc_eps, (int) sinkhorn_iters,
-        (float) norm_eps, (float) constant_bias, (float) constant_scale);
+        (float) norm_eps, (float) constant_bias, (float) constant_scale, ldy);
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -1881,14 +1894,15 @@ void hc_pf_apply_mix_norm
     hc_check_common(partials, device, op, "partials");
     hc_check_common(post, device, op, "post");
     hc_check_common(comb, device, op, "comb");
-    hc_check_common(y, device, op, "y");
+    hc_check_y_rows(y, device, op);
     TORCH_CHECK(x.scalar_type() == at::kFloat && post_a.scalar_type() == at::kFloat &&
                 comb_a.scalar_type() == at::kFloat && base.scalar_type() == at::kFloat &&
                 scale.scalar_type() == at::kFloat && partials.scalar_type() == at::kFloat &&
                 post.scalar_type() == at::kFloat && comb.scalar_type() == at::kFloat, op, ": dtype");
     TORCH_CHECK(ya.scalar_type() == at::kFloat || ya.scalar_type() == at::kHalf, op, ": ya dtype");
     TORCH_CHECK(fn.scalar_type() == at::kFloat || fn.scalar_type() == at::kHalf, op, ": fn dtype");
-    TORCH_CHECK(y.scalar_type() == at::kHalf && y.numel() == (int64_t) R * D, op, ": y must be half (R, D)");
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.dim() == 2 && y.size(0) == R && y.size(1) == D, op, ": y must be half (R, D)");
+    const int ldy = (int) y.stride(0);
     TORCH_CHECK(ya.dim() == 2 && ya.size(0) == R && ya.size(1) == D, op, ": ya shape");
     TORCH_CHECK(post_a.dim() == 2 && post_a.size(0) == R && post_a.size(1) == H, op, ": post_a shape");
     TORCH_CHECK(comb_a.dim() == 3 && comb_a.size(0) == R && comb_a.size(1) == H &&
@@ -1925,7 +1939,7 @@ void hc_pf_apply_mix_norm
         (const float*) base.data_ptr(), (const float*) scale.data_ptr(), \
         (float*) post.data_ptr(), (float*) comb.data_ptr(), (half*) y.data_ptr(), \
         wtype ? w->data_ptr() : nullptr, wtype, D, (float) rms_eps, (float) hc_eps, \
-        (int) sinkhorn_iters, (float) norm_eps, (float) constant_bias, (float) constant_scale
+        (int) sinkhorn_iters, (float) norm_eps, (float) constant_bias, (float) constant_scale, ldy
     if (ya.dtype() == at::kHalf)
     {
         if (fn.dtype() == at::kHalf)

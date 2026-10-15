@@ -427,6 +427,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mul_sigmoid_pad", &mul_sigmoid_pad, "mul_sigmoid_pad");
     m.def("pad_copy", &pad_copy, "pad_copy");
     m.def("fused_silu_mul", &fused_silu_mul, "fused_silu_mul");
+    m.def("silu_mul_pitched", &silu_mul_pitched, "silu_mul_pitched");
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
     m.def("kda_gate", &kda_gate, "kda_gate");
     m.def("kda_fb_gate", &kda_fb_gate, "kda_fb_gate");
@@ -447,7 +448,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("K_gu"), py::arg("K_down"), py::arg("gu_had"), py::arg("gu_out"),
           py::arg("down_out"), py::arg("expert_offsets"), py::arg("inverse_order"),
           py::arg("tiles"), py::arg("tile_count"),
-          py::arg("act_limit") = 0.0, py::arg("mcg") = false);
+          py::arg("act_limit") = 0.0, py::arg("mcg") = false, py::arg("addend") = py::none());
     m.def("exl3_moe_prefill_gemm_test", &exl3_moe_prefill_gemm_test, "exl3_moe_prefill_gemm_test");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");

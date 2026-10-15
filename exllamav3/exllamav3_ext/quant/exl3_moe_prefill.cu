@@ -159,7 +159,8 @@ void mpw_gather_had_kernel
     int assignments,
     int top_k,
     int width,
-    int projections
+    int projections,
+    int lda                              // A row pitch (elements, >= width)
 )
 {
     const int blocks = width / 128;
@@ -170,7 +171,7 @@ void mpw_gather_had_kernel
     const int blk = job % blocks;
     const int r = (job / blocks) % rows;
     const int proj = job / ((int64_t) rows * blocks);
-    const half4 v0 = ((const half4*) (A + (int64_t) r * width + blk * 128))[t];
+    const half4 v0 = ((const half4*) (A + (int64_t) r * lda + blk * 128))[t];
     for (int k = 0; k < top_k; ++k)
     {
         const int64_t orig = (int64_t) r * top_k + k;
@@ -258,7 +259,9 @@ void mpw_reduce_had_kernel
     float* __restrict__ output,
     int rows,
     int top_k,
-    int width
+    int width,
+    const half* __restrict__ addend,
+    int addend_rows
 )
 {
     const int blocks = width / 128;
@@ -284,6 +287,15 @@ void mpw_reduce_had_kernel
         sum.y += h1 * r * __high2float(sc.x);
         sum.z += h2 * r * __low2float(sc.y);
         sum.w += h3 * r * __high2float(sc.y);
+    }
+    // Shared-expert output (fp16 GEMM result) added in the epilogue (EXL3_NC2_SHARED_FUSE): the exact
+    // fp16 -> fp32 widen and the single fp32 add of the `y.copy_(y_)` + `final += y` pair it replaces.
+    // Rows past addend_rows (alignment dummies) skip it.
+    if (addend && row < addend_rows)
+    {
+        const half4 a = ((const half4*) (addend + row * width + blk * 128))[t];
+        sum.x += __low2float(a.x); sum.y += __high2float(a.x);
+        sum.z += __low2float(a.y); sum.w += __high2float(a.y);
     }
     ((float4*) (output + row * width + blk * 128))[t] = sum;
 }
@@ -315,7 +327,8 @@ void mpw_gather_had2_kernel
     const int64_t* __restrict__ suh_1,
     int assignments,
     int top_k,
-    int width
+    int width,
+    int lda
 )
 {
     const int blocks = width / 128;
@@ -334,7 +347,7 @@ void mpw_gather_had2_kernel
         p0_l = suh_0[e];
         p1_l = suh_1[e];
     }
-    const half4 v0 = ((const half4*) (A + r * width + blk * 128))[t];
+    const half4 v0 = ((const half4*) (A + (int64_t) r * lda + blk * 128))[t];
     #pragma unroll 5
     for (int k = 0; k < top_k; ++k)
     {
@@ -1615,15 +1628,19 @@ void exl3_moe_prefill_wmma
     at::Tensor& tiles,
     at::Tensor& tile_count,
     double act_limit,
-    bool mcg
+    bool mcg,
+    const c10::optional<at::Tensor>& addend
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(A.dtype() == at::kHalf && A.is_contiguous() && A.dim() == 2, "A must be fp16 [rows, H]");
+    // A may be a producer's row-padded view (exl3.row_pad_pitch): unit column stride, row pitch >= H, 8-byte rows
+    TORCH_CHECK(A.dtype() == at::kHalf && A.dim() == 2 && A.stride(1) == 1 && A.stride(0) >= A.size(1) &&
+                A.stride(0) % 4 == 0, "A must be fp16 [rows, H] with unit column stride");
     const int rows = A.size(0);
     const int H = A.size(1);
+    const int lda = (int) A.stride(0);
     TORCH_CHECK(selected.dtype() == at::kLong && selected.is_contiguous() && selected.dim() == 2 &&
                 selected.size(0) == rows, "selected must be int64 [rows, top_k]");
     const int top_k = selected.size(1);
@@ -1649,6 +1666,16 @@ void exl3_moe_prefill_wmma
     TORCH_CHECK(down_out.dtype() == at::kFloat && down_out.numel() >= (int64_t) assignments * H, "down_out too small");
     TORCH_CHECK(expert_offsets.dtype() == at::kLong && expert_offsets.numel() >= experts + 1, "expert_offsets");
     TORCH_CHECK(inverse_order.dtype() == at::kLong && inverse_order.numel() >= assignments, "inverse_order");
+    const half* add_ptr = nullptr;
+    int add_rows = 0;
+    if (addend.has_value())
+    {
+        const at::Tensor& ad = addend.value();
+        TORCH_CHECK(ad.dtype() == at::kHalf && ad.is_contiguous() && ad.dim() == 2 && ad.size(1) == H &&
+                    ad.size(0) <= rows && ad.device() == A.device(), "addend must be fp16 [<= rows, H] contiguous");
+        add_ptr = (const half*) ad.data_ptr();
+        add_rows = ad.size(0);
+    }
     const int kern = mpw_kern(assignments, experts);
     const int slots = tile_slots(assignments, experts, kern);
     TORCH_CHECK(tiles.dtype() == at::kInt && tiles.numel() >= slots, "tiles too small");
@@ -1666,20 +1693,20 @@ void exl3_moe_prefill_wmma
     ((const int64_t*) expert_count.data_ptr(), ord, offs, inv, tl, tc, (int) experts, assignments, mpw_mt(kern));
 
     const char* glue_env = getenv("EXL3_MPW_GLUE");   // read per launch (A/B harnesses flip it in-process)
-    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX;
+    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX && !add_ptr;
     if (glue2)
     {
         const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
         mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
         ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-         assignments, top_k, H);
+         assignments, top_k, H, lda);
     }
     else
     {
     const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
     mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
     ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-     assignments, top_k, H, 2);
+     assignments, top_k, H, 2, lda);
     }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,
@@ -1706,7 +1733,7 @@ void exl3_moe_prefill_wmma
     else
     mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
-     (float*) output.data_ptr(), rows, top_k, H);
+     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows);
     cuda_check(hipPeekAtLastError());
 }
 

@@ -14,6 +14,20 @@ def _pad_pitch_for(k: int) -> int:
     # keep in step with exllamav3_ext/pad_pitch.h pad_pitch_for
     return k + _PAD_ELEMS if (k * 2) % 1024 == 0 else k
 
+# EXL3_NC2_HC_YPAD=1 (attention site) / EXL3_NC2_HC_YPAD_MLP=1 (MLP site), read per call: the fused mix_norm writes
+# its normed output at the GEMM row pitch when the site accepts a row-padded input (params["hc_pad_ok"], set by the transformer), so the consumers' pad_copy_in disappears.
+# Same kernels, only the store address moves: bit-exact.
+def _hc_y_out(b: int, s: int, D: int, dev, params: dict) -> torch.Tensor:
+    R = b * s
+    site = params.get("hc_pad_ok")
+    flag = "EXL3_NC2_HC_YPAD_MLP" if site == "mlp" else "EXL3_NC2_HC_YPAD"
+    if site and R >= _PAD_MIN_ROWS and os.environ.get(flag, "0") == "1" \
+            and os.environ.get("EXL3_OPROJ_PAD", "1") != "0":
+        pitch = _pad_pitch_for(D)
+        if pitch != D:
+            return torch.empty((R, pitch), dtype = torch.half, device = dev)[:, :D].view(b, s, D)
+    return torch.empty((b, s, D), dtype = torch.half, device = dev)
+
 # gfx1151: store the GatedResidual mixer weights (the only fp16 bulk in an EXL3 model, 22% of
 # decode weight bytes) as per-row int8 and dequantize in the fused kernel. ROCm only; opt out
 # with EXL3_HIP_GR_MIX_Q8=0.
@@ -366,7 +380,7 @@ class HyperConnection(Module):
         partials = torch.empty((R, 1, M1), dtype = torch.float, device = dev)
         post = torch.empty((R, H), dtype = torch.float, device = dev)
         comb = torch.empty((R, H * H), dtype = torch.float, device = dev).view(R, H, H)
-        y = torch.empty((b, s, D), dtype = torch.half, device = dev)
+        y = _hc_y_out(b, s, D, dev, params)
         ext.hc_pf_apply_mix_norm(streams.view(R, H, D), ya.contiguous().view(R, D),
                                  post_a.contiguous().view(R, H), comb_a.contiguous().view(R, H, H),
                                  fn, self.base, self.scale, self.rms_eps, self.hc_eps,
@@ -408,7 +422,7 @@ class HyperConnection(Module):
             fn = self.fn_h
         else:
             fn = self.fn
-        y = torch.empty((b, s, D), dtype = torch.half, device = dev)
+        y = _hc_y_out(b, s, D, dev, params)
         ext.hc_mix_norm(streams.view(R, H, D), fn, self.base, self.scale, self.rms_eps, self.hc_eps,
                         self.sinkhorn_iters, partials, post, comb, y.view(R, D), w,
                         norm.rms_norm_eps, norm.constant_bias, norm.constant_scale)
