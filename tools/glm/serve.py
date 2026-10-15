@@ -88,6 +88,16 @@ SPEED_ENV = {
     "EXL3_PF_GLUE": "1",
     "EXL3_PF_MSPLIT": "2048",
     "EXL3_PF_SKIP": "1",
+    # 14/10: verify of 5..8 rows (GLM_NGRAM lookup rounds of 4..7 copied tokens), the Qwen server's switches: MoE row split,
+    # one-launch 8-row fused MoE, one-launch 6-row dense GEMV. Bit-identical per row, rows <= 4 untouched (--num-draft 2 rounds).
+    # Harness, one load each: 6-row round +6.9 % (RM6), 8-row round +2.6 %, ids equal. 0 = off.
+    "EXL3_VERIFY_ROW_SPLIT": "2",
+    "EXL3_MOE_R8": "1",
+    "EXL3_GEMV_R_RM6": "1",
+    # 14/10: sampled requests (temperature > 0) draw the MTP drafts from the drafter's own law and keep them with the exact
+    # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
+    # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
+    "EXL3_SPEC_SAMPLED": "1",
 }
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
@@ -116,6 +126,50 @@ def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
           f"{EH_SIDECAR_DEFAULT}): running without it, draft acceptance is lower. To add it: python "
           "tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model folder>/" + EH_SIDECAR_IN_PACK,
           flush=True)
+    return "absent"
+
+
+DRAFT2S_IN_PACK = "draft2s.st"  # safetensors layout, but not *.safetensors so the weight loader never indexes it
+
+
+def _draft2s_pack_matches(path: Path, model_dir: Path) -> bool:
+    """True when the pack header (tools/qwen/draft2s_pack.py metadata) was built for this model's vocabulary and width."""
+    import struct
+    try:
+        with open(path, "rb") as fh:
+            meta = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0])).get("__metadata__") or {}
+        cfg = json.loads((model_dir / "config.json").read_text())
+        cfg = cfg.get("text_config", cfg)
+        return meta.get("format") == "draft2s-v1" and int(meta["vocab"]) == cfg["vocab_size"] \
+            and int(meta["in_features"]) == cfg["hidden_size"]
+    except (OSError, ValueError, KeyError, struct.error):
+        return False
+
+
+def apply_draft2s_default(model_dir: str | None = None) -> str:
+    """Pick the optional two-stage draft head pack (EXL3_DRAFT2S, exllamav3/modules/draft2s.py) and log which source is used.
+
+    Order: explicit EXL3_DRAFT2S (never touched; "", "0" or "off" = off) > DRAFT2S_IN_PACK inside the model folder when its
+    header matches the model (vocab_size, hidden_size) > absent. The head only changes how the draft argmax is found, never
+    the output (every draft is verified). Returns the source: "explicit", "off", "pack", "mismatch" or "absent".
+    """
+    if "EXL3_DRAFT2S" in os.environ:
+        if os.environ["EXL3_DRAFT2S"].strip().lower() in ("", "0", "off"):
+            os.environ["EXL3_DRAFT2S"] = ""
+            print("serve: two-stage draft head: off (EXL3_DRAFT2S)", flush=True)
+            return "off"
+        print(f"serve: two-stage draft head: EXL3_DRAFT2S={os.environ['EXL3_DRAFT2S']} (explicit)", flush=True)
+        return "explicit"
+    if model_dir:
+        path = Path(model_dir).expanduser() / DRAFT2S_IN_PACK
+        if path.is_file():
+            if not _draft2s_pack_matches(path, Path(model_dir).expanduser()):
+                print(f"serve: two-stage draft head: {path} does not match this model (vocab / width): not used", flush=True)
+                return "mismatch"
+            os.environ["EXL3_DRAFT2S"] = str(path)
+            print(f"serve: two-stage draft head: {path} (model folder)", flush=True)
+            return "pack"
+    print(f"serve: two-stage draft head: none ({DRAFT2S_IN_PACK} not in the model folder): full draft head", flush=True)
     return "absent"
 
 
@@ -336,7 +390,7 @@ def load_image(url: str) -> tuple[Any, str]:
         raise _bad(f"cannot decode image: {exc}") from exc
 
 
-MAX_SESSIONS = 16   # Cache default max_batch_size (recurrent state slots)
+MAX_SESSIONS = 16   # upper bound of --sessions (the Cache default max_batch_size)
 
 
 class ResidentEngine:
@@ -354,9 +408,10 @@ class ResidentEngine:
         self.torch = torch
         self.Job = Job
         self.num_draft = num_draft
-        # Concurrent requests batched through the one Generator. The recurrent (KDA) state has Cache.max_batch_size = 16
-        # slots whatever the value (the Cache default, allocated in every case), so up to MAX_SESSIONS sessions cost no
-        # extra state memory; the paged KV pool (ctx + 4096 tokens) is shared by all sessions.
+        # Concurrent requests batched through the one Generator. The recurrent (KDA) state is allocated per slot and per
+        # history level (138 MiB each). The Cache default of 16 slots was allocated whatever --sessions said: 6.6 GiB at
+        # --num-draft 2, of which a single session uses 0.4 GiB. The cache now gets one slot per session (the Generator
+        # caps its batch at the slot count, the admission gate at --sessions). EXL3_GLM_SLOTS=16 restores the old layout. The paged KV pool (ctx + 4096 tokens) is shared by all sessions.
         if not 1 <= sessions <= MAX_SESSIONS:
             raise ValueError(f"sessions must be 1..{MAX_SESSIONS}")
         self.sessions = sessions
@@ -368,14 +423,27 @@ class ResidentEngine:
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
+        slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
+        # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
+        # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
+        # --num-draft tokens. K rows beyond the first need K history levels (138 MiB each per slot). Default 2,7,16,3 with
+        # one session (copy / edit turns +26 %, +0.67 GiB; greedy text may change at an fp16 tie), off with more sessions
+        # (lookup rounds need a single active request and the history cost grows per slot). GLM_NGRAM=off turns it off.
+        v = (os.environ.get("GLM_NGRAM") or ("2,7,16,3" if sessions == 1 else "off")).strip().lower()
+        self.lookup = None if v in ("off", "0", "none") or num_draft < 1 else tuple(int(x) for x in v.split(","))
+        if self.lookup:
+            if not (3 <= len(self.lookup) <= 4 and 1 <= self.lookup[0] <= 16 and self.lookup[1] >= 1 and self.lookup[2] >= self.lookup[0]):
+                raise ValueError(f"GLM_NGRAM={v}")
+            max_history = max(max_history, self.lookup[1])
+        self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
-                           max_history=max_history)
+                           max_history=max_history, max_batch_size=slots)
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                     max_history=max_history)
+                                     max_history=max_history, max_batch_size=slots)
             startup_health.stage("drafter weights")
             self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
@@ -387,6 +455,14 @@ class ResidentEngine:
         self.supports_vision = self.vision is not None
         self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
         self.Generator = Generator
+        # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
+        # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: four
+        # server loads in both orders give +2.1 % first-token rate at 8K and +7.9 % at 2K. The Qwen server has it on.
+        if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
+            import gc
+            gc.collect()
+            gc.freeze()
         self.greedy_generator = self._make_generator()
         # n1f2: one drafted token, fused catch-up variant 2. One Generator only: a second one over the
         # same Cache takes ownership and breaks the first. Sampling also goes through MTP: a draft is
@@ -395,10 +471,20 @@ class ResidentEngine:
         os.environ.setdefault("EXL3_MOE_UNION_V2", "1")  # the "+v2" of n1f2+v2
 
     def _make_generator(self):
-        return self.Generator(
+        lookup = getattr(self, "lookup", None)
+        g = self.Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
-            draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.num_draft or None,
+            draft_model=self.draft_model, draft_cache=self.draft_cache,
+            num_draft_tokens=max(self.num_draft, lookup[1] if lookup else 0) or None,   # buffers for the widest round
             record_draft_stats=True)
+        if lookup:
+            qdir = str(Path(__file__).resolve().parent.parent / "qwen")
+            if qdir not in sys.path:
+                sys.path.append(qdir)
+            import spec_policy
+            spec_policy.install_lookup(g, lookup, self.lookup_stats)
+            g.num_draft_tokens = self.num_draft     # the drafter's own depth; lookup rounds bring their K tokens
+        return g
 
     def _rebuild_generator(self) -> None:
         """A fresh Generator over the same Cache (one at a time: a second one takes the Cache over). It drops the whole prompt
@@ -1436,6 +1522,7 @@ def main() -> None:
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
+    apply_draft2s_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and os.environ["EXL3_DENSE_GEMM_TUNE"] != "0" and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])

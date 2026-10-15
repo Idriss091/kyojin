@@ -101,6 +101,12 @@ Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the co
 and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
 single-kernel absorbed-form prefill for A/B testing.
 
+### `EXL3_MLA_DEC_VALU` (default: `1` on HIP)
+
+Decode and verify rows (up to 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels. The output is
+bitwise equal to the Triton path. `0` turns it off. If the extension build lacks the kernels, the Triton path is used and
+one log line says so.
+
 ### `EXL3_PREFER_FA2` (default: `0`)
 
 Put the flash-attn-2 backends ahead of the built-in Triton attention kernels in the dispatch
@@ -831,6 +837,13 @@ draft acceptance without changing target token ids. `0` turns it off; a path tha
 stops the load. The GLM server looks for the file itself in three places, listed in
 [tools/glm/SERVE.md](../tools/glm/SERVE.md).
 
+#### `EXL3_DRAFT2S` (default: `<model folder>/draft2s.st` when present and matching)
+
+Two-stage draft head for the MTP drafters: it finds the draft argmax in two steps instead of one pass over the full
+vocabulary. Every draft is still verified, so the output does not change. The GLM and Qwen servers pick up
+`draft2s.st` from the model folder when its header (vocabulary size, hidden width) matches `config.json`. A path in the
+variable wins; `0`, `off` or an empty value uses the full head. Sampled jobs always use the full head.
+
 #### `EXL3_MIMO_LOSSLESS` (default: `1`)
 
 `0` restores the fast MiMo verify that is not token-identical. With it on, speculative output
@@ -937,6 +950,10 @@ latch the value at import.
 | `EXL3_BIG_TAIL_DENSE` | `1` | On a sparse single-session decode pass longer than the query-length cap, lets the tail attend densely instead of sparsely. |
 | `EXL3_PREFILL_BIG_CHUNK_MAXPOS` | `32768` | From this position on, prefill goes back to plain chunks, which lowers peak memory at very long context. `0` is off. |
 | `EXL3_MOE_UNION_V2` | `1` | The v2 union MoE table, which stays on the device instead of synchronizing to the host. Already the engine default; `0` disables it. |
+| `EXL3_VERIFY_ROW_SPLIT` | `2` | Same switch as in the Qwen table: a verify round of 5 to 8 rows (copy-lookup rounds) runs as fused sub-calls. Rows 4 and below are unchanged. |
+| `EXL3_MOE_R8` | `1` | Same switch as in the Qwen table: rows 5 to 8 run as one fused MoE launch. |
+| `EXL3_GEMV_R_RM6` | `1` | Same switch as in the Qwen table: 5 or 6 rows run in one launch of the 6-row dense GEMV. |
+| `EXL3_SPEC_SAMPLED` | `1` | See the speculative-decoding entries below. The engine default is `0`; the GLM server turns it on. |
 
 #### MiMo: the defaults in `tools/mimo/serve.py`
 
@@ -956,6 +973,17 @@ latch the value at import.
 
 The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE` and
 `EXL3_DENSE_GEMM_TUNE_FILE`, all covered above.
+
+#### Speculative decoding and start-up options of the GLM and Qwen servers
+
+| variable | default | what it does |
+|---|---|---|
+| `GLM_NGRAM` | `2,7,16,3` with one session, `off` with more | Copy lookup for the GLM server, as `gram,K,match[,cmin]`. When the last `match` tokens of the context appeared before, the next round verifies the `K` tokens that followed them, instead of the drafter's tokens. `cmin` cuts the copy where the two latest occurrences stop agreeing, and drops it if that leaves fewer than `cmin` tokens. The default copies 7 tokens after a 16-token match. It speeds up requests that copy or edit text; other requests are unchanged. It needs about 0.7 GiB of GPU memory more. It works only while one request is active. `off` (or `0`, `none`) turns it off, and so does `--num-draft 0`. A malformed value stops the server at start. With greedy decoding, a near-tie in a long answer can make the text differ from a run without lookup. |
+| `QWSPEC_NGRAM` | `2,7,16,3` | The same copy lookup for the Qwen server, in the same format. `2,3,5` gives the earlier setting (a 5-token match, 3 copied tokens). `off` turns it off. |
+| `QWSPEC_NGRAM_IDX` | `1` | Builds the lookup index when the request is queued, so its cost lands in the time to first token and not in the first decode round. `0` builds it lazily and also turns off the `cmin` check. |
+| `EXL3_SPEC_SAMPLED` | engine `0`; the GLM server sets `1` | For requests with temperature above 0 and an MTP drafter: the drafter draws its tokens from its own distribution, and the verify keeps each one with probability min(1, p/q), or resamples from the remainder. The output has the same distribution as plain sampling. Greedy requests are untouched. `0` goes back to taking the drafter's top token. The Qwen server does not set it. |
+| `EXL3_GLM_SLOTS` | `0` (one recurrent state slot per session) | Minimum number of recurrent state slots the GLM server allocates. The default sizes them to `--sessions`, which frees about 6 GiB of GPU memory at one session. `16` restores the earlier layout. |
+| `EXL3_GC_FREEZE` | Qwen server `1`, GLM server `0` | Moves the loaded model and tokenizer objects out of the Python garbage collector before the first generator is built. Without it, rebuilding the generator (for example after a `cache_salt` change) pays a collector pass of about 0.5 s inside the time to first token. `0` leaves them in the collector. |
 
 ### Server state
 

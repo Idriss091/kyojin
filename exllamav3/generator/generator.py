@@ -20,6 +20,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job, _ttrace_begin, _ttrace_end
+from . import spec_sample
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -340,6 +341,8 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        # Sampled-draft round (spec_sample): (job, sampler params, draft laws per depth) for the next verify
+        self._spec_round = None
         # Lazy drafter KV catch-up: plain 1-row steps do not feed the drafter cache, they park the
         # target hidden rows here and the next drafting round (or a flush point) writes them in one pass
         self._dkv_pending = None
@@ -848,6 +851,7 @@ class Generator:
 
     def iterate_draftmodel_mtp_gen(self, results: list):
 
+        self._spec_round = None
         if self._mtp_defer_gate():
             return None
         self._draft_conf_round = None
@@ -930,6 +934,16 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # A sampled job (T > 0) draws its drafts from the drafter's law under its own sampler (spec_sample)
+        spec_job = spec_prm = None
+        if spec_sample.SPEC_SAMPLED and batch_size == 1:
+            spec_job = next(j for j in self.active_jobs if j.is_prefill_done())
+            spec_prm = spec_sample.eligible(spec_job)
+        spec_q = []
+        if spec_prm is not None:
+            # Filled depth by depth: a draft policy that stops the loop early (tools/qwen/spec_policy StopDraft) verifies
+            # a prefix of draft_ids_pinned, whose laws are all recorded by then
+            self._spec_round = (spec_job, spec_prm, spec_q)
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -940,6 +954,8 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
+            if spec_prm is not None:
+                params["export_draft_logits"] = True
             if idx == 0 and n_pend and _mtp_fuse_catchup() == 2:
                 params["dflash_verify"] = True
             batch_state = self.draft_model.forward(first_ids if idx == 0 else batch_ids, params)
@@ -948,6 +964,14 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
+            if spec_prm is not None:
+                dl = params.pop("draft_logits", None)
+                if dl is None:
+                    spec_prm = self._spec_round = None
+                else:
+                    q = spec_sample.law(dl[0, -1, :], spec_prm)
+                    spec_q.append(q)
+                    new_ids = spec_sample.draw(q, spec_job.rng.random()).view(1, 1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1 + (n_pend if idx == 0 else 0)
@@ -1472,11 +1496,22 @@ class Generator:
                 # One bulk D2H + one synchronize replaces one sync per position; the consume
                 # loop below is unchanged, so RNG order, accept logic and ids are identical.
                 npos = batch_logits.shape[1]
+                # Sampled-draft round: the draft positions take the spec_sample keep / residual rule, only the last
+                # (bonus) position samples from the target as usual. Applies only to drafts read from the drafter's own
+                # buffer, for which this round recorded a law per position (a lookup round brings its own tensor of
+                # copied tokens: a deterministic draft keeps the argmax rule)
+                spec = None
+                sr = self._spec_round
+                if sr is not None and sr[0] is job and draft_tokens is not None and len(sr[2]) >= npos - 1 and \
+                        draft_tokens.data_ptr() == self.draft_ids_pinned.data_ptr():
+                    spec = [(spec_sample.verify(job_logits[0, pi, :], sr[2][pi], int(draft_tokens[j, pi]), sr[1], job.rng),
+                             None, None, None) for pi in range(npos - 1)]
                 pre = None
                 if draft_tokens is not None and _host_lean() and _lean_verify_job(job, b - a):
                     launched = []
                     for pi in range(npos):
-                        launched.append(job.receive_logits(job_logits[:, pi:pi + 1, :]))
+                        launched.append(spec[pi] if spec is not None and pi < npos - 1 else
+                                        job.receive_logits(job_logits[:, pi:pi + 1, :]))
                     n_dev = sum(1 for s in launched
                                 if s[0] is not None and s[0].is_cuda and s[0].numel() == 1)
                     if n_dev == len(launched):
@@ -1493,6 +1528,8 @@ class Generator:
                     token_logits = job_logits[:, i:i + 1, :]
                     if pre is not None:
                         next_token, next_k_tokens, next_k_probs, next_prob = pre[i]
+                    elif spec is not None and i < npos - 1:
+                        next_token, next_k_tokens, next_k_probs, next_prob = spec[i]
                     else:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                             token_logits,

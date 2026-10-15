@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
 
+
+def _write_draft2s_pack(path, vocab, width):
+    """A header-only draft2s pack (tools/qwen/draft2s_pack.py metadata layout) for the sidecar tests."""
+    import json as _json, struct
+    hdr = _json.dumps({"__metadata__": {"format": "draft2s-v1", "vocab": str(vocab), "in_features": str(width), "m": "512"}}).encode()
+    path.write_bytes(struct.pack("<Q", len(hdr)) + hdr)
+
+
 class SharedModuleTests(unittest.TestCase):
     def test_serve_metrics_resolves_next_to_the_server(self):
         # serve.py loads tools/mimo/serve.py, which imports serve_metrics from the sys.path of this folder
@@ -81,6 +89,31 @@ def sse_events(raw: str):
 
 
 class ParserTests(unittest.TestCase):
+    def test_draft2s_sidecar(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}):
+            pack = Path(d)
+            (pack / "config.json").write_text(json.dumps({"vocab_size": 248320, "hidden_size": 2560}))
+            os.environ.pop("EXL3_DRAFT2S", None)
+            self.assertIn("no draft2s.st", serve.configure_draft2s(str(pack)))
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 154880, 4096)       # GLM's head: not this model
+            self.assertIn("does not match", serve.configure_draft2s(str(pack)))
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 248320, 2560)
+            self.assertIn("two-stage", serve.configure_draft2s(str(pack)))
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], str(pack / "draft2s.st"))
+            os.environ["EXL3_DRAFT2S"] = "/nope/x.st"
+            self.assertIn("/nope/x.st", serve.configure_draft2s(str(pack)))
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], "/nope/x.st")
+            for value in ("0", "off", ""):
+                os.environ["EXL3_DRAFT2S"] = value
+                self.assertIn("full head", serve.configure_draft2s(str(pack)))
+                self.assertEqual(os.environ["EXL3_DRAFT2S"], "")
+        self.assertNotIn("EXL3_DRAFT2S", dict(serve.SERVE_ENV))
+        self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
+
     def test_reasoning_first_split(self):
         m = serve.split_completion("let me think\nmore\n</think>\n\nThe answer.\n", True, None)
         self.assertEqual(m["reasoning_content"], "let me think\nmore")

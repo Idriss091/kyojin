@@ -41,6 +41,11 @@ wins): `EXL3_CONV_GEMM=1`, `EXL3_DENSE_GEMM_TUNE=0`, `EXL3_MOE_UNION_V2=1`, `EXL
 `Generator.MTP_FUSE_CATCHUP = 2`. There is no `--temperature`/seed handling beyond the
 request body.
 
+Copy lookup (`GLM_NGRAM`), sampled drafts (`EXL3_SPEC_SAMPLED`), the recurrent slot count (`EXL3_GLM_SLOTS`) and the
+collector freeze (`EXL3_GC_FREEZE`) are described in [doc/env_vars.md](../../doc/env_vars.md).
+The lookup code is `tools/qwen/spec_policy.py`, which the GLM server finds through its own file path, so `tools/qwen`
+must ship next to `tools/glm`.
+
 ### MTP sidecar (higher draft acceptance)
 
 The pack stores the MTP `eh_proj` at 2 bits. The pack also ships an unquantized copy,
@@ -61,6 +66,16 @@ To build it yourself from the official GLM-5.3 checkpoint:
 ```bash
 python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model folder>/mtp_eh_proj.st
 ```
+
+### Two-stage draft head (faster drafting)
+
+If `draft2s.st` is in the model folder and its header matches `config.json` (vocabulary size and hidden width), the
+server uses it as the two-stage draft head. No flag needed. It changes only how the draft is found; target token ids
+stay equal. Sampled jobs keep the full head. One log line says which source was used. `EXL3_DRAFT2S=<path>` picks
+another pack; `EXL3_DRAFT2S=off` turns it off. Build one with `tools/qwen/draft2s_pack.py`.
+
+The GLM MLA decode kernels (VALU path, bitwise equal to the Triton path) are also on by default.
+`EXL3_MLA_DEC_VALU=0` turns them off.
 
 ## Endpoints
 

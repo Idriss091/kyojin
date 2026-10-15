@@ -550,6 +550,8 @@
                   $out/share/kyojin/$flavor/
                 # qwen/serve.py imports spec_policy at draft-build time
                 # (sibling import, resolved relative to its own file).
+                # glm/serve.py imports the same file from ../qwen (path built
+                # from its own location), so the qwen flavor must ship too.
                 [ "$flavor" = qwen ] && cp $src/tools/$flavor/spec_policy.py \
                   $out/share/kyojin/$flavor/
                 # chat templates live next to the scripts (qwen/mimo) or in

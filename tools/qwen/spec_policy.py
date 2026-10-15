@@ -52,6 +52,7 @@ class NgramIndex:
         self.prev = [None] + [array("i", [-1]) if m >= nmin else None for m in range(1, lmax + 1)]
         self.latest = [None] + [{} if m >= nmin else None for m in range(1, lmax + 1)]
         self.fallbacks = 0
+        self._hit = None
 
     def __len__(self):
         return len(self.toks)
@@ -134,6 +135,7 @@ class NgramIndex:
     def match(self, K):
         """Same value as ngram_match(ctx, nmin, K) on ctx = the indexed tokens."""
         toks = self.toks; n = len(toks); nmin = self.nmin
+        self._hit = None
         if n < nmin + 1: return (0, [])
         prev = self.prev
         for m in range(self.lmax, nmin - 1, -1):
@@ -151,7 +153,19 @@ class NgramIndex:
         if not ok:
             self.fallbacks += 1
             return ngram_match(toks.tolist(), nmin, K)
+        self._hit = (j, m)
         return (L, toks[j:j + K].tolist())
+
+    def witness_len(self, cont):
+        """After match(): how many leading tokens of its continuation the PREVIOUS occurrence of the matched gram also
+        continues with. len(cont) when there is no previous occurrence (a single witness cannot be checked)."""
+        if self._hit is None: return len(cont)
+        j, m = self._hit; toks = self.toks
+        j2 = self.prev[m][j]
+        if j2 < m or toks[j2 - m:j2] != toks[j - m:j]: return len(cont)
+        a = 0
+        while a < len(cont) and toks[j2 + a] == cont[a]: a += 1
+        return a
 
     def sync_array(self, ids):
         """Make the index equal to ids (numpy int array): keep the longest common prefix, roll back, add the rest."""
@@ -313,6 +327,65 @@ def env_defaults(ndt):
     """(thf, thv, maxd) for install(): today's 0.6 / 0.3 / ndt unless QWSPEC_THF / QWSPEC_THV / QWSPEC_MAXD are set."""
     return _envf("QWSPEC_THF", 0.6), _envf("QWSPEC_THV", 0.3), _envf("QWSPEC_MAXD", int(ndt))
 
+def ngram_from_env(default=(2, 7, 16, 3)):
+    """n-gram lookup setting for install(): (gram, K, match[, cmin]) from QWSPEC_NGRAM = "gram,K,match[,cmin]"; "off" = no
+    lookup (None). cmin: see install(); 0 or absent = no second-occurrence check.
+    Default (2, 7, 16, 3): the lookup replaces the drafter only on a match of 16 tokens or more and then drafts 7 tokens.
+    The former (2, 3, 5) dates from the time the drafter stopped at 3 drafts. With the deep tier the drafter keeps 4-5 drafts
+    on JSON and code where a 5-token match (keys, punctuation, idioms) copies the wrong values: lookup rounds accepted
+    1.7 of 3 drafts there against 5.1 of 5.5 for drafter rounds, and on a plain copy 3 drafts per round is less than the
+    drafter gives alone. QWSPEC_NGRAM=2,3,5 restores the former setting.
+    cmin 3: on templated lists (SQL rows, log lines, table rows) a 16-token match is the constant part of a row and the
+    7 copied tokens ran into the value that changes (0 to 3.9 of 7 accepted, 3-6 % slower than no lookup); cut at the point
+    where the two latest rows differ, the lookup is level with "off" there and keeps its gain on copies and edits."""
+    v = (os.environ.get("QWSPEC_NGRAM") or "").strip().lower()
+    if v == "": return default
+    if v in ("off", "0", "none"): return None
+    f = [int(x) for x in v.split(",")]
+    g, k, m = f[:3]
+    if not (3 <= len(f) <= 4 and 1 <= g <= LMAX and k >= 1 and m >= g and min(f) >= 0): raise ValueError(f"QWSPEC_NGRAM={v}")
+    return tuple(f)
+
+def install_lookup(g, ngram, stats=None):
+    """The n-gram lookup alone, for a Generator whose drafter keeps its own fixed depth (GLM): no depth rule, no read of the
+    draft probabilities. ngram = (nmin, K, lmin[, cmin]) as in install(). When the context suffix (>= lmin tokens) occurred
+    before, the round verifies its continuation (K tokens, cut by cmin as in install()) and runs ONE draft forward so the
+    drafter cache has no hole; every other round is the Generator's own. Only with a single active request. The cache
+    needs max_history >= K. Returns an uninstall function."""
+    fol = SeqFollower(ngram[0]); K, lmin = ngram[1], ngram[2]; cmin = ngram[3] if len(ngram) > 3 else 0
+    orig = type(g).iterate_draftmodel_mtp_gen.__get__(g)
+    orig_enqueue = g.enqueue
+    def enq(job):
+        # prime the index at enqueue (as install()): its cold build lands in time-to-first-token, not in the first decode round
+        r = orig_enqueue(job)
+        if os.environ.get("QWSPEC_NGRAM_IDX", "1") != "0":
+            for j in (job if isinstance(job, list) else [job]):
+                if len(getattr(j, "sequences", ())) == 1: fol.sync(j.sequences[0].sequence_ids)
+        return r
+    g.enqueue = enq
+    def wrapped(results):
+        cont = None
+        if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
+            idx = fol.sync(g.active_jobs[0].sequences[0].sequence_ids)
+            L, c = idx.match(K)
+            if L >= lmin and c:
+                cont = c
+                if cmin > 0:
+                    a = idx.witness_len(c)
+                    if a < len(c): cont = c[:a] if a >= cmin else None
+        if cont is None: return orig(results)
+        w = g.num_draft_tokens; g.num_draft_tokens = 1
+        try: out = orig(results)
+        finally: g.num_draft_tokens = w
+        if out is None: return None
+        if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + len(cont)
+        return torch.tensor([cont], dtype=torch.long)
+    g.iterate_draftmodel_mtp_gen = wrapped
+    def uninstall():
+        g.__dict__.pop("iterate_draftmodel_mtp_gen", None)
+        if g.__dict__.get("enqueue") is enq: g.__dict__.pop("enqueue")
+    return uninstall
+
 def rule_from_env(thf, thv, maxd):
     """QWSPEC_RULE = tier (default) | product (the former 0.6/0.3/3 rule when maxd=3) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
     QWSPEC_FIXD = N: draft N depths with no host read and truncate once per round (rule applied on the stacked probabilities)."""
@@ -336,7 +409,10 @@ def apply_rule(rule, ps):
     return keep
 
 def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule=None, fixed=None, log=None, log_depth=7):
-    """ngram = (nmin, K, lmin) or None. Returns an uninstall function.
+    """ngram = (nmin, K, lmin) or (nmin, K, lmin, cmin) or None. Returns an uninstall function.
+    cmin > 0: when the matched gram has a previous occurrence too, only the tokens that BOTH occurrences continue with are
+      copied (a templated list repeats its constant part and changes its values: the copy stops where the two rows differ),
+      and the lookup is taken only if at least cmin tokens are left, else the round is a drafter round.
     rule: a depth rule (default ProductRule(thf, thv, maxd) = the shipped rule).
     fixed = N: no host read per depth; N depths are drafted, the max probabilities stay on the device and one read per
       round feeds the rule, which then truncates (rows kept <= N + 1).
@@ -367,10 +443,12 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         return orig_fwd(*a, **k)
     def sfs(state, params):
         ids = orig_sfs(state, params)
+        dp = params.pop("draft_p", None)      # EXL3_DRAFT2S head: its max probability (lm.forward did not run: cap["lg"] is stale)
         if st["mode"] == "mtp" and not getattr(rule, "needs_p", True):
             return ids
         if st["mode"] == "mtp":
-            pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
+            if dp is not None: pt = dp.reshape(())
+            else: pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
             i = st["i"]
             if fixed is not None:
                 st["ps"].append(pt); st["i"] = i + 1
@@ -419,7 +497,13 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
                     if ref != (L, c):
                         if stats is not None: stats["shadow_bad"] = stats.get("shadow_bad", 0) + 1
                         raise RuntimeError(f"ngram index mismatch at n={n}: old {ref} new {(L, c)}")
-            if L >= ngram[2] and c: cont = c
+            if L >= ngram[2] and c:
+                cont = c
+                if len(ngram) > 3 and ngram[3] > 0 and os.environ.get("QWSPEC_NGRAM_IDX", "1") != "0":
+                    a = fol.idx.witness_len(c)
+                    if a < len(c):
+                        cont = c[:a] if a >= ngram[3] else None
+                        if stats is not None: stats["ng_cut" if cont else "ng_skip"] = stats.get("ng_cut" if cont else "ng_skip", 0) + 1
         if cont is not None:
             st["mode"] = "ng"; g.num_draft_tokens = 1
             try: out = orig_draft(results)

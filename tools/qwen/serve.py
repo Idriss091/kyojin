@@ -589,6 +589,37 @@ def configure_hc_sidecar(model_path: str) -> str:
     return f"hc mixer: group scales, plain rounding (no {HC_GS_SIDECAR} in the model directory)"
 
 
+DRAFT2S_IN_PACK = "draft2s.st"  # safetensors layout, but not *.safetensors so the weight loader never indexes it
+
+
+def configure_draft2s(model_path: str) -> str:
+    """Point EXL3_DRAFT2S (two-stage draft head, exllamav3/modules/draft2s.py) at <model_path>/draft2s.st when the
+    variable is unset, the file exists and its header was built for this model (vocab_size, hidden_size). "", "0" or "off" =
+    off. The head only changes how the draft argmax is found, never the output (every draft is verified). Returns the log line."""
+    env = os.environ.get("EXL3_DRAFT2S")
+    if env is not None:
+        if env.strip().lower() in ("", "0", "off"):
+            os.environ["EXL3_DRAFT2S"] = ""
+            return "draft head: full head (EXL3_DRAFT2S off)"
+        return f"draft head: two-stage, pack {env} (EXL3_DRAFT2S)"
+    f = Path(model_path).expanduser() / DRAFT2S_IN_PACK
+    if not f.is_file():
+        return f"draft head: full head (no {DRAFT2S_IN_PACK} in the model directory)"
+    import struct
+    try:
+        with open(f, "rb") as fh:
+            meta = json.loads(fh.read(struct.unpack("<Q", fh.read(8))[0])).get("__metadata__") or {}
+        cfg = json.loads((Path(model_path).expanduser() / "config.json").read_text())
+        cfg = cfg.get("text_config", cfg)
+        ok = meta.get("format") == "draft2s-v1" and int(meta["vocab"]) == cfg["vocab_size"] \
+            and int(meta["in_features"]) == cfg["hidden_size"]
+    except (OSError, ValueError, KeyError, struct.error):
+        ok = False
+    if not ok:
+        return f"draft head: full head ({f} does not match this model: not used)"
+    os.environ["EXL3_DRAFT2S"] = str(f)
+    return f"draft head: two-stage, pack {f}"
+
 def _env_flag(name: str, default: str, off: tuple = ("", "0")) -> bool:
     return os.environ.get(name, default) not in off
 
@@ -633,6 +664,7 @@ class QwenEngine:
             os.environ.setdefault(k, v)
         check_latched_env()
         print("qserve:", configure_hc_sidecar(model_path), flush=True)
+        print("qserve:", configure_draft2s(model_path), flush=True)
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
@@ -685,6 +717,12 @@ class QwenEngine:
         self.spec_on = self.draft_model is not None
         self.slot_store = None
         self.last_stats: dict[str, Any] = {}
+        # The loaded model and tokenizer are about 1.9 M Python objects, and every later gc.collect() walked them all: the Generator
+        # rebuild of a cache_salt change or cache_prompt=false spent 0.5 s there, inside time to first token (0.53 -> 0.03 s).
+        # Keep them out of the collector, before the first Generator exists (a frozen Generator would never be freed). 0 = off.
+        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
+            gc.collect()
+            gc.freeze()
         self._build(self.spec_on)
 
     def _ngram_resident(self) -> None:
@@ -722,7 +760,7 @@ class QwenEngine:
             thf, thv, maxd = spec_policy.env_defaults(self.ndt)   # 0.6 / 0.3 / ndt unless QWSPEC_THF / THV / MAXD are set
             fx = os.environ.get("QWSPEC_FIXD")
             self.uninstall = spec_policy.install(self.generator, self.draft_model, self.model,
-                                                 thf, thv, maxd, (2, 3, 5), {},
+                                                 thf, thv, maxd, spec_policy.ngram_from_env(), {},
                                                  rule=spec_policy.rule_from_env(thf, thv, maxd), fixed=int(fx) if fx else None)
         self.spec_on = spec
         if self.slot_store is not None:

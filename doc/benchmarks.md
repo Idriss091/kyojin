@@ -19,8 +19,8 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 | Model | Pack | Prefill 8K | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Spec prose | Spec chat | Spec code |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 95 GB | 1481 | 1477 | 1436 | 1396 | 1347 | 45.7 | 48.3 | 66.8 |
-| GLM-5.3-Flash | 99.73 GB | 634 | 637 | 613 | 589 | 567 | 26.2 | 31.4 | 33.4 |
+| Qwen3.8-Flash-Next | 95 GB | 1494 | 1478 | 1466 | 1406 | 1353 | 47.5 | 52.8 | 73.2 |
+| GLM-5.3-Flash | 99.73 GB | 652 | 645 | 598 | 566 | 554 | 27.4 | 30.0 | 36.8 |
 | MiMo-V2.6-Flash | 105.8 GB | 760 | 702 | 599 | 458 | - | 28.9 | 31.2 | 37.0 |
 
 Kyojin 1.5, same recipe on a second Ryzen AI Max+ 395 with 128 GB: Qwen3.8-Flash-Next 1486 / 1478 / 1454 / 1397 / 1349
@@ -37,8 +37,8 @@ GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once
 
 | Model | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
-| GLM-5.3-Flash | 31.1 | 30.7 | 30.0 | 32.1 | 32.3 |
+| Qwen3.8-Flash-Next | 52.4 | 48.1 | 49.3 | 43.0 | 44.3 |
+| GLM-5.3-Flash | 30.1 | 30.6 | 31.5 | 27.3 | 28.8 |
 | MiMo-V2.6-Flash | 29.8 | 23.4 | 17.4 | 12.9 | - |
 
 ## Where each figure comes from
@@ -75,7 +75,7 @@ Same machine, one method for every engine we ran: non-thinking chat, an essay re
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 1481 | 1477 | 1436 | 1396 | 1347 |
+| Kyojin | 1494 | 1478 | 1466 | 1406 | 1353 |
 | Gufo v0.8.0, measured by us | 1250 | 1308 | 1289 | 1230 | - |
 
 Strata prefill, independent measurement by Ciru Inference Lab ([report](https://llm.ciru.ai/strataflash/), 6 October 2026; cold prompts of 32K, 64K and 120K tokens; a different machine and different prompts; the lab states that it did not reproduce the publisher's exact workload and that the cause of the gap is not established): 795 / 762 / 709 tok/s at 32K / 64K / 120K.
@@ -86,11 +86,11 @@ Strata prefill, independent measurement by Ciru Inference Lab ([report](https://
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
+| Kyojin | 52.4 | 48.1 | 49.3 | 43.0 | 44.3 |
 | Gufo, measured by us | 35.3 | 31.9 | 35.8 | 31.4 | - |
 | Strata, measured by us | 39.0 | 38.7 | 36.4 | 35.0 | 37.5 |
 
-Card prompts (chat / prose / code): Kyojin 48.3 / 45.7 / 66.8; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
+Card prompts (chat / prose / code): Kyojin 52.8 / 47.5 / 73.2; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
 
 ### Fidelity to the original model
 
