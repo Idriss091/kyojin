@@ -1729,6 +1729,10 @@ class GatedDeltaNet(Module):
         if self.tp_reduce:
             params["backend"].all_reduce(x)
 
+        # EXL3_NC2_ATTN_F16 (default off): keep o_proj's fp16 output when the block asked for it (see MLAttention)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 

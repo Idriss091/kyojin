@@ -20,6 +20,14 @@ void silu_mul
     const float act_limit
 );
 
+void silu_mul_pitched
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    const float act_limit
+);
+
 void silu_oai_mul_gr
 (
     const at::Tensor& x,

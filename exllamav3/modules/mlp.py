@@ -12,6 +12,8 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 from .quant.exl3 import VERIFY_FUSE, MAX_BSZN_GEMV_R, dec_workspace
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch
+import os
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
@@ -786,8 +788,20 @@ class GatedMLP(Module):
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
-                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                    self.activation_fn_call(g, u, a, self.act_limit)
+                    # nc2 S1-rest (EXL3_NC2_SILU_PAD, default off): silu_mul writes its rows at the down projection's
+                    # padded pitch, so the down GEMM skips its pad_copy_in (same values, bit-exact)
+                    a_pitch = 0
+                    if os.environ.get("EXL3_NC2_SILU_PAD", "0") == "1" and self.activation_fn_call is ext.silu_mul and g.is_contiguous() and u.is_contiguous():
+                        ik = u.shape[-1]
+                        a_pitch = _row_pad_pitch(self.downs[s], ik, u.numel() // ik, params)
+                    if a_pitch:
+                        rows_ = u.numel() // ik
+                        a = torch.empty((rows_, a_pitch), dtype = torch.half, device = u.device)[:, :ik]
+                        ext.silu_mul_pitched(g, u, a, self.act_limit)
+                        a = a.view(*u.shape)
+                    else:
+                        a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                        self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params, torch.half if nc2_half else None)
 
                     if d is None: d = d_
