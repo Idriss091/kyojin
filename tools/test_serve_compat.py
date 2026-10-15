@@ -3,7 +3,7 @@
 
 The RigMark part runs bench.py (read-only, outside this repo) over real HTTP against qwen/serve.py and glm/serve.py with a
 fake engine that keeps a whole-prompt cache and drops it in reset_prefix_cache(). Model-free, CPU only. It is skipped when
-the RigMark source is not at $RIGMARK_SRC (default ~/hermes-work/rigmark/src).
+the RigMark source is not at $RIGMARK_SRC.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import serve_compat
 
-RIGMARK = Path(os.environ.get("RIGMARK_SRC", os.path.expanduser("~/hermes-work/rigmark/src")))
+RIGMARK = Path(os.environ.get("RIGMARK_SRC", "/nonexistent"))
 
 
 class HelperTests(unittest.TestCase):
