@@ -588,6 +588,10 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),
+             # GDN prefill in 16-row WY chunks (fla/hip/gdn_hf.hip, adapted from hipfire, fp32 forward-substitution inverse): one
+             # kernel per layer instead of kkt_solve + the chunk kernel. Not bitwise; PPL equal (4.91972 -> 4.91967 on 24 x 2048
+             # wiki rows) and closer to an exact fp32 GDN than the 64-row chain. 0 = off.
+             ("EXL3_GDN_HF", "1"),
              # verify of 5..8 rows (deep draft tier of spec_policy.TierRule): row split, one-launch fused MoE, one-launch 6-row dense GEMV;
              # bit-identical per row, rows <= 4 untouched. 0 = off.
              ("EXL3_VERIFY_ROW_SPLIT", "2"), ("EXL3_MOE_R8", "1"), ("EXL3_GEMV_R_RM6", "1"),
