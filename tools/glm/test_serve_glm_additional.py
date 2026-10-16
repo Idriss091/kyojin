@@ -354,6 +354,37 @@ class ImageDiskCacheTests(unittest.TestCase):
                 entry.rename(entry.with_name(entry.name.split(".", 1)[1]))
             self.assertEqual(disk._present(), {"key1", "key2"})
 
+    def test_a_write_that_was_killed_leaves_a_tmp_the_next_start_removes(self):
+        """One picture is written to `<name>.tmp` and moved onto its name, so a `.pt` is always complete.
+
+        A process that dies mid-write leaves the `.tmp`, which nothing else looks at: not the cap, not the
+        set of pictures present, not the eviction order. It is removed on the next start, but only once it
+        is old enough to be certainly nobody's live write - another process could be writing it, and the
+        servers cannot rule that out from here."""
+        import tempfile
+        import time
+        from image_cache_disk import STALE_TMP_S, ImageEmbeddingDisk
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = pathlib.Path(tmp) / "aaaa.deadbeef.q8.tmp"
+            stale.write_bytes(b"x" * 4096)
+            long_ago = time.time() - STALE_TMP_S - 60
+            os.utime(stale, (long_ago, long_ago))
+            fresh = pathlib.Path(tmp) / "aaaa.cafebabe.q8.tmp"
+            fresh.write_bytes(b"y" * 2048)
+
+            disk = ImageEmbeddingDisk(tmp, max_bytes=64 << 20, start_token=7, end_token=8,
+                                      env_fingerprint="aaaa")
+            self.assertFalse(stale.exists())                     # the leftover of a killed write
+            self.assertTrue(fresh.exists())                      # young: possibly somebody's live write
+            self.assertEqual(disk.report()["stale_tmp"], 1)
+            self.assertEqual(disk.report()["files"], 0)          # a tmp was never one of the pictures
+
+            os.utime(fresh, (long_ago, long_ago))
+            again = ImageEmbeddingDisk(tmp, max_bytes=64 << 20, start_token=7, end_token=8,
+                                       env_fingerprint="aaaa")
+            self.assertFalse(fresh.exists())
+            self.assertEqual(again.report()["stale_tmp"], 1)
+
     def test_the_disk_cache_needs_a_cap(self):
         # `--image-cache-dir-max-gb 0` (the default) is off; any positive value is a real cap, never "unlimited".
         self.assertIsNone(serve.make_image_disk(serve.IMAGE_CACHE_DIR_DEFAULT, 0, 300.0))

@@ -183,7 +183,10 @@ wherever `KYOJIN_HEALTH_DIR` points) is created with the process umask — its m
 other processes write there too.
 Two knobs bound it:
 `--image-cache-dir-max-gb` caps the directory and `--image-cache-dir-lock-s` caps how often a conversation can
-lose its place to another one.
+lose its place to another one. Each picture is written to `<name>.tmp` and moved onto its name, so a file that
+is there is always complete and a process killed mid-write leaves the `.tmp` behind; the next start removes
+those (keeping any younger than five minutes, which could still be another process's write) and reports how many
+in `stale_tmp`, since they take room the cap does not count.
 
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`

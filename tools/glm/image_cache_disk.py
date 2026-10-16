@@ -36,6 +36,14 @@ from exllamav3.tokenizer.mm_embedding import MMEmbedding, QuantizedMMRows
 from serve_reqlog import restrict, secure_dir, secure_open
 
 
+# A `.tmp` file is what a half-finished write leaves behind (a killed process, a full disk that was not
+# reported). It is only removed once it is this old: while it is being written it is milliseconds old,
+# and another server of the same directory cannot be ruled out by this module, so a fresh one is left in
+# peace. Five minutes is far beyond one write of one picture (a few milliseconds for a few MiB) and far
+# below the time it takes anyone to notice a crash and start again.
+STALE_TMP_S = 300.0
+
+
 def content_key(path: pathlib.Path) -> str:
     """The picture key out of a file name: `<env_fingerprint>.<key>.<mode>.pt`, or `<key>.<mode>.pt`.
 
@@ -119,12 +127,13 @@ class ImageEmbeddingDisk:
         # written_mb / skipped_mb are the numbers to watch when what matters is how much the server writes:
         # a batch that would not fit is not written at all, so bytes are never written just to be deleted.
         self.stats = {"loaded": 0, "stored": 0, "dropped": 0, "skipped": 0,
-                      "written_bytes": 0, "skipped_bytes": 0, "errors": 0}
+                      "written_bytes": 0, "skipped_bytes": 0, "errors": 0, "stale_tmp": 0}
         try:
             # Owner-only: these files are rows derived from the pictures clients sent. See
             # tools/strix_halo/serve_reqlog.py for what the modes are and why they are set explicitly.
             secure_dir(self.path)
             self.enabled = True
+            self.cleanup_stale_tmp()
             for entry in self.path.glob("*.pt"):
                 try:
                     self._bytes += entry.stat().st_size
@@ -236,6 +245,38 @@ class ImageEmbeddingDisk:
         restrict(path, 0o600)                               # belt and braces for a file from before the rule
         self.stats["loaded"] += 1
         return emb
+
+    def cleanup_stale_tmp(self, grace_s: float = STALE_TMP_S) -> int:
+        """Remove the `.tmp` files a write left behind, older than `grace_s`.
+
+        Every picture is written to `<name>.tmp` and moved onto its final name with `os.replace`, so a
+        `.pt` is always complete and a leftover `.tmp` can only come from a process that died mid-write
+        (`kill -9`, the OOM killer, a power cut). Nothing else looks at those files - not the cap, not the
+        set of pictures present, not the eviction order - so without this they would stay for ever, taking
+        room the cap does not know about.
+
+        A file younger than the grace period is left alone: this module cannot know whether another process
+        is writing it (the servers are one per GPU, but a stale one that was not stopped is a real way to
+        get two). A write of one picture takes milliseconds, so the grace period never covers a live one,
+        and a crash leaves a file that is already minutes old by the time anyone restarts.
+
+        Returns how many were removed; they are counted in `report()` as `stale_tmp`.
+        """
+        try:
+            entries = list(self.path.glob("*.tmp"))
+        except OSError:
+            return 0
+        now, removed = time.time(), 0
+        for entry in entries:
+            try:
+                if now - entry.stat().st_mtime < grace_s:
+                    continue                              # young enough to be somebody's live write
+                entry.unlink()
+                removed += 1
+            except OSError:
+                pass                                      # a file that vanished or cannot be read: not ours
+        self.stats["stale_tmp"] = self.stats.get("stale_tmp", 0) + removed
+        return removed
 
     def store(self, evicted: list, mode: str, live: list | set | None = None,
               protect: set | None = None) -> None:
