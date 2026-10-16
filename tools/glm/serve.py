@@ -439,6 +439,7 @@ def load_image(url: str) -> tuple[Any, str]:
 MAX_SESSIONS = 16   # upper bound of --sessions (the Cache default max_batch_size)
 
 
+
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
@@ -555,8 +556,17 @@ class ResidentEngine:
             self.slot_store.generator = self.greedy_generator
             self.slot_store.erase()
 
+    async def settle_reply(self) -> None:
+        """EXL3_REPLY_FIRST, single-session path: the previous request's finished job is released in an executor
+        thread after its reply went out (see generate's finally); wait for it before anything touches the Generator or Cache."""
+        fut = getattr(self, "_reply_first_fut", None)
+        if fut is not None:
+            self._reply_first_fut = None
+            await fut
+
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (cache_salt namespace change). The caller has drained the requests."""
+        await self.settle_reply()
         if self.sessions > 1:
             await self._post(self._rebuild_generator)    # on the driver, between two steps
         else:
@@ -616,6 +626,7 @@ class ResidentEngine:
         import torch
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
         t0 = time.perf_counter()
+        await self.settle_reply()
         probe = getattr(self, "rss_probe", None)
         embs = []
         if prompt_ids is not None:   # token-id prompt: exactly these ids, no template, no BOS, no re-encoding
@@ -654,8 +665,8 @@ class ResidentEngine:
             async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe):
                 yield piece
             return
-        generator.enqueue(job)
         loop = asyncio.get_running_loop()
+        generator.enqueue(job)
         try:
             while generator.num_remaining_jobs():
                 if cancel is not None and cancel.is_set():
@@ -680,6 +691,8 @@ class ResidentEngine:
             # a leftover job would run inside the next request.
             if generator.num_remaining_jobs():
                 generator.clear_queue()
+            if getattr(generator, "deferred_jobs", None):    # EXL3_REPLY_FIRST: release (reply-end stash) while the reply goes out
+                self._reply_first_fut = loop.run_in_executor(None, generator.flush_deferred)
 
     # Shared mode (sessions > 1). One driver task is the only code that touches the Generator: it runs queued commands
     # (enqueue, cancel, image tower, slot actions) between two iterate() calls and routes the events of each step to the
@@ -716,6 +729,7 @@ class ResidentEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        rf_wait = 0.0
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -734,6 +748,22 @@ class ResidentEngine:
             # read every round: _rebuild_generator (cache_salt change) replaces the Generator between two steps
             generator = self.greedy_generator
             if not generator.num_remaining_jobs():
+                # EXL3_REPLY_FIRST: release the finished jobs (reply-end stash) once idle AND their handlers have
+                # dropped their routes (forget is the last driver command a request waits for before its reply ends), at most
+                # 50 ms after the step; a new request's iterate() releases them first anyway
+                dj = getattr(generator, "deferred_jobs", None)
+                if dj and not self._cmds:
+                    if rf_wait < 0.05 and any(self._routes.get(getattr(j, "serial_number", None)) is not None for j in dj):
+                        self._wake.clear()
+                        try:
+                            await asyncio.wait_for(self._wake.wait(), 0.005)
+                        except asyncio.TimeoutError:
+                            pass
+                        rf_wait += 0.005
+                        continue
+                    rf_wait = 0.0
+                    await loop.run_in_executor(None, generator.flush_deferred)
+                    continue
                 self._wake.clear()
                 if not self._cmds:
                     await self._wake.wait()
@@ -1484,6 +1514,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         body = await request.json() if request.can_read_body else {}
         try:
             async with exclusive():
+                if hasattr(engine, "settle_reply"):
+                    await engine.settle_reply()
                 if action == "erase":
                     return web.json_response(store.erase())
                 if action not in ("save", "restore"):

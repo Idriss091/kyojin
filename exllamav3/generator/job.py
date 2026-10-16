@@ -45,6 +45,9 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
 
 
 _TT = bool(os.environ.get("KYO_TURN_TRACE"))
+# EXL3_TAIL_REPLY=1 (default off): a finished job also stashes a tail checkpoint at the END of its reply, so the
+# next turn (prompt = old prompt + reply + new message) resumes after the reply instead of replaying its last page
+_TAIL_REPLY = os.environ.get("EXL3_TAIL_REPLY", "0") == "1"
 def _ttrace_begin():
     if not _TT: return 0.0
     torch.cuda.synchronize()
@@ -1717,6 +1720,11 @@ class Job:
 
 
     def deallocate_pages(self):
+        if _TAIL_REPLY and self.is_finished and len(self.sequences) == 1 and self.sequences[0].allocated_pages:
+            try:
+                self._tail_stash(self.sequences[0], reply = True)   # BEFORE the mtp_defer flush -> honest draft_ok
+            except Exception as e:  # cleanup must not raise: a missed stash only costs a replay next turn
+                logging.warning("EXL3_TAIL_REPLY stash failed: %r", e)
         if self.mtp_defer:
             try:
                 self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
@@ -1930,7 +1938,7 @@ class Job:
         )
 
 
-    def _tail_stash(self, seq):
+    def _tail_stash(self, seq, reply = False):
         """
         Exact prompt-end checkpoint. Recurrent checkpoints sit on page boundaries, so a follow-up request replays
         the prompt tail after the last full page (up to 255 tokens, each turn). Keep the recurrent state at the very
@@ -1941,7 +1949,9 @@ class Job:
         if not self._tail_ok(seq):
             return
         end = seq.kv_position
-        if end != len(seq.sequence_ids) - 1 or end % PAGE_SIZE == 0 or self.recurrent_state.position != end:
+        # reply = True (EXL3_TAIL_REPLY, job finished): the last sampled token has no K/V yet, so end <= len - 1
+        if (end > len(seq.sequence_ids) - 1 if reply else end != len(seq.sequence_ids) - 1) or \
+                end % PAGE_SIZE == 0 or self.recurrent_state is None or self.recurrent_state.position != end:
             return
         g = self.generator
         if end < g.tail_ckpt_min:                       # short one-shot prompts: the stash costs more than a replay
@@ -1951,7 +1961,8 @@ class Job:
             return
         prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
         ids = seq.sequence_ids.torch_slice(p0 * PAGE_SIZE, end).clone()
-        carry_now = seq.mtp_carry_hidden
+        # reply: the live decode carry; seq.mtp_carry_hidden still holds the prompt-end carry
+        carry_now = self.mtp_last_hidden if reply else seq.mtp_carry_hidden
         for e in g.tail_ckpts:
             if e["prev_hash"] == prev_hash and e["ids"].shape == ids.shape and torch.equal(e["ids"], ids):
                 # same content: refresh the page (the old one may be recycled) and the carry, move to MRU
@@ -1965,7 +1976,7 @@ class Job:
         while len(g.tail_ckpts) >= g.tail_ckpt_max:     # trim before the append: the peak stays at the bound
             g.tail_ckpts.pop(0)
         t = _ttrace_begin()
-        carry = seq.mtp_carry_hidden
+        carry = self.mtp_last_hidden if reply else seq.mtp_carry_hidden
         if _TT: print(f"trace:   tail checkpoint size {self.recurrent_state.checkpoint_size / 2**20:.0f} MiB", flush=True)
         rc = g.recurrent_cache
         if rc is not None and rc.async_stash_ok(self.recurrent_state):

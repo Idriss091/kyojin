@@ -73,6 +73,7 @@ DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 EFFORT_ALIASES = {"high": "xhigh", "minimal": "low"}
 
 
+
 class BadRequest(Exception):
     pass
 
@@ -936,6 +937,7 @@ class QwenEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        rf_wait = 0.0
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -953,6 +955,22 @@ class QwenEngine:
                     if not fut.done():
                         fut.set_result(res)
             if not self.generator.num_remaining_jobs():
+                # EXL3_REPLY_FIRST: release the finished jobs (reply-end stash) once idle AND their handlers have
+                # dropped their routes (_drop is the last driver command a request waits for before its reply ends), at most
+                # 50 ms after the step; a new request's iterate() releases them first anyway
+                dj = getattr(self.generator, "deferred_jobs", None)
+                if dj and not self._cmds:
+                    if rf_wait < 0.05 and any(self._routes.get(getattr(j, "serial_number", None), (None,))[0] is j for j in dj):
+                        self._wake.clear()
+                        try:
+                            await asyncio.wait_for(self._wake.wait(), 0.005)
+                        except asyncio.TimeoutError:
+                            pass
+                        rf_wait += 0.005
+                        continue
+                    rf_wait = 0.0
+                    await loop.run_in_executor(None, self.generator.flush_deferred)
+                    continue
                 self._wake.clear()
                 if not self._cmds:
                     await self._wake.wait()
