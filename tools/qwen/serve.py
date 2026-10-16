@@ -585,6 +585,11 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # checkpoint the decode state at the end of every answer, so the next chat turn only prefills
              # the new message (without it an answer shorter than the 2048-token grid is prefilled again). 0 = off.
              ("EXL3_ROLL_CKPT", "1"),
+             # a turn that resumes mid-page (tail checkpoint) and adds 1024..4095 tokens in one chunk no longer pays a separate
+             # last-page forward: follow-up after a 12K conversation 1.47 -> 1.26 s (+1536 tokens), 2.37 -> 2.11 s (+3072), first-token
+             # KLD vs a cold prefill 2.1e-3 / 1.9e-3 (shipped 4.8e-3 / 3.8e-3), top-1 equal; 768 and 6144 appends unchanged (bitwise).
+             # Slot files keep the tail checkpoint, so a reload does not replay the gap. 1024 goes back.
+             ("EXL3_TAIL_MAXGAP", "8192"),
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),
