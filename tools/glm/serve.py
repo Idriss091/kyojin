@@ -94,6 +94,21 @@ SPEED_ENV = {
     # forward: served tool turn 4.34 -> 3.35 s, 2.58 -> 2.14 s; first-token KLD vs cold within the chunk-size floor
     # Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
     "EXL3_TAIL_MAXGAP": "8192",
+    # a prompt that shares cached pages but not their recurrent checkpoint (a new conversation on the same long system prompt)
+    # side-writes the state where those pages end, so the next one resumes there: first token after a shared 9K / 12.1K prefix
+    # 2.41 -> 1.94 s, 3.84 -> 2.06 s; the writing prompt is bitwise unchanged, KLD vs a cold prefill at the resumed-turn level.
+    "EXL3_BRANCH_CKPT": "1",
+    # such a resume (page-aligned, off the 2048 chunk grid) with a short remainder keeps the tail in its one chunk (prompt-end tail
+    # checkpoint) instead of a separate last-page forward: 2.00 -> 1.42 s, 2.44 -> 1.51 s; KLD vs a cold prefill unchanged in class.
+    "EXL3_TAIL_OFFGRID": "1",
+    # cold prompts checkpoint every 2048 rows before the tail window too (default grid 32768), so the FIRST new conversation on a
+    # long system prompt cached by a conversation with a long first turn resumes near the shared end instead of at token 0: served,
+    # 14.7K-token system + 4.5K-token turns, 28.4 -> 8.0 s; later cold prompts equal within noise, the first one per process +~1.8 s.
+    "EXL3_CKPT_INTERVAL_PP": "2048",
+    # Dense EXL3 GEMM with in-GEMM decode for forwards of 1..1023 rows (the large K 3/4 shapes skip the fp16 weight rebuild).
+    # Served GLM first token +5.7..+12.2 % on 200-900-token prompts, cold and follow-up. Quality checked against an fp32
+    # reference: top-1 vs fp32 never below the current path over 96 rows. Read per call, not latched. "0" = off.
+    "EXL3_DENSE_MPW2": "1023",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
@@ -486,9 +501,9 @@ class ResidentEngine:
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
         # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
-        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: four
-        # server loads in both orders give +2.1 % first-token rate at 8K and +7.9 % at 2K. The Qwen server has it on.
-        if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Four server loads in both
+        # orders give +2.1 % first-token rate at 8K and +7.9 % at 2K, texts identical; on by default as in the Qwen server. 0 = off.
+        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
             import gc
             gc.collect()
             gc.freeze()

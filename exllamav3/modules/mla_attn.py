@@ -19,6 +19,7 @@ from .attention_fn.mla_triton import (
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
+from .qsa_indexer import topk_spans_ok, dsa_topk_spans
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -938,7 +939,10 @@ class MLAttention(Module):
                     elif (EXL3_DSA_DEC_NOTILE and seqlen <= 8) or _pf_notile_ok(rows, pools_slab):
                         sc = tile_scores(0, pools_slab)   # pow2 stride, see _indexer_topk
                         pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
-                        ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
+                        if topk_spans_ok(sc, k_sel):
+                            dsa_topk_spans(ext.dsa_topk, sc, pool_idx, k_sel)
+                        else:
+                            ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
                         pool_idx = pool_idx[:, :k_sel]
                         # Same score-descending order as the tiled merge's final topk: the sparse
                         # attention accumulates in index order, so order is not free

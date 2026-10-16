@@ -321,6 +321,11 @@ class Job:
         self.last_recurrent_checkpoint_pos = None
         self.roll_ckpt = os.environ.get("EXL3_ROLL_CKPT", "0") == "1"
         self.roll_key = None
+        # EXL3_CKPT_INTERVAL_PP (default 0 = the generator's recurrent_checkpoint_interval_pp, 32768): checkpoint spacing
+        # during prompt ingestion before the tail window, read per job. A smaller grid lets a NEW conversation that shares
+        # only a long prefix (system prompt) of a cached one resume near the shared end instead of at token 0
+        self.ckpt_interval_pp = int(os.environ.get("EXL3_CKPT_INTERVAL_PP", "0"))
+        assert self.ckpt_interval_pp % PAGE_SIZE == 0, "EXL3_CKPT_INTERVAL_PP must be a multiple of the page size"
 
         # Loop detector
         self.loop_detector = None
@@ -1397,7 +1402,11 @@ class Job:
                 # last chunks have the same shapes cold and resumed (a 6144 resume of a 7000-token prompt ran one 855-row
                 # chunk instead of cold's 768 + 87 and the recurrent state differed). Only a mid-page resume (tail
                 # checkpoint, never comparable to a cold prefill) keeps the distance to its checkpoint.
-                gap_base = self.cached_pages * PAGE_SIZE if self._unaligned_start else 0
+                # EXL3_TAIL_OFFGRID=1 (default off): a page-aligned resume off the chunk grid (a branch or last-page checkpoint)
+                # never matches a cold prefill's chunks either, so it also measures the gap from the resume point
+                resume_pos = self.cached_pages * PAGE_SIZE
+                off_grid = os.environ.get("EXL3_TAIL_OFFGRID", "0") == "1" and resume_pos % self.generator.max_chunk_size != 0
+                gap_base = resume_pos if self._unaligned_start or off_grid else 0
                 # EXL3_PF_NO_TAIL=1 (default 0, big-tail mode only): no separate pass for the prompt's last page
                 # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
                 # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)
@@ -1417,6 +1426,17 @@ class Job:
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+
+            # EXL3_BRANCH_CKPT=1 (default off, read per chunk; GDN no-tail and KDA big-tail paths): the chunk replays prompt
+            # pages whose K/V were found by hash but whose recurrent state was not (the resume fell back to an older checkpoint,
+            # e.g. a new conversation sharing a long system prompt with a cached one). The kernel also side-writes the state at
+            # the end of that shared run, so the next prompt with the same prefix resumes there instead of replaying up to a chunk
+            branch_row = None
+            if (gdn_nt or big_tail) and self.recurrent_state is not None and prefill_start % PAGE_SIZE == 0 and \
+                    os.environ.get("EXL3_BRANCH_CKPT", "0") == "1":
+                L = getattr(self, "kv_only_end", 0)
+                if prefill_start < L < prefill_end and L - prefill_start != no_tail_row:
+                    branch_row = L - prefill_start
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1499,10 +1519,11 @@ class Job:
                 # EXL3_MIDCHUNK_CKPT=1 (default off): a chunk that crosses a recurrent checkpoint boundary also
                 # saves the recurrent state at that boundary (KDA layers split conv + core there), stashed below
                 if self.recurrent_state is not None and not self.embeddings and \
-                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or (gdn_nt and no_tail_row is not None)) and \
+                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or
+                         (gdn_nt and (no_tail_row is not None or branch_row is not None))) and \
                         not self.generator.model.loaded_tp and prefill_start % PAGE_SIZE == 0:
                     if gdn_nt:
-                        rows = [] if no_tail_row is None else [no_tail_row]
+                        rows = sorted(r for r in (branch_row, no_tail_row) if r is not None)   # the kernel side-writes 2
                     else:
                         rows = [
                             p - prefill_start
@@ -1511,6 +1532,11 @@ class Job:
                         ]
                         if no_tail_row is not None:
                             rows = sorted(set(rows + [no_tail_row]))
+                        # the branch row only where the kernel has a free slot (a list over the limit drops every row)
+                        cap = (4 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else
+                               2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1)
+                        if branch_row is not None and branch_row not in rows and len(rows) < cap:
+                            rows = sorted(rows + [branch_row])
                     if rows:
                         params["checkpoint_rows"] = rows
                         # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
@@ -1677,6 +1703,13 @@ class Job:
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
 
+            # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
+            # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
+            q = cached_pages
+            while q < len(seq.allocated_pages) and seq.allocated_pages[q].kv_position == PAGE_SIZE:
+                q += 1
+            self.kv_only_end = q * PAGE_SIZE
+
             # Metrics
             self.cached_pages += cached_pages
             self.total_pages += allocated_pages
@@ -1793,7 +1826,7 @@ class Job:
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            return (seq_pos - self.cached_pages * PAGE_SIZE) % (self.ckpt_interval_pp or self.generator.recurrent_checkpoint_interval_pp) == 0
 
 
     def mm_exact_spans(self, seq):

@@ -566,6 +566,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "1"),
              ("EXL3_VERIFY_GEMV_R", "1"), ("EXL3_GEMV_R_DEC1", "1"), ("EXL3_MTP_FUSE_CATCHUP", "0"),
              ("EXL3_PLE_HIP", "1"), ("EXL3_DQ_HIP", "1"), ("EXL3_GR_HIP", "1"), ("EXL3_GDN_FUSE", "1"), ("EXL3_PF_SKIP", "1"),
+             # the attention / GDN blocks keep o_proj's fp16 output (the residual apply widens in-kernel) and the ablit projection
+             # reads the fp16 x directly, as on GLM: bit-identical, one-load A/B 6/6 + 6/6 + 6/6 logits equal.
+             ("EXL3_NC2_ATTN_F16", "1"), ("EXL3_NC2_ABLIT_F16", "1"),
              # 4096-row prefill chunks (one MoE pass per 4096 rows, no 2048 + 2048 + tail split below 4097 tokens) and the
              # draft prefill run chunk by chunk with the target prefill (K/V and indexer planes only). EXL3_PF_DEFER=1 defers it behind the
              # first token instead; that lands the whole draft prefill (2.4 s at 256K) inside the first decode steps. 0 for either goes back.
@@ -582,9 +585,23 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # checkpoint the decode state at the end of every answer, so the next chat turn only prefills
              # the new message (without it an answer shorter than the 2048-token grid is prefilled again). 0 = off.
              ("EXL3_ROLL_CKPT", "1"),
+             # a turn that resumes mid-page (tail checkpoint) and adds 1024..4095 tokens in one chunk no longer pays a separate
+             # last-page forward: follow-up after a 12K conversation 1.47 -> 1.26 s (+1536 tokens), 2.37 -> 2.11 s (+3072), first-token
+             # KLD vs a cold prefill 2.1e-3 / 1.9e-3 (shipped 4.8e-3 / 3.8e-3), top-1 equal; 768 and 6144 appends unchanged (bitwise).
+             # Slot files keep the tail checkpoint, so a reload does not replay the gap. 1024 goes back.
+             ("EXL3_TAIL_MAXGAP", "8192"),
+             # a prompt that shares a cached prefix but not its recurrent checkpoint (a new conversation on the same long system
+             # prompt) side-writes the state at the end of the shared pages, so the next one resumes there: first token after a
+             # shared 9K / 11K / 12.1K / 14K prefix 1.04 -> 0.60, 2.25 -> 0.80, 2.92 -> 0.63, 1.62 -> 0.74 s; the writing prompt is
+             # bitwise unchanged, KLD vs a cold prefill at the level of any resumed turn. 0 = off.
+             ("EXL3_BRANCH_CKPT", "1"),
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),
+             # GDN prefill in 16-row WY chunks (fla/hip/gdn_hf.hip, adapted from hipfire, fp32 forward-substitution inverse): one
+             # kernel per layer instead of kkt_solve + the chunk kernel. Not bitwise; PPL equal (4.91972 -> 4.91967 on 24 x 2048
+             # wiki rows) and closer to an exact fp32 GDN than the 64-row chain. 0 = off.
+             ("EXL3_GDN_HF", "1"),
              # verify of 5..8 rows (deep draft tier of spec_policy.TierRule): row split, one-launch fused MoE, one-launch 6-row dense GEMV;
              # bit-identical per row, rows <= 4 untouched. 0 = off.
              ("EXL3_VERIFY_ROW_SPLIT", "2"), ("EXL3_MOE_R8", "1"), ("EXL3_GEMV_R_RM6", "1"),
@@ -599,7 +616,11 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # Grouped MoE prefill GEMM: mpw2 (the engine default, +3-5 % prefill over the legacy kernel, identical ids). Its CPU bounds
              # proof (tools/qwen/check_mpw2_qwen.py --bits 4, bal pack: 4-bit routed experts, gate/up N 640, down N 2560, 63748 launches,
              # 0 failures, mutants fail) passed on this tree. The K6 draft experts never reach it (k2 12 aborts in a host check).
-             ("MPW_KERN", "2"))
+             ("MPW_KERN", "2"),
+             # 16/10: tensor-core MoE GEMM from 9 rows (was 32). Short prompts (17-31 tokens) stop taking the per-expert GEMV
+             # path: time to first token 212 vs 360 ms on short chat prompts, decode unchanged. Vs the true next tokens over
+             # 1500 prompts it moves the model no more than prefilling the same prompt in two chunks (KLD ratio 0.98).
+             ("EXL3_MOE_WMMA_MIN_ROWS", "9"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
@@ -674,6 +695,7 @@ LATCHED = (
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._MOE_VALU, lambda: os.environ.get("EXL3_MOE_VALU", "0") != "0"),
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._HIP_PREFILL_MIN_ROWS,
      lambda: max(2, int(os.environ.get("EXL3_HIP_PREFILL_MIN_ROWS", "17")))),
+    ("exllamav3.modules.block_sparse_mlp", lambda m: m._HIP_WMMA_MIN_ROWS, lambda: int(os.environ.get("EXL3_MOE_WMMA_MIN_ROWS", "32"))),
     ("exllamav3.modules.attention_fn.qsa_triton", lambda m: m.ROWINV["on"], lambda: _env_flag("EXL3_QSA_ROWINV", "1")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_PROJ["on"], lambda: _env_flag("EXL3_VERIFY_QSA_PROJ", "0")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_ATTN["mode"],
