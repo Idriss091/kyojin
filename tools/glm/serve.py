@@ -31,7 +31,7 @@ from serve_metrics import Metrics
 # serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: one line per request
 # lifecycle event (numbers and event names only, never prompt or reply text) plus a heartbeat while a job
 # is queued or prefilling, so "the client went silent" can be lined up with what the server was doing.
-# Off unless KYOJIN_REQLOG names a path; the server prints which of the two it is at start-up.
+# Off unless KYOJIN_REQLOG_DIR names a directory; the server prints which of the two it is at start-up.
 from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize
 # serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
 # KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so the same silence is
@@ -1068,7 +1068,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
-    # Request log: off unless KYOJIN_REQLOG names a path, in which case every generation request gets one line
+    # Request log: off unless KYOJIN_REQLOG_DIR names a directory, in which case every generation request gets a line
     # per lifecycle event (numbers and event names only, never prompt or reply text) plus an 'alive' heartbeat
     # while it is queued or running. `inflight` is what the heartbeat walks; it holds no request content.
     reqlog = ReqLog.from_env(server="glm")

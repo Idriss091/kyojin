@@ -14,9 +14,29 @@ extra byte on the wire.
 
 | variable | default | meaning |
 |---|---|---|
-| `KYOJIN_REQLOG` | **unset = off** | a path, or `1`/`on`/`yes` for `~/.cache/kyojin/requests.log`; `0`/`off`/`none`/`no`/`false` also disable it |
+| `KYOJIN_REQLOG_DIR` | **unset = off** | the directory to write in, or `1`/`on`/`yes` for `~/.cache/kyojin`; a path ending in a file name means that file's directory; `0`/`off`/`none`/`no`/`false` also disable it |
+| `KYOJIN_REQLOG_KEEP` | `20` | how many runs keep their file; the oldest are removed at start-up |
 | `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | seconds between `alive` lines while a job is queued, prefilling or decoding; `0` disables the heartbeat (the log itself stays on) |
 | `KYOJIN_SSE_PING_S` | `0` = off | seconds a stream may go without a data event before the server writes one SSE comment line |
+
+**One file per run.** The switch names a directory, and a run writes `requests-<run>.log` in it — the
+default directory is `~/.cache/kyojin`, so the file is `~/.cache/kyojin/requests-<run>.log`, and every line
+carries `run=<id>`. A path that ends in a file name is read as that file's directory
+(`/var/log/kyojin/requests.log` means `/var/log/kyojin`), which is what pointing the switch at a log means;
+that file itself is never written to, the run's own `requests-<run>.log` is. One run's lines can
+therefore be read on their own, instead of every run of every server piling into one file that has to be
+filtered by hand. At start-up the run files of the oldest runs are removed, keeping the newest
+`KYOJIN_REQLOG_KEEP` of them (20 by default) — the directory is checked at start-up only, and nothing
+while a run is going on. A file this module did not write, such as an archive or the plain file an earlier
+layout appended to, is never deleted.
+
+**A long-running server keeps writing.** There is no size limit: while the log is on, a run writes its
+events plus one `alive` line per heartbeat interval per request that is queued, prefilling or decoding, so
+a server left running for weeks grows its file for weeks. Measurements from this deployment: about 14-21
+lines per request, 144 bytes a line, a few MB an hour of normal agent traffic — and much more for long
+image prefills, where the heartbeat is what fills the file. Keep the switch on for the runs that need
+diagnosing and turn it off for a server that is meant to stay up; if it must stay on, lower
+`KYOJIN_REQLOG_KEEP` and read the run you need from its own file.
 
 **Every file this writes is owner-only.** The log (and the picture cache the GLM server keeps on disk)
 holds material derived from what clients sent, so the files are created `0600` regardless of the process
@@ -38,8 +58,8 @@ Each server prints one line per switch at start-up, so the state is discoverable
 file:
 
 ```
-serve: request log off (set KYOJIN_REQLOG=<path> to enable, numbers and event names only)
-serve: request log /home/you/.cache/kyojin/requests.log (heartbeat 10 s, numbers and event names only, no prompt or reply text)
+serve: request log off (set KYOJIN_REQLOG_DIR=<directory> to enable, numbers and event names only)
+serve: request log /home/you/.cache/kyojin/requests-20261016T153012.log (run 20261016T153012, from KYOJIN_REQLOG_DIR, heartbeat 10 s, keeping 20 runs, numbers and event names only, no prompt or reply text)
 serve: SSE keep-alive: a comment line after 10 s without output (KYOJIN_SSE_PING_S)
 serve: SSE keep-alive off (set KYOJIN_SSE_PING_S=<seconds> to hold a silent stream open)
 ```

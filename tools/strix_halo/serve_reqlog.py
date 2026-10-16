@@ -8,9 +8,19 @@ compared afterwards. The heartbeat and the per-request summary carry the request
 accounting** (`out_events`, `out_chars`, `last_out_s`), which is what separates "the server was
 writing to a client that did not show it" from "the server had nothing to write".
 
-**Off unless asked for.** With KYOJIN_REQLOG unset (or 0/off/none/no/false/empty) nothing is opened and
+**Off unless asked for.** With KYOJIN_REQLOG_DIR unset (or 0/off/none/no/false/empty) nothing is opened and
 every call is a no-op, so a default deployment behaves exactly as before. The server prints one line at
 start-up either way, so the switch stays discoverable when a request does go silent.
+
+**One file per run.** The switch names a directory; a run writes `requests-<run>.log` in it (the default
+directory is `~/.cache/kyojin`) and every line carries that run id, so the lines of one run can be read
+without filtering the other runs out. A path that ends in a file name is read as that file's directory
+(`/var/log/kyojin/requests.log` means `/var/log/kyojin`); that file itself is never written to - every run
+writes `requests-<run>.log` in the directory. At start-up the log files of the oldest runs are removed,
+keeping the newest `KYOJIN_REQLOG_KEEP` (20 by default) of them: the directory is checked once, at
+start-up, and nothing is checked while a run is going on. A long-running server writes continuously
+(one `alive` line per heartbeat interval per request plus the events), so a deployment that keeps a log
+open for weeks should turn it off or shorten the retention rather than expect the file to stop growing.
 
 **Owner-only files.** The log, and the picture cache the GLM server keeps on disk, hold material derived
 from what clients sent, so the files are created `0600` and an older one is tightened on the next start
@@ -23,7 +33,7 @@ default (`shared_cache_dir()`) — is created with the process umask like any ot
 folders above it included: more than one process writes there, and whichever makes it first must not decide
 how it looks. A file inside is still unreadable to others at `0600`.
 
-    KYOJIN_REQLOG=~/cache/kyojin/requests.log   # a path, or 1/on/yes for the default path below
+    KYOJIN_REQLOG_DIR=/var/log/kyojin           # a directory, or 1/on/yes for the default below
     KYOJIN_REQLOG_HEARTBEAT_S=10                # seconds between 'alive' lines while a job runs
 
 Privacy: nothing derived from the request is written except numbers — token counts, message/image
@@ -51,7 +61,12 @@ import time
 import uuid
 from typing import Any
 
-DEFAULT_PATH = "~/.cache/kyojin/requests.log"
+# The switch names a directory; every run writes its own file in it, `<BASE>-<run>.log`, so that the lines of
+# one run can be read without filtering the lines of every other run out of one growing file.
+DEFAULT_DIR = "~/.cache/kyojin"
+BASE_NAME = "requests"            # fixed: the directory says where, this says what it is
+RUN_STAMP = "%Y%m%dT%H%M%S"
+DEFAULT_KEEP = 20                 # runs kept on disk; older files are removed when a server starts
 FALSE = {"0", "off", "none", "no", "false", ""}
 TRUE = {"1", "on", "yes", "true"}
 
@@ -455,39 +470,84 @@ def refusal_text(exc: Any) -> str:
     return text or type(exc).__name__
 
 
+def log_dir_from_env(environ: Any = None) -> pathlib.Path | None:
+    """The directory to write logs in, or None when logging is off.
+
+    `KYOJIN_REQLOG_DIR` names a *directory*. A path that ends in a file is read as that file's directory
+    (`/var/log/kyojin/requests.log` means `/var/log/kyojin`), because that is what an operator has in mind
+    when they point the switch at a log, and that file is never written to: every run writes its own
+    `<BASE_NAME>-<run>.log` in the directory.
+    """
+    env = os.environ if environ is None else environ
+    raw = str(env.get("KYOJIN_REQLOG_DIR", "") or "").strip()
+    if not raw or raw.lower() in FALSE:
+        return None
+    if raw.lower() in TRUE:
+        return pathlib.Path(DEFAULT_DIR).expanduser()
+    target = pathlib.Path(raw).expanduser()
+    directory = target if (target.is_dir() or target.name in ("", ".", "..")) else target.parent
+    return directory if str(directory) else pathlib.Path(".")
+
+
 class ReqLog:
-    """Append-only event log. Every method is safe to call when logging is disabled or broken."""
+    """Append-only event log, one file per run. Safe when logging is disabled or broken."""
 
     def __init__(self, path: str | None = None, heartbeat_s: float | None = None,
                  server: str | None = None) -> None:
-        raw = os.environ.get("KYOJIN_REQLOG", "") if path is None else path
-        raw = raw.strip()
         self.server = server
-        self.enabled = raw.lower() not in FALSE
-        if self.enabled and raw.lower() in TRUE:
-            raw = DEFAULT_PATH
-        self.path: pathlib.Path | None = pathlib.Path(raw).expanduser() if self.enabled else None
+        if path is None:
+            self.directory = log_dir_from_env()
+            self.enabled = self.directory is not None
+        else:
+            # an explicit path is a directory too, with the same rule (a file name means its directory)
+            raw = str(path).strip()
+            self.enabled = raw.lower() not in FALSE
+            target = pathlib.Path(raw).expanduser() if self.enabled else None
+            if target is None or raw.lower() in TRUE:
+                self.directory = pathlib.Path(DEFAULT_DIR).expanduser() if self.enabled else None
+            else:
+                self.directory = target if (target.is_dir() or target.name in ("", ".", "..")) else target.parent
+        self.base_path = self.directory / BASE_NAME if self.directory is not None else None
+        self.run = time.strftime(RUN_STAMP) if self.enabled else None
+        # one file per start, so a file is one run; the fixed base name is what the retention matches on
+        self.path = (self.base_path.with_name(f"{self.base_path.name}-{self.run}.log")
+                     if self.base_path is not None else None)
         if heartbeat_s is None:
             try:
                 heartbeat_s = float(os.environ.get("KYOJIN_REQLOG_HEARTBEAT_S", "10") or 10)
             except ValueError:
                 heartbeat_s = 10.0
         self.heartbeat_s = max(0.0, heartbeat_s)
+        try:
+            self.keep = int(os.environ.get("KYOJIN_REQLOG_KEEP", DEFAULT_KEEP) or DEFAULT_KEEP)
+        except ValueError:
+            self.keep = DEFAULT_KEEP
         self._lock = threading.Lock()
+        self.pruned = 0
         self._fh = None
-        if self.enabled and self.path is not None:
-            try:
-                # Owner-only: the log names every request's size, timing and outcome, and it is derived
-                # from what clients sent (see the module docstring). The file mode applies when the file
-                # is created; an older one is tightened here too. A shared folder (the deployment's
-                # ~/.cache/kyojin) keeps the mode the deployment gave it.
-                secure_dir(self.path.parent)
-                fd = secure_open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-                self._fh = os.fdopen(fd, "a", encoding="utf-8")
-                restrict(self.path, 0o600)
-            except OSError as exc:
-                print(f"serve: request log off ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-                self.enabled, self._fh = False, None
+        self.open()
+
+    def open(self) -> bool:
+        """Open this run's file (the constructor calls it). A failure leaves the log off, never raises."""
+        if not self.enabled or self.path is None or self._fh is not None:
+            return self._fh is not None
+        try:
+            # Owner-only: the log names every request's size, timing and outcome, and it is derived
+            # from what clients sent (see the module docstring). The file mode applies when the file
+            # is created; an older one is tightened here too. A shared folder (the deployment's
+            # ~/.cache/kyojin) keeps the mode the deployment gave it.
+            secure_dir(self.path.parent)
+            # This run's file is created before pruning, so that the directory holds exactly `keep` of them
+            # at every start (and not `keep` plus the one that just appeared)
+            fd = secure_open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            self._fh = os.fdopen(fd, "a", encoding="utf-8")
+            restrict(self.path, 0o600)
+            self.pruned = self.prune_old_runs()
+            return True
+        except OSError as exc:
+            print(f"serve: request log off ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+            self.enabled, self._fh = False, None
+            return False
 
     @classmethod
     def from_env(cls, server: str | None = None) -> "ReqLog":
@@ -496,9 +556,35 @@ class ReqLog:
     def describe(self) -> str:
         """One start-up line, so an operator can tell whether the log is on without looking for a file."""
         if self._fh is None or self.path is None:
-            return "request log off (set KYOJIN_REQLOG=<path> to enable, numbers and event names only)"
-        return (f"request log {self.path} (heartbeat {self.heartbeat_s:g} s, "
-                f"numbers and event names only, no prompt or reply text)")
+            return "request log off (set KYOJIN_REQLOG_DIR=<directory> to enable, numbers and event names only)"
+        pruned = f", {self.pruned} older removed" if self.pruned else ""
+        return (f"request log {self.path} (run {self.run}, heartbeat {self.heartbeat_s:g} s, "
+                f"keeping {self.keep} runs{pruned}, numbers and event names only, no prompt or reply text)")
+
+    def prune_old_runs(self) -> int:
+        """Remove the log files of the oldest runs, keeping the newest `keep` beside the base path.
+
+        Runs are ordered by the stamp in their name, not by their dates, so a file that was copied around
+        keeps its place in the order. Only files this module writes are candidates - `<stem>-<stamp><suffix>`
+        - so an archive (a renamed or compressed one, say) is never deleted, and the base file of an earlier
+        layout (a plain `requests.log` someone appended to) is left where it is. Called once, at start-up:
+        nothing is checked while a run is going on, so the request path pays nothing for this.
+        """
+        if self.directory is None or self.keep <= 0:
+            return 0
+        try:
+            candidates = sorted(self.directory.glob(f"{BASE_NAME}-*.log"))
+        except OSError:
+            return 0
+        doomed = candidates[:max(0, len(candidates) - self.keep)]         # this run is one of them
+        removed = 0
+        for entry in doomed:
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     def log(self, event: str, **fields: Any) -> None:
         if self._fh is None:
@@ -509,6 +595,8 @@ class ReqLog:
             parts = [f"{stamp}.{ms:03d}", event]
             if self.server:
                 parts.append(f"srv={self.server}")
+            if self.run:
+                parts.append(f"run={self.run}")
             for key, value in fields.items():
                 if value is None:
                     continue

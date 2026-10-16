@@ -87,6 +87,15 @@ def vision_engine():
     return eng, calls
 
 
+def run_log_file(directory) -> Path:
+    """The file the last run wrote in a directory: `requests-<run>.log`, one file per run."""
+    directory = Path(directory)
+    if directory.suffix:                      # a file name handed in: its directory is what is used
+        directory = directory.parent
+    written = sorted(directory.glob("requests-*.log"))
+    return written[-1] if written else directory / "requests-none.log"
+
+
 def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True,
                 lock_s: float = 0.0, policy: str = "tail", fingerprint: str = ""):
     """An engine whose _embed() runs over a real memory cache *and* a real second-level cache on disk.
@@ -439,18 +448,25 @@ class ImageDiskCacheTests(unittest.TestCase):
 
 
 class RequestLogTests(unittest.TestCase):
-    """KYOJIN_REQLOG: off unless asked for; when on, one line per lifecycle event, numbers and names only."""
+    """KYOJIN_REQLOG_DIR: off unless asked for; when on, one line per lifecycle event, numbers and names only."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.log_path = Path(self.tmp.name) / "requests.log"
-        for key in ("KYOJIN_REQLOG", "KYOJIN_REQLOG_HEARTBEAT_S"):
+        self.log_dir = Path(self.tmp.name)          # the switch names a directory
+        self.log_path = self.log_dir / "requests.log"   # only used to assert that nothing appears
+        for key in ("KYOJIN_REQLOG_DIR", "KYOJIN_REQLOG_HEARTBEAT_S"):
             os.environ.pop(key, None)
             self.addCleanup(os.environ.pop, key, None)
 
+    def current_log(self) -> Path:
+        """The file this run wrote: `<stem>-<run><suffix>` beside the base path, one file per run."""
+        written = sorted(self.log_dir.glob("requests-*.log"))
+        return written[-1] if written else self.log_path
+
     def lines(self) -> list[str]:
-        return self.log_path.read_text(encoding="utf-8").splitlines() if self.log_path.exists() else []
+        path = self.current_log()
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
     def events(self) -> list[tuple[str, dict]]:
         """(event name, fields) per line; the timestamp is field 0 and the event name field 1."""
@@ -495,7 +511,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertFalse(list(Path(self.tmp.name).iterdir()))
 
     def test_lifecycle_lines_share_one_id_and_never_hold_request_text(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         secret, reply = "PROMPT-SECRET-7f3a", "REPLY-SECRET-9b1c"
         engine = FakeEngine(reply)
         from aiohttp.test_utils import TestClient, TestServer
@@ -527,7 +543,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertNotIn(reply, blob)
 
     def test_stream_headers_first_content_and_done(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         from aiohttp.test_utils import TestClient, TestServer
 
         async def check():
@@ -546,7 +562,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertLess(names.index("sse_first_content"), names.index("sse_done"))
 
     def test_refusals_are_logged_without_quoting_the_body(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         from aiohttp.test_utils import TestClient, TestServer
 
         async def check():
@@ -567,7 +583,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertNotIn("model", reasons)
 
     def test_image_request_logs_cache_hits_misses_and_budget(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         from PIL import Image
         from aiohttp.test_utils import TestClient, TestServer
         eng, _ = vision_engine()
@@ -614,7 +630,7 @@ class RequestLogTests(unittest.TestCase):
         self.assertNotIn("data:image", "\n".join(self.lines()))     # the image URL is never written
 
     def test_heartbeat_while_a_job_runs(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         os.environ["KYOJIN_REQLOG_HEARTBEAT_S"] = "0.05"
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -638,8 +654,35 @@ class RequestLogTests(unittest.TestCase):
         self.assertTrue(all("elapsed_s" in f and "phase" in f for f in alive))
         self.assertTrue({f["phase"] for f in alive} <= {"parse", "queued", "prefill", "decode", "stream"})
 
+    def test_the_switch_names_a_directory_and_a_file_name_means_its_directory(self):
+        """`KYOJIN_REQLOG_DIR` is a directory: an operator who points it at `.../requests.log` means the
+        directory that file lives in, and that file itself is never written to."""
+        import tempfile
+        from serve_reqlog import ReqLog, log_dir_from_env
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            cases = {
+                str(logs): logs,                                  # a directory
+                str(logs / "requests.log"): logs,                 # a file name: its directory
+                "1": Path("~/.cache/kyojin").expanduser(),        # on, default directory
+                "0": None,                                        # off
+            }
+            for raw, expected in cases.items():
+                os.environ["KYOJIN_REQLOG_DIR"] = raw
+                self.assertEqual(log_dir_from_env(), expected, raw)
+
+            os.environ["KYOJIN_REQLOG_DIR"] = str(logs / "requests.log")
+            log = ReqLog.from_env(server="glm")
+            try:
+                self.assertTrue(str(log.path).startswith(str(logs) + os.sep))
+                self.assertTrue(log.path.name.startswith("requests-"))
+                self.assertTrue(log.path.name.endswith(".log"))
+            finally:
+                log.close()
+
     def test_v1_completions_is_logged_too(self):
-        os.environ["KYOJIN_REQLOG"] = str(self.log_path)
+        os.environ["KYOJIN_REQLOG_DIR"] = str(self.log_dir)
         from aiohttp.test_utils import TestClient, TestServer
 
         async def check():
@@ -747,23 +790,24 @@ class SSEKeepAliveTests(unittest.TestCase):
         from serve_reqlog import ReqLog, secure_dir
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        fresh = Path(tmp.name) / "logs" / "requests.log"
+        base = Path(tmp.name) / "logs" / "requests.log"
         previous = os.umask(0)
         try:
-            log = ReqLog(path=str(fresh), server="test")
+            log = ReqLog(path=str(base), server="test")
             log.log("req_start", req="r1")
+            written = log.path                                   # this run's own file, not the base path
             log.close()
-            self.assertEqual(_stat.S_IMODE(fresh.parent.stat().st_mode), 0o700)
-            self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)
+            self.assertEqual(_stat.S_IMODE(base.parent.stat().st_mode), 0o700)
+            self.assertEqual(_stat.S_IMODE(written.stat().st_mode), 0o600)
 
-            os.chmod(fresh, 0o666)                               # as an earlier run would have left the file
-            os.chmod(fresh.parent, 0o775)                        # ...and the directory the deployment owns
-            again = ReqLog(path=str(fresh), server="test")
+            os.chmod(written, 0o666)                             # as an earlier run would have left the file
+            os.chmod(base.parent, 0o775)                         # ...and the directory the deployment owns
+            again = ReqLog(path=str(base), server="test")        # the next run: another file of its own
             again.close()
         finally:
             os.umask(previous)
-        self.assertEqual(_stat.S_IMODE(fresh.parent.stat().st_mode), 0o775)   # left alone
-        self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)          # this one is ours
+        self.assertEqual(_stat.S_IMODE(base.parent.stat().st_mode), 0o775)   # left alone
+        self.assertEqual(_stat.S_IMODE(written.stat().st_mode), 0o600)       # this one is ours
 
     def test_every_directory_this_creates_is_owner_only(self):
         """Not just the leaf: `mkdir(parents=True, mode=...)` leaves the directories in between at 0777
@@ -881,6 +925,44 @@ class SSEKeepAliveTests(unittest.TestCase):
         (path / "startup-glm.json").parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    def test_every_run_writes_its_own_log_and_old_runs_are_kept_by_count(self):
+        """One file per run, so a run's lines can be read without filtering the other runs out.
+
+        The switch names a base path; a run writes `<stem>-<run><suffix>` beside it and the newest
+        `KYOJIN_REQLOG_KEEP` runs stay (checked once, at start-up). Files this module did not write - an
+        archive, or the plain file an earlier layout appended to - are never deleted."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import ReqLog
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "requests.log"
+            for i in range(23):                                  # 23 runs already on disk
+                (Path(tmp) / f"requests-20260101T{i:06d}.log").write_text("old\n")
+            (base).write_text("the file an earlier layout appended to\n")
+            (Path(tmp) / "other-20260101T000000.log").write_text("another program\n")
+
+            os.environ["KYOJIN_REQLOG_KEEP"] = "20"
+            self.addCleanup(os.environ.pop, "KYOJIN_REQLOG_KEEP", None)
+            log = ReqLog(path=str(base), server="test")
+            try:
+                self.assertNotEqual(log.path, base)              # not the shared file any more
+                self.assertTrue(log.path.name.startswith("requests-"))
+                self.assertTrue(log.path.name.endswith(".log"))
+                log.log("req_start", req="r1")
+                line = log.path.read_text().splitlines()[0]
+                self.assertIn(f"run={log.run}", line)            # every line names its run
+                self.assertIn("keeping 20 runs", log.describe())
+            finally:
+                log.close()
+            kept = sorted(p.name for p in Path(tmp).glob("requests-*.log"))
+            self.assertEqual(len(kept), 20)                      # exactly the retention, this run included
+            self.assertEqual(kept[-1], log.path.name)            # the newest is this run's
+            self.assertIn("requests-20260101T000022.log", kept)  # the newest of the old ones stays...
+            self.assertNotIn("requests-20260101T000003.log", kept)   # ...and the oldest go
+            self.assertNotIn("requests-20260101T000000.log", kept)
+            self.assertEqual(log.pruned, 4)                      # 23 old + this one - 20 kept
+            self.assertTrue((Path(tmp) / "other-20260101T000000.log").exists())
+
     def test_the_log_says_whether_the_server_was_writing(self):
         """The accounting that separates "the client showed nothing" from "the server sent nothing".
 
@@ -890,9 +972,9 @@ class SSEKeepAliveTests(unittest.TestCase):
         import tempfile
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        os.environ["KYOJIN_REQLOG"] = str(Path(tmp.name) / "requests.log")
+        os.environ["KYOJIN_REQLOG_DIR"] = tmp.name                 # the switch names a directory
         os.environ["KYOJIN_REQLOG_HEARTBEAT_S"] = "0.2"
-        self.addCleanup(os.environ.pop, "KYOJIN_REQLOG", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_REQLOG_DIR", None)
         self.addCleanup(os.environ.pop, "KYOJIN_REQLOG_HEARTBEAT_S", None)
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -913,7 +995,7 @@ class SSEKeepAliveTests(unittest.TestCase):
 
         run(check())
         events = []
-        for line in Path(os.environ["KYOJIN_REQLOG"]).read_text(encoding="utf-8").splitlines():
+        for line in run_log_file(os.environ["KYOJIN_REQLOG_DIR"]).read_text(encoding="utf-8").splitlines():
             parts = line.split(" ")
             fields = {}
             for item in parts[2:]:

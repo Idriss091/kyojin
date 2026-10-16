@@ -244,7 +244,7 @@ this server:
 * **GLM is the only server whose pinger also writes its comments to the log**, so `sse_ping` lines and
   the `sse_ping_s` field of `serve_start` appear here and not on Qwen or MiMo.
 
-Turn it on with `KYOJIN_REQLOG=<path>` (or `1`); both switches are in [doc/env_vars.md](../../doc/env_vars.md).
+Turn it on with `KYOJIN_REQLOG_DIR=<directory>` (or `1`) — each run writes `requests-<run>.log` there, keeping the newest 20 runs; the switches are in [doc/env_vars.md](../../doc/env_vars.md), and what is written, per run, in [doc/logging.md](../../doc/logging.md).
 
 ## Start-up progress on `/health`
 
@@ -334,7 +334,7 @@ keep-alive timing (off by default, one comment per interval, retired at the firs
 request).
 
 `test_serve_glm_additional.py` holds the tests for what this checkout adds locally: the
-request log (`KYOJIN_REQLOG`, off by default, no request text), the image cache
+request log (`KYOJIN_REQLOG_DIR`, off by default, no request text), the image cache
 (`--image-cache-mb` / `--image-cache-items`, the defaults of the `--image-cache-dir*` options,
 the row format, what `img_cache` reports) and the SSE keep-alive (a comment reaches the client before
 the first token, and nothing at all with the switch off). It is a file of its own so upstream's

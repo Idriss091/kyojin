@@ -48,7 +48,7 @@ import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /to
 # not look like a hung server to a client that only watches its socket.
 from serve_ping import ServePing  # noqa: E402
 # serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: off unless
-# KYOJIN_REQLOG names a path. Its output accounting also feeds the end-of-stream summary here.
+# KYOJIN_REQLOG_DIR names a directory. Its output accounting also feeds the end-of-stream summary here.
 from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize  # noqa: E402
 
 
@@ -1270,7 +1270,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
     ping = ServePing.from_env()
     app.update(ping=ping)
-    # Request log: off unless KYOJIN_REQLOG names a path (numbers and event names only). The name is bound
+    # Request log: off unless KYOJIN_REQLOG_DIR names a directory (numbers and event names only). The name is bound
     # here, not only stored on the app: the streaming routes log from inside their own scope, and an
     # unbound name there raises after the reply is complete, which costs the client its connection.
     reqlog = ReqLog.from_env(server="qwen")

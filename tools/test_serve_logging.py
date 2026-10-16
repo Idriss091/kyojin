@@ -98,8 +98,17 @@ def load_server(name: str):
         sys.path.remove(str(here))
 
 
+def run_log_file(directory: Path) -> Path:
+    """The file the last run wrote in a directory: `requests-<run>.log`, one file per run."""
+    if directory.suffix:                      # a file name handed in: its directory is what is used
+        directory = directory.parent
+    written = sorted(directory.glob("requests-*.log"))
+    return written[-1] if written else directory / "requests-none.log"
+
+
 def parse_log(path: Path) -> dict[str, dict[str, set[str]]]:
     """{request id: {event: fields}}; the heartbeat's own lines land under the key '-' if untagged."""
+    path = run_log_file(path)                       # one file per run: read the one this battery wrote
     out: dict[str, dict[str, set[str]]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         parts = line.split(" ")
@@ -128,13 +137,13 @@ def run_battery(name: str, log_path: Path) -> dict[str, dict[str, set[str]]]:
         finally:
             await client.close()
 
-    os.environ["KYOJIN_REQLOG"] = str(log_path)
+    os.environ["KYOJIN_REQLOG_DIR"] = str(log_path.parent)      # the switch names a directory
     os.environ["KYOJIN_REQLOG_HEARTBEAT_S"] = "0.2"
     os.environ["KYOJIN_SSE_PING_S"] = "0.2"
     try:
         asyncio.run(go())
     finally:
-        for key in ("KYOJIN_REQLOG", "KYOJIN_REQLOG_HEARTBEAT_S", "KYOJIN_SSE_PING_S"):
+        for key in ("KYOJIN_REQLOG_DIR", "KYOJIN_REQLOG_HEARTBEAT_S", "KYOJIN_SSE_PING_S"):
             os.environ.pop(key, None)
     return parse_log(log_path)
 
