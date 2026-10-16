@@ -32,6 +32,9 @@ import torch
 
 from exllamav3.tokenizer.mm_embedding import MMEmbedding, QuantizedMMRows
 
+# The log's module holds the owner-only helpers this cache needs (servers put tools/glm on sys.path).
+from serve_reqlog import restrict, secure_dir, secure_open
+
 
 def dtype_name(dtype: torch.dtype) -> str:
     """`torch.float32` -> "float32": what a stored payload records about the rows it holds."""
@@ -101,12 +104,17 @@ class ImageEmbeddingDisk:
         self.stats = {"loaded": 0, "stored": 0, "dropped": 0, "skipped": 0,
                       "written_bytes": 0, "skipped_bytes": 0, "errors": 0}
         try:
-            self.path.mkdir(parents=True, exist_ok=True)
+            # Owner-only: these files are rows derived from the pictures clients sent. See
+            # tools/strix_halo/serve_reqlog.py for what the modes are and why they are set explicitly.
+            secure_dir(self.path)
             self.enabled = True
             for entry in self.path.glob("*.pt"):
                 try:
                     self._bytes += entry.stat().st_size
                     self._files += 1
+                    # A file written before the owner-only rule (or by a process with a looser umask) is
+                    # tightened here: files are only ever written once, so nothing else would revisit it.
+                    restrict(entry, 0o600)
                 except OSError:
                     pass
             # A directory left over the cap by an earlier run (or a smaller cap now) is trimmed here, oldest
@@ -201,6 +209,7 @@ class ImageEmbeddingDisk:
             os.utime(path, None)                            # used now: the last thing the collector takes
         except OSError:
             pass
+        restrict(path, 0o600)                               # belt and braces for a file from before the rule
         self.stats["loaded"] += 1
         return emb
 
@@ -252,7 +261,12 @@ class ImageEmbeddingDisk:
             path = self._file(key, mode)
             tmp = path.with_suffix(".tmp")
             try:
-                torch.save(payload, tmp)
+                # torch.save() would create the temp file with the process umask (0644 on a 0022 host) and
+                # os.replace() moves that mode onto the final name, so the file is made owner-only here.
+                fd = secure_open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+                with os.fdopen(fd, "wb") as fh:
+                    torch.save(payload, fh)
+                restrict(tmp, 0o600)
                 os.replace(tmp, path)
                 size = path.stat().st_size
                 self._bytes += size

@@ -170,7 +170,12 @@ pictures are the end of a prompt, restoring them completes the prompt again and 
 is where the large win is (99.8 % of a 24-page prompt reused, 1.2 s against 82.0 s). Under the default `head`
 policy it still saves the vision pass for the pictures it holds, but the prefix is broken at the first of them.
 Note what it stores: the **rows derived from the input images stay on disk**, which is a privacy and disk-wear
-consideration. Two knobs bound it:
+consideration. Because of that its files are created `0600` whatever the process umask is, and a file left
+wider by an earlier run is tightened on the next start; the directory is made `0700` only if this server has to
+create it, one that already exists keeps its mode, and the shared folder above it (`~/.cache/kyojin`, or
+wherever `KYOJIN_HEALTH_DIR` points) is created with the process umask — its missing parents as well — since
+other processes write there too.
+Two knobs bound it:
 `--image-cache-dir-max-gb` caps the directory and `--image-cache-dir-lock-s` caps how often a conversation can
 lose its place to another one.
 

@@ -592,6 +592,150 @@ class SSEKeepAliveTests(unittest.TestCase):
         self.assertLessEqual(body.count(b"tool_calls"), 2)      # once as a message, once in usage
         self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))
 
+    def test_the_log_file_and_its_directory_are_owner_only(self):
+        """The log names every request's size, timing and outcome: owner-only, whatever the umask is.
+
+        Checked under a umask of 0, which is where a plain `open("a")` would leave 0666 in a 0777
+        directory; a file that already exists with a wider mode is tightened on the next start."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import ReqLog, secure_dir
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fresh = Path(tmp.name) / "logs" / "requests.log"
+        previous = os.umask(0)
+        try:
+            log = ReqLog(path=str(fresh), server="test")
+            log.log("req_start", req="r1")
+            log.close()
+            self.assertEqual(_stat.S_IMODE(fresh.parent.stat().st_mode), 0o700)
+            self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)
+
+            os.chmod(fresh, 0o666)                               # as an earlier run would have left the file
+            os.chmod(fresh.parent, 0o775)                        # ...and the directory the deployment owns
+            again = ReqLog(path=str(fresh), server="test")
+            again.close()
+        finally:
+            os.umask(previous)
+        self.assertEqual(_stat.S_IMODE(fresh.parent.stat().st_mode), 0o775)   # left alone
+        self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)          # this one is ours
+
+    def test_every_directory_this_creates_is_owner_only(self):
+        """Not just the leaf: `mkdir(parents=True, mode=...)` leaves the directories in between at 0777
+        (the C implementation does not pass the mode on), which the umask clearing below would expose."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import secure_dir
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        leaf = Path(tmp.name) / "a" / "b" / "c"
+        previous = os.umask(0)
+        try:
+            secure_dir(leaf)
+        finally:
+            os.umask(previous)
+        for made in (leaf, leaf.parent, leaf.parent.parent):
+            self.assertEqual(_stat.S_IMODE(made.stat().st_mode), 0o700, made)
+        os.chmod(leaf.parent, 0o775)                             # a directory that is not ours to change
+        secure_dir(leaf)
+        self.assertEqual(_stat.S_IMODE(leaf.parent.stat().st_mode), 0o775)
+
+    def test_the_shared_cache_folder_is_created_the_way_the_health_history_creates_it(self):
+        """Two modules create the shared folder; whichever runs first, it must come out the same.
+
+        `tools/startup_health.py` makes it with a plain `mkdir(parents=True, exist_ok=True)` under the
+        process umask, so this server must not make it owner-only instead: that would leave a different
+        directory depending on which of the two started first."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import secure_dir, shared_cache_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["KYOJIN_HEALTH_DIR"] = str(Path(tmp) / "ours")
+            self.addCleanup(os.environ.pop, "KYOJIN_HEALTH_DIR", None)
+            shared = shared_cache_dir()
+            self.assertEqual(shared, (Path(tmp) / "ours").expanduser())     # the same expression
+
+            def modes(umask: int) -> tuple[int, int]:
+                """(ours, theirs) for one umask, each in a fresh parent so both start from nothing."""
+                mine = Path(tmp) / "run-ours"
+                os.environ["KYOJIN_HEALTH_DIR"] = str(mine)
+                previous = os.umask(umask)
+                try:
+                    secure_dir(shared_cache_dir())                          # ours first
+                    (Path(tmp) / "run-theirs" / "startup-glm.json").parent.mkdir(parents=True, exist_ok=True)
+                finally:
+                    os.umask(previous)
+                return (_stat.S_IMODE(mine.stat().st_mode),
+                        _stat.S_IMODE((Path(tmp) / "run-theirs").stat().st_mode))
+
+            for umask in (0o022, 0o002, 0o000):
+                ours, theirs = modes(umask)
+                self.assertEqual(ours, theirs, f"umask {umask:04o}: {ours:04o} != {theirs:04o}")
+            self.assertEqual(modes(0o022)[0], 0o755)                        # and it really follows the umask
+
+            # the folders above it are created the same way
+            with tempfile.TemporaryDirectory() as deep:
+                os.environ["KYOJIN_HEALTH_DIR"] = str(Path(deep) / ".cache" / "kyojin")
+                previous = os.umask(0o022)
+                try:
+                    secure_dir(shared_cache_dir())
+                finally:
+                    os.umask(previous)
+                self.assertEqual(_stat.S_IMODE((Path(deep) / ".cache").stat().st_mode), 0o755)
+                self.assertEqual(_stat.S_IMODE((Path(deep) / ".cache" / "kyojin").stat().st_mode), 0o755)
+                # and every level is traversable by others, which is the point of the exception
+                for level in (Path(deep) / ".cache", Path(deep) / ".cache" / "kyojin"):
+                    self.assertTrue(_stat.S_IMODE(level.stat().st_mode) & 0o001, level)
+
+    def test_the_health_folder_switch_names_the_shared_folder(self):
+        """`KYOJIN_HEALTH_DIR` is what makes a folder the shared one, whatever it is called."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import secure_dir, shared_cache_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / "shared-state"
+            os.environ["KYOJIN_HEALTH_DIR"] = str(custom)
+            self.addCleanup(os.environ.pop, "KYOJIN_HEALTH_DIR", None)
+            self.assertEqual(shared_cache_dir(), custom)
+            previous = os.umask(0o022)
+            try:
+                secure_dir(shared_cache_dir())
+            finally:
+                os.umask(previous)
+            self.assertEqual(_stat.S_IMODE(custom.stat().st_mode), 0o755)     # shared: the umask decides
+            previous = os.umask(0)
+            try:
+                secure_dir(custom / "image-embeddings")                      # ours: owner-only
+            finally:
+                os.umask(previous)
+            self.assertEqual(_stat.S_IMODE((custom / "image-embeddings").stat().st_mode), 0o700)
+            self.assertEqual(_stat.S_IMODE(custom.stat().st_mode), 0o755)    # and not touched again
+
+    def test_a_directory_of_ours_inside_the_shared_folder_is_owner_only(self):
+        """The exception is the shared folder itself, not everything under it."""
+        import stat as _stat
+        import tempfile
+        from serve_reqlog import secure_dir, shared_cache_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["KYOJIN_HEALTH_DIR"] = str(Path(tmp) / "kyojin")
+            self.addCleanup(os.environ.pop, "KYOJIN_HEALTH_DIR", None)
+            shared = shared_cache_dir()
+            previous = os.umask(0o022)
+            try:
+                secure_dir(shared)                                      # created the upstream way
+                mode_before = _stat.S_IMODE(shared.stat().st_mode)
+                secure_dir(shared / "image-embeddings")                 # ...and then our own directory
+            finally:
+                os.umask(previous)
+            self.assertEqual(_stat.S_IMODE((shared / "image-embeddings").stat().st_mode), 0o700)
+            self.assertEqual(_stat.S_IMODE(shared.stat().st_mode), mode_before)   # not touched again
+
+    @staticmethod
+    def upstream_style_dir(path: Path) -> Path:
+        """What `tools/startup_health.py` does before writing its history file."""
+        (path / "startup-glm.json").parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def test_the_log_says_whether_the_server_was_writing(self):
         """The accounting that separates "the client showed nothing" from "the server sent nothing".
 

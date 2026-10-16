@@ -18,6 +18,22 @@ extra byte on the wire.
 | `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | seconds between `alive` lines while a job is queued, prefilling or decoding; `0` disables the heartbeat (the log itself stays on) |
 | `KYOJIN_SSE_PING_S` | `0` = off | seconds a stream may go without a data event before the server writes one SSE comment line |
 
+**Every file this writes is owner-only.** The log (and the picture cache the GLM server keeps on disk)
+holds material derived from what clients sent, so the files are created `0600` regardless of the process
+umask — a host with the common `0022` would otherwise get `0644` logs. A file that already exists with a
+wider mode is tightened on the next start, because `open(..., "a")` does not change the mode of a file it
+opens.
+
+The **directory** is made `0700` when this server creates it, and a directory that already exists is left
+exactly as it is. One directory is deliberately not given that mode: the shared folder where the servers
+keep state for each other — `~/.cache/kyojin`, or wherever `KYOJIN_HEALTH_DIR` points
+([env_vars.md](env_vars.md)) — is created with the process umask like any other shared directory on the
+host, and the folders above it are created the same way when they are missing. It is not this server's to
+restrict: more than one process writes there, and which of them makes it first must not change what it
+looks like. Everywhere else the modes above hold, a directory of the server's own *inside* that folder
+(`image-embeddings`, for instance) included, and the files inside are `0600` either way, so their contents
+are not readable by others on the box.
+
 Each server prints one line per switch at start-up, so the state is discoverable without looking for a
 file:
 
@@ -134,7 +150,7 @@ tolerates comments from giving up, and tells you the server was alive if one doe
 
 ## Privacy
 
-Nothing derived from the request is written except numbers: token counts, message and image counts,
+The files are owner-only (see above) and nothing derived from the request is written except numbers: token counts, message and image counts,
 durations, byte counts, HTTP statuses, an opaque request id, a server tag and event names. Prompt text,
 completion text, tool arguments and image paths from the body are never logged. Of the server's own error
 text, only the exception type is logged plus a truncated message; JSON parse errors are reduced to

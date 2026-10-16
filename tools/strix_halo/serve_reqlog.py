@@ -12,6 +12,17 @@ writing to a client that did not show it" from "the server had nothing to write"
 every call is a no-op, so a default deployment behaves exactly as before. The server prints one line at
 start-up either way, so the switch stays discoverable when a request does go silent.
 
+**Owner-only files.** The log, and the picture cache the GLM server keeps on disk, hold material derived
+from what clients sent, so the files are created `0600` and an older one is tightened on the next start
+(`secure_open` / `restrict` below); every directory this server creates is `0700`. Without that the mode
+would follow the process umask, `0022` on most systems, and the log would be `0644`.
+
+Two directories are deliberately not this server's to set: one that already exists is **not** touched at
+all, and the shared folder the three servers keep state in — `KYOJIN_HEALTH_DIR`, `~/.cache/kyojin` by
+default (`shared_cache_dir()`) — is created with the process umask like any other shared directory, the
+folders above it included: more than one process writes there, and whichever makes it first must not decide
+how it looks. A file inside is still unreadable to others at `0600`.
+
     KYOJIN_REQLOG=~/cache/kyojin/requests.log   # a path, or 1/on/yes for the default path below
     KYOJIN_REQLOG_HEARTBEAT_S=10                # seconds between 'alive' lines while a job runs
 
@@ -33,6 +44,7 @@ import functools
 import json
 import os
 import pathlib
+import stat
 import sys
 import threading
 import time
@@ -42,6 +54,88 @@ from typing import Any
 DEFAULT_PATH = "~/.cache/kyojin/requests.log"
 FALSE = {"0", "off", "none", "no", "false", ""}
 TRUE = {"1", "on", "yes", "true"}
+
+
+def shared_cache_dir() -> pathlib.Path:
+    """The folder the servers share for the state they keep between starts.
+
+    `KYOJIN_HEALTH_DIR` names it; `~/.cache/kyojin` is the default. More than one module and more than one
+    server write there, so it is created with the process umask like any other shared directory (see
+    `secure_dir`) and never tightened."""
+    return pathlib.Path(os.environ.get("KYOJIN_HEALTH_DIR") or "~/.cache/kyojin").expanduser()
+
+
+def secure_dir(path: "pathlib.Path", mode: int = 0o700) -> None:
+    """Create `path`, and the directories above it that are missing, owner-only. An existing one is left
+    alone, whatever its mode.
+
+    `mode` applies to every directory this call creates, applied with the umask cleared so the requested
+    mode is the mode that lands. The directories in between are created one level at a time, because
+    `mkdir(parents=True, mode=...)` does not pass the mode to those (its C implementation calls
+    `mkdir(path)` without one), which would leave them at `0777` with the umask cleared.
+
+    `shared_cache_dir()` is the exception, and it is recognised here rather than passed in by the callers:
+    that folder is shared, other processes write there, and whichever of them creates it first must not
+    decide how it looks, so it is created with the process umask, and so are the folders above it when they
+    are missing. Everything else this server creates is its own and gets `mode`: a directory *below* the
+    shared folder (`image-embeddings`), and any level of a path that merely passes through it. Files are
+    `0600` either way."""
+    path = pathlib.Path(path)
+    if path.exists() and not path.is_dir():
+        # A file where a directory has to go is a broken setup, and the callers report it as such: the
+        # disk cache answers "off" with the reason, the log switches itself off with a line on stderr.
+        raise NotADirectoryError(f"{path} exists and is not a directory")
+    shared = path == shared_cache_dir()
+    # every level that is not there yet, deepest first, down to the first one that exists; decided before
+    # anything is created, because a directory this call makes must not change the answer
+    missing: list[pathlib.Path] = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:                            # reached the filesystem root
+            break
+        probe = probe.parent
+    # the shared folder and the levels above it are created the umask way; a directory that merely passes
+    # *through* the shared folder, `<shared>/image-embeddings`, keeps `mode`
+    previous = os.umask(0)
+    try:
+        for entry in reversed(missing):                      # shallowest first, so each parent exists
+            if shared and (entry == path or entry in path.parents):
+                os.umask(previous)                           # a shared folder: the umask decides, as for any
+                try:
+                    entry.mkdir(exist_ok=True)
+                except FileExistsError:                      # a race: somebody created it just now
+                    pass
+                os.umask(0)
+                continue
+            try:
+                entry.mkdir(mode=mode)
+            except FileExistsError:                          # a race: somebody else created it just now
+                pass
+    finally:
+        os.umask(previous)
+
+
+def secure_open(path: "pathlib.Path", flags: int, mode: int = 0o600) -> int:
+    """`os.open` for a file only its owner may read, whatever the process umask is.
+
+    Same trick as `secure_dir`: umask 0 while creating, so the mode lands as asked, and the group and
+    other bits are dropped even if the caller asks for more. Opening an existing file does not change its
+    mode, so a file that predates the rule is fixed by `restrict` instead."""
+    previous = os.umask(0)
+    try:
+        return os.open(path, flags, mode & ~0o077)
+    finally:
+        os.umask(previous)
+
+
+def restrict(path: "pathlib.Path", mode: int) -> None:
+    """Bring an existing file to `mode`, owner-only, if it is not already."""
+    try:
+        if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+            os.chmod(path, mode)
+    except OSError:
+        pass
 
 
 def sanitize(exc: BaseException) -> str:
@@ -383,8 +477,14 @@ class ReqLog:
         self._fh = None
         if self.enabled and self.path is not None:
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._fh = self.path.open("a", encoding="utf-8")
+                # Owner-only: the log names every request's size, timing and outcome, and it is derived
+                # from what clients sent (see the module docstring). The file mode applies when the file
+                # is created; an older one is tightened here too. A shared folder (the deployment's
+                # ~/.cache/kyojin) keeps the mode the deployment gave it.
+                secure_dir(self.path.parent)
+                fd = secure_open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+                self._fh = os.fdopen(fd, "a", encoding="utf-8")
+                restrict(self.path, 0o600)
             except OSError as exc:
                 print(f"serve: request log off ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
                 self.enabled, self._fh = False, None
