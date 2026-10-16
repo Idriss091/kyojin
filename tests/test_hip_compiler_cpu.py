@@ -187,6 +187,7 @@ def test_compiler_health_fields(env, monkeypatch):
 
 def test_every_jit_site_uses_the_resolver():
     sites = ["exllamav3/modules/gr_fn/gr_mix_hip.py", "exllamav3/vendor/fla/hip/gdn_fused_h_hip.py", "exllamav3/vendor/fla/hip/kda_fused_h_hip.py",
+             "exllamav3/vendor/fla/hip/gdn_hf_hip.py", "exllamav3/vendor/fla/hip/kda_hf_hip.py",
              "exllamav3/modules/ple_fn/ple_hip.py", "exllamav3/modules/attention_fn/qsa_prefill_hip.py"]
     for f in sites:
         s = (ROOT / f).read_text()
