@@ -695,7 +695,6 @@ LATCHED = (
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._MOE_VALU, lambda: os.environ.get("EXL3_MOE_VALU", "0") != "0"),
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._HIP_PREFILL_MIN_ROWS,
      lambda: max(2, int(os.environ.get("EXL3_HIP_PREFILL_MIN_ROWS", "17")))),
-    ("exllamav3.modules.block_sparse_mlp", lambda m: m._HIP_WMMA_MIN_ROWS, lambda: int(os.environ.get("EXL3_MOE_WMMA_MIN_ROWS", "32"))),
     ("exllamav3.modules.attention_fn.qsa_triton", lambda m: m.ROWINV["on"], lambda: _env_flag("EXL3_QSA_ROWINV", "1")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_PROJ["on"], lambda: _env_flag("EXL3_VERIFY_QSA_PROJ", "0")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_ATTN["mode"],
