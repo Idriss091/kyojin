@@ -209,6 +209,18 @@ def _hip_router_buffers(cfg, rows):
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
     router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
+    # EXL3_ROUTER_TOPK (default 1, read per call): prefill rows select top-k with one Triton pass (router_topk.py)
+    # instead of the stable sort below over all experts; same ids, same values into the same softmax
+    if (router_logits.dim() == 2 and router_logits.shape[0] > 16 and router_logits.is_cuda and router_logits.stride(1) == 1
+            and not (include_bias and cfg.router_bias is not None) and not params.get("activate_all_experts")
+            and cfg.num_experts_per_tok <= 32 and os.environ.get("EXL3_ROUTER_TOPK", "1") != "0"
+            and not torch.cuda.is_current_stream_capturing()):
+        from .router_topk import router_topk
+        top_v, selected_experts = router_topk(router_logits, cfg.num_experts_per_tok)
+        routing_weights = torch.softmax(top_v, dim = -1)
+        if cfg.per_expert_scale is not None:
+            routing_weights = routing_weights * cfg.per_expert_scale.float()[selected_experts]
+        return selected_experts, routing_weights.half()
     router_logits_f = router_logits.float()
     if include_bias and cfg.router_bias is not None:
         router_logits_f = router_logits_f + cfg.router_bias.float()
@@ -243,8 +255,15 @@ def _routing_nogroup_torch(cfg, y, params, scores):
         # at the k-th place, which expert is chosen). Router scores tie often, so identical inputs gave
         # different expert sets from run to run. A stable descending sort keeps the lowest expert index first
         # among equals: same values, reproducible routing.
-        selected_experts = torch.sort(selection_scores, dim = -1, descending = True, stable = True).indices[
-            :, :cfg.num_experts_per_tok].contiguous()
+        if (selection_scores.dim() == 2 and selection_scores.shape[0] > 16 and selection_scores.is_cuda
+                and selection_scores.stride(1) == 1 and cfg.num_experts_per_tok <= 32
+                and os.environ.get("EXL3_ROUTER_TOPK", "1") != "0" and not torch.cuda.is_current_stream_capturing()):
+            # EXL3_ROUTER_TOPK: same ids as the stable sort (router_topk.py)
+            from .router_topk import router_topk
+            selected_experts = router_topk(selection_scores, cfg.num_experts_per_tok)[1]
+        else:
+            selected_experts = torch.sort(selection_scores, dim = -1, descending = True, stable = True).indices[
+                :, :cfg.num_experts_per_tok].contiguous()
     routing_weights = scores.gather(1, selected_experts)
     routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
     routing_weights = routing_weights * cfg.routed_scaling_factor
