@@ -19,7 +19,12 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .job import Job, _ttrace_begin, _ttrace_end
+from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
+# EXL3_REPLY_FIRST=1 (default off): a job that finishes inside iterate() is released (deallocate_pages: reply-end tail
+# stash, draft flush, page / slot release) by flush_deferred() AFTER its last results are returned, not before. The server calls it
+# once the results are handed out; every iterate / cancel / clear_queue runs it first, so later work sees the same cache state in
+# the same order (exact by construction). Pays where the stash is a blocking copy (HIP .cpu(), CUDA EXL3_TAIL_PIN=0).
+_REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
 from . import spec_sample
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -260,6 +265,7 @@ class Generator:
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+        self.deferred_jobs = []   # EXL3_REPLY_FIRST: finished jobs not yet released
 
         # Filter threads
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
@@ -464,6 +470,7 @@ class Generator:
         Abort all active and pending jobs
         """
 
+        self.flush_deferred()
         num_jobs = self.num_remaining_jobs()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
@@ -516,6 +523,7 @@ class Generator:
         block tables still depend on the current physical page ordering.
         """
 
+        self.flush_deferred()
         num_jobs = self.num_remaining_jobs()
 
         if job in self.pending_jobs:
@@ -527,8 +535,23 @@ class Generator:
             self.on_queue_drained()
 
 
+    def flush_deferred(self):
+        """
+        EXL3_REPLY_FIRST: release the jobs that finished in the last iterate() (see _REPLY_FIRST). No-op when none.
+        """
+        if not self.deferred_jobs:
+            return
+        jobs, self.deferred_jobs = self.deferred_jobs, []
+        with torch.inference_mode():
+            for job in jobs:
+                job.deallocate_pages()
+        if not self.num_remaining_jobs():
+            self.on_queue_drained()
+
+
     @torch.inference_mode
     def iterate(self) -> list[dict]:
+        self.flush_deferred()
         results = self._iterate_inner()
         if _moe_fused_check is not None:
             _moe_fused_check(self.model)
@@ -1563,6 +1586,18 @@ class Generator:
                     # The EOS stream event was already built inside receive_sample, so patch its counter too
                     if eos:
                         num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
+                        # EXL3_TAIL_REPLY: roll the recurrent state and page positions back to the accepted
+                        # position (as a rejection would) so the finished job can stash an exact reply-end tail
+                        if _TAIL_REPLY_GEN and draft_tokens is not None and batch_states is not None \
+                                and len(job.sequences) == 1:
+                            batch_states[j].rewind(num_unresolved)   # rewind(0) too: it normalises the per-token history
+                            r_ = num_unresolved
+                            seq_ = job.sequences[0]
+                            while r_:
+                                page = seq_.allocated_pages[(seq_.kv_position + r_ - 1) // PAGE_SIZE]
+                                rp = min(page.kv_position, r_)
+                                page.kv_position -= rp
+                                r_ -= rp
                         if num_unresolved:
                             job.rejected_draft_tokens += num_unresolved
                             for r_ in reversed(results):
@@ -1734,7 +1769,10 @@ class Generator:
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
-            job.deallocate_pages()
+            if _REPLY_FIRST and job not in requeuing_jobs:
+                self.deferred_jobs.append(job)   # released by flush_deferred() after the results are out
+            else:
+                job.deallocate_pages()
             self.active_jobs.remove(job)
 
         # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
@@ -1744,7 +1782,7 @@ class Generator:
             self.pending_jobs.insert(0, rq_job)
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
-        if num_jobs and not self.num_remaining_jobs():
+        if num_jobs and not self.num_remaining_jobs() and not self.deferred_jobs:
             self.on_queue_drained()
 
 
