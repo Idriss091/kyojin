@@ -32,7 +32,7 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
 | `--image-cache-mb` | `1024` | host memory for the decoded image embeddings, in MiB, one pool shared by all sessions; `0` = no byte limit |
 | `--image-cache-items` | `32` | cap on how many pictures are held at once; `0` = no limit |
-| `--image-cache-dir` | `~/.cache/kyojin/image-embeddings` | directory of the second-level picture cache; used only when `--image-cache-dir-max-gb` is set |
+| `--image-cache-dir` | `~/.cache/kyojin/image-embeddings` | directory of the second-level picture cache; used only when `--image-cache-dir-max-gb` is set. A file is named after the pack and its preprocessing settings as well as the picture, so another model or other pixel settings never reach rows computed with the old ones |
 | `--image-cache-dir-max-gb` | `0` | GiB cap on that directory; `0` = disabled. There is no unlimited setting |
 | `--image-cache-dir-lock-s` | `300` | seconds a conversation keeps the room its files took before another may take it; `0` = no tenure |
 | `--image-cache-format` | `fp32` | row storage: `fp32` as the vision merger emits them, `fp16` (half the bytes, bit-exact on this pack) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
@@ -163,7 +163,13 @@ the comparison with the default configuration: [doc/EXL3_CONV_GEMM.md](../../doc
 With `--image-cache-dir-max-gb` (off by default), the pictures the memory budget gives up are written to disk
 **when they are evicted** and read back when the client sends them again. It only ever helps a conversation with
 more pictures than `--image-cache-mb` holds: a session that fits writes nothing, and a longer one writes each
-evicted picture once (files are keyed by content, so a picture evicted twice is not rewritten). The directory is
+evicted picture once (files are keyed by content, so a picture evicted twice is not rewritten). A row is only
+worth reusing while the model and the preprocessing stay the same, so a file is named after both: a short
+fingerprint of the pack and its resize/canvas settings, then the content key and the storage format. Start with
+another model, another pack or other pixel settings and the files already there are simply not addressed any more -
+they stay until the directory cap takes them, and the request ends up encoding the pictures again. Both the
+fingerprint and the fields it was built from are in the log (`image_cache_env` on `serve_start`, `env` inside the
+`disk=` report of `img_cache`), so a fingerprint that changed between two runs can be compared. The directory is
 `--image-cache-dir`, `~/.cache/kyojin/image-embeddings` unless changed, and anything unreadable in it is dropped
 and re-encoded: the disk never becomes a reason for a request to fail. It is meant to be used with `KYOJIN_IMAGE_CACHE_POLICY=tail`: then the evicted
 pictures are the end of a prompt, restoring them completes the prompt again and the paged prefix survives, which
@@ -228,7 +234,7 @@ The log is shared code and its switches, format, every event, the shared/GLM-onl
 the output accounting are documented once, in [doc/logging.md](../../doc/logging.md). What belongs to
 this server:
 
-* **its events are the reference vocabulary** — `img_cache`, `img_disk` and `serve_start` exist here
+* **its events are the reference vocabulary** — `img_cache` and `serve_start` exist here
   because this is the server with an image cache, a disk tier and a start-up record; the other two run
   the same `Lifecycle` and `tools/test_serve_logging.py` holds all three to the same field lists;
 * the start-up lines an operator sees are `serve: request log …` and `serve: SSE keep-alive …`;

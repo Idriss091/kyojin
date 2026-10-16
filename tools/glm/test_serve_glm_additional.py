@@ -88,7 +88,7 @@ def vision_engine():
 
 
 def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_bytes: int = 0, on_disk: bool = True,
-                lock_s: float = 0.0, policy: str = "tail"):
+                lock_s: float = 0.0, policy: str = "tail", fingerprint: str = ""):
     """An engine whose _embed() runs over a real memory cache *and* a real second-level cache on disk.
 
     The memory cache runs the `tail` policy the disk layer is built for: keeping the head of a prompt is what
@@ -130,7 +130,8 @@ def disk_engine(directory, budget_bytes: int = 768, mode: str = "fp32", cap_byte
     eng.emb_disk = None
     if on_disk:
         from image_cache_disk import ImageEmbeddingDisk
-        eng.emb_disk = ImageEmbeddingDisk(directory, max_bytes=cap_bytes, start_token=7, end_token=8, lock_s=lock_s)
+        eng.emb_disk = ImageEmbeddingDisk(directory, max_bytes=cap_bytes, start_token=7, end_token=8,
+                                          lock_s=lock_s, env_fingerprint=fingerprint)
     return eng, calls
 
 
@@ -226,6 +227,48 @@ class ImageDiskCacheTests(unittest.TestCase):
             self.assertEqual(len(out), 2)
             self.assertEqual(len(calls), 2)
 
+    def test_the_model_fingerprint_is_stable_and_setting_specific(self):
+        """The name of every cached row comes from here, so it has to be stable and to notice a change.
+
+        A fingerprint that moved on its own would make the disk tier unreachable and turn every restart into
+        re-encoding; one that ignored a setting would hand back rows the new setting never produced. Built
+        from a synthetic pack here, so the check does not need the 93 GB one to be on the machine."""
+        import json
+        import tempfile
+        from serve import env_fingerprint_source, make_env_fingerprint
+
+        class Pre:
+            patch_size, merge_size, temporal_patch_size = 14, 2, 2
+            min_image_tokens, max_image_tokens = 16, 8000
+            spatial_merge_size, hidden_size = 2, 1024
+
+        class Config:
+            vision_config, vision_pp = Pre(), Pre()
+
+        def pack(directory: pathlib.Path, name: str, tokens: int = 8000) -> str:
+            """A pack is its directory name, its configuration and the size/date of the visual shards."""
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "model.safetensors.index.json").write_text(json.dumps(
+                {"weight_map": {"model.visual.blocks.0.w": f"{name}.safetensors"}}))
+            (directory / f"{name}.safetensors").write_bytes(b"x" * (1024 if tokens == 8000 else 2048))
+            config = Config()
+            config.vision_pp = type("Pre", (Pre,), {"max_image_tokens": tokens})()
+            return make_env_fingerprint(str(directory), config)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            first = pack(base / "pack-a", "shard")
+            self.assertEqual(first, pack(base / "pack-a", "shard"))               # same pack, same name
+            self.assertNotEqual(first, pack(base / "pack-b", "shard"))            # another pack directory
+            self.assertNotEqual(first, pack(base / "pack-a", "shard", tokens=7999))   # another canvas budget
+
+            source = env_fingerprint_source(str(base / "pack-a"), Config())
+            for field in ("vision_pp.patch_size", "vision_pp.merge_size", "vision_pp.max_image_tokens"):
+                self.assertIn(field, source)
+            self.assertEqual(source["model"], "pack-a")
+            self.assertTrue(any(k.startswith("shard.") for k in source))          # the weights are in it
+            json.dumps(source, sort_keys=True)                                    # and it can be logged
+
     def test_the_defaults_match_upstream(self):
         # The memory budget is upstream's 1 GiB, and the disk cache is off unless a cap is given: no auto share
         # of RAM, and no way to ask for an unbounded directory.
@@ -239,6 +282,77 @@ class ImageDiskCacheTests(unittest.TestCase):
         self.assertEqual(serve.IMAGE_CACHE_DIR_MAX_GB, 0.0)
         self.assertTrue(serve.IMAGE_CACHE_DIR_DEFAULT.endswith(".cache/kyojin/image-embeddings"))
         self.assertEqual(serve.IMAGE_CACHE_DIR_LOCK_S, 300.0)
+
+    def test_the_disk_rows_are_kept_per_environment(self):
+        """A row is only reusable while the model and the preprocessing stay the same.
+
+        The file name carries the fingerprint of what produced it, so a restart with another pack or other
+        pixel settings cannot reach the old rows; they stay on disk until the cap takes them, the same
+        treatment as any other unusable file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, _ = disk_engine(tmp, budget_bytes=384, cap_bytes=64 << 20, fingerprint="aaaa")   # room for one
+            images = tiny_pictures(2)
+            serve.ResidentEngine._embed(eng, images)
+            names = sorted(p.name for p in pathlib.Path(tmp).glob("*.pt"))
+            self.assertEqual(len(names), 1)
+            self.assertTrue(names[0].startswith("aaaa."), names)         # the fingerprint names the file
+            self.assertEqual(eng.emb_disk.report()["env"], "aaaa")
+
+            other, calls = disk_engine(tmp, budget_bytes=384, cap_bytes=64 << 20, fingerprint="bbbb")
+            images = tiny_pictures(2)
+            serve.ResidentEngine._embed(other, images)
+            self.assertEqual(len(calls), 2)                              # nothing of ours is reachable
+            self.assertEqual(len(list(pathlib.Path(tmp).glob("*.pt"))), 2)
+
+            again, calls = disk_engine(tmp, budget_bytes=384, cap_bytes=64 << 20, fingerprint="aaaa")  # a restart
+            serve.ResidentEngine._embed(again, images)
+            self.assertEqual(len(calls), 1)                              # the second picture came back
+            self.assertEqual(len(list(pathlib.Path(tmp).glob("*.pt"))), 2)   # and nothing was written again
+
+    def test_a_row_from_another_environment_is_refused_rather_than_injected(self):
+        """The name keeps another environment out. The copy inside the file is the second line: a file that
+        got there some other way (copied in, restored from a backup, a name collision) is refused and
+        dropped, rather than having its rows injected into a prompt as if this environment had made them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, _ = disk_engine(tmp, budget_bytes=384, cap_bytes=64 << 20, fingerprint="aaaa")
+            serve.ResidentEngine._embed(eng, tiny_pictures(2))
+            path = next(pathlib.Path(tmp).glob("*.pt"))
+            import torch
+            blob = torch.load(path, weights_only=True)
+            blob["env_fingerprint"] = "bbbb"                      # the contents say another environment
+            torch.save(blob, path)
+
+            disk = eng.emb_disk
+            self.assertIsNone(disk.fetch(path.name.split(".")[1], "fp32"))   # refused, not injected
+            self.assertEqual(disk.stats["errors"], 1)
+            self.assertFalse(path.exists())                       # and dropped, so it is encoded fresh
+
+    def test_the_fingerprint_is_not_mistaken_for_the_picture_key(self):
+        """Every part of the disk cache that names a picture reads the key out of the file name - the
+        eviction grouping, the tenure map, the set of pictures present. With the fingerprint in front, "the
+        first part" is the fingerprint, which would make every file of one environment look like the same
+        picture: the grouping would then free whatever it walks over instead of the pictures the cap is meant
+        to give up, and the files of the environment being served would be sacrificed for the files of an
+        old one. The disk layer's whole point is that a conversation keeps the head of its prompt, so the
+        reading is pinned here."""
+        import tempfile
+        from image_cache_disk import content_key
+        self.assertEqual(content_key(pathlib.Path("81a20c24930c549a.abcdef.q8.pt")), "abcdef")
+        self.assertEqual(content_key(pathlib.Path("abcdef.fp32.pt")), "abcdef")          # before the prefix
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # room for one picture in memory, so the other two are written to disk
+            eng, _ = disk_engine(tmp, budget_bytes=384, cap_bytes=64 << 20, fingerprint="aaaa")
+            serve.ResidentEngine._embed(eng, tiny_pictures(3))
+            disk = eng.emb_disk
+            written = sorted(p.name for p in pathlib.Path(tmp).glob("*.pt"))
+            self.assertEqual(len(written), 2, written)
+            # the keys of the files this cache holds: two pictures, not one fingerprint twice
+            self.assertEqual(disk._present(), {"key1", "key2"})
+            # ...and the same reading for a directory written before the fingerprint existed
+            for entry in pathlib.Path(tmp).glob("aaaa.*.pt"):
+                entry.rename(entry.with_name(entry.name.split(".", 1)[1]))
+            self.assertEqual(disk._present(), {"key1", "key2"})
 
     def test_the_disk_cache_needs_a_cap(self):
         # `--image-cache-dir-max-gb 0` (the default) is off; any positive value is a real cap, never "unlimited".

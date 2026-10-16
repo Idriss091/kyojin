@@ -36,6 +36,17 @@ from exllamav3.tokenizer.mm_embedding import MMEmbedding, QuantizedMMRows
 from serve_reqlog import restrict, secure_dir, secure_open
 
 
+def content_key(path: pathlib.Path) -> str:
+    """The picture key out of a file name: `<env_fingerprint>.<key>.<mode>.pt`, or `<key>.<mode>.pt`.
+
+    The parts after the fingerprint are fields of their own, so the key is the part before the mode and this
+    cannot be "the first part": with a fingerprint in front that would return the fingerprint itself and every
+    file would look like the same picture. Files written before the fingerprint existed have no prefix, and
+    then the first part is the key."""
+    parts = path.name.split(".")
+    return parts[1] if len(parts) > 3 else parts[0]
+
+
 def dtype_name(dtype: torch.dtype) -> str:
     """`torch.float32` -> "float32": what a stored payload records about the rows it holds."""
     return str(dtype).rsplit(".", 1)[-1]
@@ -82,8 +93,14 @@ class ImageEmbeddingDisk:
     """
 
     def __init__(self, directory: str, max_bytes: int = 0, start_token: int = 0, end_token: int = 0,
-                 lock_s: float = 0.0):
+                 lock_s: float = 0.0, env_fingerprint: str = ""):
         self.path = pathlib.Path(directory).expanduser()
+        # What the rows in this directory were computed with: the model and the settings that decide how a
+        # picture is resized and encoded (`make_env_fingerprint` in the server). It names the files, so a
+        # restart with another model or other pixel settings cannot reach rows computed with the old ones,
+        # and a file that is somehow in the way is refused rather than injected (`fetch`). Empty means "not
+        # told", which is what the tests that only exercise the store/collect logic want.
+        self.env_fingerprint = str(env_fingerprint or "")
         self.max_bytes = max(0, int(max_bytes))
         self.start_token, self.end_token = int(start_token), int(end_token)
         # A conversation keeps the room its cache took for this long (0 = no tenure). The clock starts when the
@@ -134,6 +151,7 @@ class ImageEmbeddingDisk:
 
     def report(self) -> dict:
         return {"files": self._files, "mb": round(self._bytes / 2 ** 20, 1),
+                "env": self.env_fingerprint or None,
                 "written_mb": round(self.stats["written_bytes"] / 2 ** 20, 3),
                 "skipped_mb": round(self.stats["skipped_bytes"] / 2 ** 20, 3),
                 "cap_mb": round(self.max_bytes / 2 ** 20, 1),
@@ -143,7 +161,7 @@ class ImageEmbeddingDisk:
 
     def _present(self) -> set:
         try:
-            return {entry.name.split(".")[0] for entry in self.path.glob("*.pt")}
+            return {content_key(entry) for entry in self.path.glob("*.pt")}
         except OSError:
             return set()
 
@@ -171,7 +189,8 @@ class ImageEmbeddingDisk:
     # -- files -----------------------------------------------------------------------------------------------
 
     def _file(self, key: str, mode: str) -> pathlib.Path:
-        return self.path / f"{key}.{mode}.pt"
+        prefix = f"{self.env_fingerprint}." if self.env_fingerprint else ""
+        return self.path / f"{prefix}{key}.{mode}.pt"
 
     def fetch(self, key: str, mode: str):
         """The picture back, or None. Rows from the file; identity from this process when it is known."""
@@ -183,6 +202,11 @@ class ImageEmbeddingDisk:
         except FileNotFoundError:
             return None
         except Exception:                                   # partial or foreign file: drop it and re-encode
+            self.stats["errors"] += 1
+            self._unlink(path)
+            return None
+        if self.env_fingerprint and blob.get("env_fingerprint") not in (None, self.env_fingerprint):
+            # reachable but computed with something else: drop it and let the caller encode the picture
             self.stats["errors"] += 1
             self._unlink(path)
             return None
@@ -258,6 +282,10 @@ class ImageEmbeddingDisk:
             payload |= {"grid_thw": getattr(emb, "grid_thw", None),
                         "mrope_merge_size": getattr(emb, "mrope_merge_size", None),
                         "metadata": dict(getattr(emb, "metadata", None) or {})}
+            if self.env_fingerprint:
+                # a second copy of the identity, in the file itself: the name already keeps a different
+                # environment out, this makes a file that got in some other way visible instead of silent
+                payload["env_fingerprint"] = self.env_fingerprint
             path = self._file(key, mode)
             tmp = path.with_suffix(".tmp")
             try:
@@ -284,7 +312,7 @@ class ImageEmbeddingDisk:
         self.collect(live, protect)
 
     def _unlink(self, path: pathlib.Path) -> None:
-        self._locked.pop(path.name.split(".")[0], None)
+        self._locked.pop(content_key(path), None)
         try:
             size = path.stat().st_size
             path.unlink()
@@ -330,16 +358,16 @@ class ImageEmbeddingDisk:
                 return 0.0
 
         def within(entry: pathlib.Path) -> float:
-            position = self._position.get(entry.name.split(".")[0])
+            position = self._position.get(content_key(entry))
             return age(entry) if position is None else -position
 
         dropped = 0
         if live is None:                              # nobody said which conversations are live: position only
-            for entry in sorted(files, key=lambda e: (0, age(e)) if self._position.get(e.name.split(".")[0]) is None
-                                else (1, -self._position[e.name.split(".")[0]])):
+            for entry in sorted(files, key=lambda e: (0, age(e)) if self._position.get(content_key(e)) is None
+                                else (1, -self._position[content_key(e)])):
                 if self._bytes + reserve <= self.max_bytes:
                     break
-                if self._locked_now(entry.name.split(".")[0]):
+                if self._locked_now(content_key(entry)):
                     continue
                 self._unlink(entry)
                 dropped += 1
@@ -360,7 +388,7 @@ class ImageEmbeddingDisk:
         unclaimed = len(live) + 1
         groups: dict[int, list] = {}
         for entry in files:
-            groups.setdefault(group_of(entry.name.split(".")[0]), []).append(entry)
+            groups.setdefault(group_of(content_key(entry)), []).append(entry)
 
         for group in sorted(groups, reverse=True):    # least wanted first
             if self._bytes + reserve <= self.max_bytes:
@@ -372,12 +400,12 @@ class ImageEmbeddingDisk:
                 ordered, whole = sorted(entries, key=within), False
             else:                                     # a remembered conversation: it goes as a unit
                 ordered, whole = sorted(entries, key=age), True
-            if whole and any(self._locked_now(e.name.split(".")[0]) for e in entries):
+            if whole and any(self._locked_now(content_key(e)) for e in entries):
                 continue                              # still within its tenure: leave it alone for now
             for entry in ordered:
                 if not whole and self._bytes + reserve <= self.max_bytes:
                     break
-                if not whole and self._locked_now(entry.name.split(".")[0]):
+                if not whole and self._locked_now(content_key(entry)):
                     continue
                 self._unlink(entry)
                 dropped += 1
@@ -391,7 +419,7 @@ class ImageEmbeddingDisk:
     def _break_tenure(self, files: list, reserve: int = 0) -> int:
         """Last resort: the cap has to hold, so the tenures closest to expiring go first."""
         dropped = 0
-        for entry in sorted(files, key=lambda e: self._locked.get(e.name.split(".")[0], 0.0)):
+        for entry in sorted(files, key=lambda e: self._locked.get(content_key(e), 0.0)):
             if self._bytes + reserve <= self.max_bytes:
                 break
             if not entry.exists():

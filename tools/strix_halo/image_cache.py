@@ -54,7 +54,8 @@ def policy_from_env(default: str = DEFAULT_POLICY) -> str:
 
 def digest(raw: bytes) -> str:
     """Content key of an encoded image. One server process holds one vision tower with fixed resize and pixel limits,
-    so the bytes alone decide the embedding; the cache dies with the process."""
+    so the bytes alone decide the embedding; the cache dies with the process. A store that outlives the
+    process has to add what the process fixed (see `env_fingerprint` in tools/glm/image_cache_disk.py)."""
     return hashlib.sha256(raw).hexdigest()
 
 

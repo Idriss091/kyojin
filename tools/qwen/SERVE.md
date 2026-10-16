@@ -105,7 +105,7 @@ The pack is tied to one set of weights: download it from the same model repo.
 
 The log and the stream keep-alive are shared code: switches, format, every event and how to read the
 output accounting are documented once, in [doc/logging.md](../../doc/logging.md). This server writes the
-same events as GLM except for `serve_start`, `img_cache` and `img_disk` (GLM's image cache and disk tier)
+same events as GLM except for `serve_start` and `img_cache` (GLM's image cache and its disk tier)
 and `sse_ping` (this server's pinger writes no log line); `tools/test_serve_logging.py` checks the shared
 part against all three servers at once. Turn it on with `KYOJIN_REQLOG=<path>` (or `1`) and hold a silent
 stream open with `KYOJIN_SSE_PING_S=<seconds>`; both are in [doc/env_vars.md](../../doc/env_vars.md).

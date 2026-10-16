@@ -86,7 +86,7 @@ elsewhere. They go through the log's raw `log()` call, and no other server needs
 |---|---|---|
 | `serve_start` | once, when the server is ready | `model`, `model_id`, `pid`, `ctx`, `cache_tokens`, `sessions`, `num_draft`, `row_budget`, `max_history`, `vision`, `conv_gemm`, `dense_tune`, `moe_fused`, `image_cache_mb`, `image_cache_items`, `image_cache_format`, `image_cache_policy`, `image_cache_dir`, `image_cache_dir_cap_mb`, `image_cache_dir_lock_s`, `heartbeat_s`, `sse_ping_s` |
 | `img_cache` | an image request, after `job_done` | `imgs`, `hits`, `misses`, `first_missing`, `entries`, `mb`, `budget_mb`, `item_cap`, `evicted` |
-| `img_disk` | the same request, when `--image-cache-dir` is set | `files`, `mb`, `cap_mb`, `locked`, `loaded`, `stored`, `dropped`, `skipped`, `written_bytes`, `written_mb`, `skipped_mb`, `errors` |
+| (inside `img_cache`) | the same request, as the `disk=` report, when the disk tier is on | `env`, `files`, `mb`, `cap_mb`, `locked`, `loaded`, `stored`, `dropped`, `skipped`, `written_bytes`, `written_mb`, `skipped_mb`, `errors` |
 
 `img_cache` is the line for image sessions: `hits` and `misses` are the embeddings the cache already held
 and the ones it re-encoded, and **`first_missing` is the index of the first picture that had to be

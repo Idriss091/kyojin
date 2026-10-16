@@ -147,8 +147,58 @@ def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: in
                                **({} if policy is None else {"policy": policy}))
 
 
+def env_fingerprint_source(model_dir: str | None, config) -> dict:
+    """What the rows in the picture cache on disk were computed with (see `make_env_fingerprint`).
+
+    A stored row is only worth keeping while the model and the preprocessing that produced it stay the
+    same, and the file name has to say so or a restart with another model would inject rows from the old
+    one. What goes in: the pack directory (two packs of the same architecture encode differently), the
+    vision settings that decide the resize and the canvas, and the size and mtime of the visual weight
+    shards - the cheap stand-in for hashing ~1.5 GB at every start. A pack that is converted again keeps
+    its name and its config, so its rows are caught only if its shards change size or date; the disk tier
+    is a cache, and a miss costs an encode, not correctness of the answer.
+    """
+    source: dict = {"model": Path(model_dir).name if model_dir else "?"}
+    for attr in ("vision_config", "vision_pp"):
+        part = getattr(config, attr, None)
+        if part is None:
+            continue
+        for field in ("patch_size", "merge_size", "temporal_patch_size", "min_image_tokens",
+                      "max_image_tokens", "spatial_merge_size", "hidden_size"):
+            value = getattr(part, field, None)
+            if value is not None:
+                source[f"{attr}.{field}"] = value
+    if model_dir:
+        index = Path(model_dir) / "model.safetensors.index.json"
+        try:
+            weight_map = json.loads(index.read_text())["weight_map"]
+            shards = sorted({name for key, name in weight_map.items()
+                             if "visual" in key or "vision" in key})
+            for name in shards:
+                shard = Path(model_dir) / name
+                stat = shard.stat()
+                source[f"shard.{name}"] = f"{stat.st_size}:{int(stat.st_mtime)}"
+        except (OSError, KeyError, ValueError):
+            pass
+    return source
+
+
+def make_env_fingerprint(model_dir: str | None, config) -> str:
+    """`env_fingerprint_source` reduced to a short name that can go in a file name.
+
+    Hashed rather than spelled out, so the name stays portable and fixed-length; the source dictionary is
+    written into the request log too - `image_cache_env` on the `serve_start` line and `env` inside the
+    `disk=` report of `img_cache` - which is what makes a fingerprint that changed between two runs visible
+    instead of mysterious.
+    """
+    import hashlib
+    source = env_fingerprint_source(model_dir, config)
+    blob = json.dumps(source, sort_keys=True).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
 def make_image_disk(image_cache_dir: str | None, image_cache_dir_max_gb: float, image_cache_dir_lock_s: float,
-                    start_token: int = 0, end_token: int = 0):
+                    start_token: int = 0, end_token: int = 0, env_fingerprint: str = ""):
     """The second-level picture cache, or None when it is off (`--image-cache-dir-max-gb` 0 or less).
 
     A cap is required: the disk cache is meant for conversations with more pictures than `--image-cache-mb`
@@ -160,7 +210,8 @@ def make_image_disk(image_cache_dir: str | None, image_cache_dir_max_gb: float, 
     return ImageEmbeddingDisk(image_cache_dir or IMAGE_CACHE_DIR_DEFAULT,
                               int(float(image_cache_dir_max_gb) * 2 ** 30),
                               start_token=int(start_token or 0), end_token=int(end_token or 0),
-                              lock_s=max(0.0, float(image_cache_dir_lock_s)))
+                              lock_s=max(0.0, float(image_cache_dir_lock_s)),
+                              env_fingerprint=env_fingerprint)
 
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
@@ -522,9 +573,11 @@ class ResidentEngine:
         self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
         # Second-level cache: the rows of the pictures the memory cache evicts. Off unless a cap is given
         # (--image-cache-dir-max-gb > 0), because the memory budget above is what a normal session needs.
+        self.env_fingerprint = make_env_fingerprint(model_path, self.config)
         self.emb_disk = make_image_disk(image_cache_dir, image_cache_dir_max_gb, image_cache_dir_lock_s,
                                         getattr(self.config, "vision_start_token_id", 0),
-                                        getattr(self.config, "vision_end_token_id", 0))
+                                        getattr(self.config, "vision_end_token_id", 0),
+                                        env_fingerprint=self.env_fingerprint)
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -1871,6 +1924,7 @@ def main() -> None:
                image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
                image_cache_dir_lock_s=engine.emb_disk.lock_s if getattr(engine, "emb_disk", None) else None,
+               image_cache_env=getattr(engine, "env_fingerprint", None),
                heartbeat_s=reqlog.heartbeat_s,
                sse_ping_s=ping.interval_s or None)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
