@@ -77,6 +77,15 @@ class NgramIndex:
     def truncate(self, p):
         n = len(self.toks)
         assert 0 <= p <= n
+        if p == 0 and n:
+            # a whole new context (a new conversation): the walk below undoes every push one by one (11-23 ms at 8K tokens, inside the
+            # time to first token) and ends in the freshly built state, so build that state directly (checked by test_ngram_index)
+            lmax, nmin = self.lmax, self.nmin
+            self.toks = array("i")
+            self.key = [None] + [array("q", [-1]) for _ in range(lmax)]
+            self.prev = [None] + [array("i", [-1]) if m >= nmin else None for m in range(1, lmax + 1)]
+            self.latest = [None] + [{} if m >= nmin else None for m in range(1, lmax + 1)]
+            return
         key, prev, latest = self.key, self.prev, self.latest
         for e in range(n, p, -1):
             for m in range(self.nmin, self.lmax + 1):
