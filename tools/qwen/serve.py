@@ -616,7 +616,11 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # Grouped MoE prefill GEMM: mpw2 (the engine default, +3-5 % prefill over the legacy kernel, identical ids). Its CPU bounds
              # proof (tools/qwen/check_mpw2_qwen.py --bits 4, bal pack: 4-bit routed experts, gate/up N 640, down N 2560, 63748 launches,
              # 0 failures, mutants fail) passed on this tree. The K6 draft experts never reach it (k2 12 aborts in a host check).
-             ("MPW_KERN", "2"))
+             ("MPW_KERN", "2"),
+             # 16/10: tensor-core MoE GEMM from 9 rows (was 32). Short prompts (17-31 tokens) stop taking the per-expert GEMV
+             # path: time to first token 212 vs 360 ms on short chat prompts, decode unchanged. Vs the true next tokens over
+             # 1500 prompts it moves the model no more than prefilling the same prompt in two chunks (KLD ratio 0.98).
+             ("EXL3_MOE_WMMA_MIN_ROWS", "9"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
@@ -691,6 +695,7 @@ LATCHED = (
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._MOE_VALU, lambda: os.environ.get("EXL3_MOE_VALU", "0") != "0"),
     ("exllamav3.modules.block_sparse_mlp_routing", lambda m: m._HIP_PREFILL_MIN_ROWS,
      lambda: max(2, int(os.environ.get("EXL3_HIP_PREFILL_MIN_ROWS", "17")))),
+    ("exllamav3.modules.block_sparse_mlp", lambda m: m._HIP_WMMA_MIN_ROWS, lambda: int(os.environ.get("EXL3_MOE_WMMA_MIN_ROWS", "32"))),
     ("exllamav3.modules.attention_fn.qsa_triton", lambda m: m.ROWINV["on"], lambda: _env_flag("EXL3_QSA_ROWINV", "1")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_PROJ["on"], lambda: _env_flag("EXL3_VERIFY_QSA_PROJ", "0")),
     ("exllamav3.modules.qsa_indexer", lambda m: m.VERIFY_QSA_ATTN["mode"],
