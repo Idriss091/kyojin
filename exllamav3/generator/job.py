@@ -1429,12 +1429,9 @@ class Job:
             branch_row = None
             if (gdn_nt or big_tail) and self.recurrent_state is not None and prefill_start % PAGE_SIZE == 0 and \
                     os.environ.get("EXL3_BRANCH_CKPT", "0") == "1":
-                q = prefill_start // PAGE_SIZE
-                while q < len(seq.allocated_pages) and (q + 1) * PAGE_SIZE < prefill_end and \
-                        seq.allocated_pages[q].kv_position == PAGE_SIZE:
-                    q += 1
-                if q * PAGE_SIZE > prefill_start and q * PAGE_SIZE - prefill_start != no_tail_row:
-                    branch_row = q * PAGE_SIZE - prefill_start
+                L = getattr(self, "kv_only_end", 0)
+                if prefill_start < L < prefill_end and L - prefill_start != no_tail_row:
+                    branch_row = L - prefill_start
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1700,6 +1697,13 @@ class Job:
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+
+            # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
+            # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
+            q = cached_pages
+            while q < len(seq.allocated_pages) and seq.allocated_pages[q].kv_position == PAGE_SIZE:
+                q += 1
+            self.kv_only_end = q * PAGE_SIZE
 
             # Metrics
             self.cached_pages += cached_pages
