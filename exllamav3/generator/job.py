@@ -1397,7 +1397,11 @@ class Job:
                 # last chunks have the same shapes cold and resumed (a 6144 resume of a 7000-token prompt ran one 855-row
                 # chunk instead of cold's 768 + 87 and the recurrent state differed). Only a mid-page resume (tail
                 # checkpoint, never comparable to a cold prefill) keeps the distance to its checkpoint.
-                gap_base = self.cached_pages * PAGE_SIZE if self._unaligned_start else 0
+                # EXL3_TAIL_OFFGRID=1 (default off): a page-aligned resume off the chunk grid (a branch or last-page checkpoint)
+                # never matches a cold prefill's chunks either, so it also measures the gap from the resume point
+                resume_pos = self.cached_pages * PAGE_SIZE
+                off_grid = os.environ.get("EXL3_TAIL_OFFGRID", "0") == "1" and resume_pos % self.generator.max_chunk_size != 0
+                gap_base = resume_pos if self._unaligned_start or off_grid else 0
                 # EXL3_PF_NO_TAIL=1 (default 0, big-tail mode only): no separate pass for the prompt's last page
                 # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
                 # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)

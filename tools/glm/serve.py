@@ -98,6 +98,9 @@ SPEED_ENV = {
     # side-writes the state where those pages end, so the next one resumes there: first token after a shared 9K / 12.1K prefix
     # 2.41 -> 1.94 s, 3.84 -> 2.06 s; the writing prompt is bitwise unchanged, KLD vs a cold prefill at the resumed-turn level.
     "EXL3_BRANCH_CKPT": "1",
+    # such a resume (page-aligned, off the 2048 chunk grid) with a short remainder keeps the tail in its one chunk (prompt-end tail
+    # checkpoint) instead of a separate last-page forward: 2.00 -> 1.42 s, 2.44 -> 1.51 s; KLD vs a cold prefill unchanged in class.
+    "EXL3_TAIL_OFFGRID": "1",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
