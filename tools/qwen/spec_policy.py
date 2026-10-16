@@ -403,6 +403,8 @@ def install_lookup(g, ngram, stats=None):
         w = g.num_draft_tokens; g.num_draft_tokens = 1
         try: out = orig(results)
         finally: g.num_draft_tokens = w
+        # the verified tokens are the copy, not the drafter's: its confidence record (one column) must not label them
+        g._draft_conf_round = None
         if out is None: return None
         if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + len(cont)
         return torch.tensor([cont], dtype=torch.long)
