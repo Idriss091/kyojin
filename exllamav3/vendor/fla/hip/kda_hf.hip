@@ -209,13 +209,15 @@ extern "C" __global__ void kda_chunk16_wmma(
 #pragma unroll
             for (int r = 0; r < 8; ++r) lf_s[2 * r + hi][l16] = P[r];
             GC_WAVE_SYNC();
-            if (hi == 0) {   // in place, lane l16 = column c: lf_s[i][c] <- T[i][c] = (i == c) + sum_{j < i} L[i][j] T[j][c]
-                             // (row i of L is read before it is overwritten; T[j][c] is this lane's own earlier store)
-#pragma unroll 1
-                for (int i = 0; i < 16; ++i) {   // rolled: unrolled, the 120 LDS loads are hoisted into VGPRs (occupancy 6 -> 5)
+            if (hi == 0) {   // lane l16 = column c: T[i][c] = (i == c) + sum_{j < i} L[i][j] T[j][c], column c held in registers
+                float tc[16];   // (same fmaf order as a rolled loop over an in-place LDS tile: bitwise the same T)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
                     float a = i == l16 ? 1.f : 0.f;
-                    for (int j = 0; j < i; ++j) a = fmaf(lf_s[i][j], lf_s[j][l16], a);
-                    lf_s[i][l16] = a;
+#pragma unroll
+                    for (int j = 0; j < i; ++j) a = fmaf(lf_s[i][j], tc[j], a);
+                    asm volatile("" : "+v"(a));   // a materialized in fp32: no fma -> f16 fusion (v_fma_mix) at the store
+                    tc[i] = a;
                     t_s[i][l16] = (_Float16)a;
                 }
             }
