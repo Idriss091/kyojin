@@ -4,7 +4,7 @@
 // (our fused_gated_rms_norm runs after, unchanged); z / norm arguments are then unused (may be null); prefix-cache checkpoint
 // side-write; T = (I - L)^-1 by fp32 forward substitution instead of the f16 product form (PPL, see the comment at the solve).
 // SPDX-License-Identifier: Apache-2.0
-// hipfire — see LICENSE and NOTICE in the project root.
+// hipfire's Apache-2.0 licence and NOTICE: LICENSE.hipfire-APACHE and NOTICE.hipfire next to this file.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>

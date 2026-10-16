@@ -4,6 +4,7 @@
 // The 16x16 intra-chunk blocks are computed in the kernel (bf16 WMMA on q, k scaled by 2^{+-(g - g_m)} around the chunk's middle
 // row m; KHF_TP=1 instead reads them from fla's token_parallel kernel), the decay factors are per channel, raw o rows out.
 // SPDX-License-Identifier: Apache-2.0
+// hipfire's Apache-2.0 licence and NOTICE: LICENSE.hipfire-APACHE and NOTICE.hipfire next to this file.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
