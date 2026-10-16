@@ -26,6 +26,7 @@ class Gen:
     def enqueue(self, job): return None
     def iterate_draftmodel_mtp_gen(self, results):
         self.draft_calls += 1
+        self._draft_conf_round = {"window": self.num_draft_tokens}   # the dynamic-depth record of this drafter round
         return torch.tensor([[0] * self.num_draft_tokens], dtype=torch.long)
 
 def run(rounds, gain_ng, gain_dr, gate="1"):
@@ -55,6 +56,20 @@ class LookupGate(unittest.TestCase):
     def test_gate_off_restores_old_behaviour(self):
         ng, gated = run(50, gain_ng=1, gain_dr=3, gate="0")
         self.assertEqual(ng, 50); self.assertEqual(gated, 0)
+
+class LookupConfidence(unittest.TestCase):
+    def test_lookup_round_drops_the_drafter_confidence_record(self):
+        # A lookup round runs the drafter at window 1 but verifies the K copied tokens: the 1-column confidence record must
+        # not label them (EXL3_GLM_DYN crashed on the first copy turn); a drafter round keeps its record
+        os.environ["QWSPEC_NGRAM_GATE"] = "0"
+        g = Gen(Sid(list(range(100, 140)) * 50)); stats = {}
+        spec_policy.install_lookup(g, (2, 7, 16, 3), stats)
+        g.iterate_draftmodel_mtp_gen(None)
+        self.assertEqual(stats.get("ng"), 1); self.assertIsNone(g._draft_conf_round)
+        g2 = Gen(Sid(list(range(100, 300)))); stats2 = {}
+        spec_policy.install_lookup(g2, (2, 7, 16, 3), stats2)
+        g2.iterate_draftmodel_mtp_gen(None)
+        self.assertIsNone(stats2.get("ng")); self.assertEqual(g2._draft_conf_round, {"window": 2})
 
 if __name__ == "__main__":
     unittest.main()
