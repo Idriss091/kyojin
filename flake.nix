@@ -540,7 +540,7 @@
             pname = "kyojin";
             # Keep in sync with exllamav3/version.py (pyproject-nix reports
             # local-project version as 0.0.0 since it's setuptools-dynamic).
-            version = "1.5.7";
+            version = "1.5.8";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
@@ -588,7 +588,7 @@
           # --corpus explicitly anywhere else.
           kyojinBench = pkgs.stdenv.mkDerivation {
             pname = "kyojin-bench";
-            version = "1.5.7";
+            version = "1.5.8";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
@@ -679,7 +679,7 @@
             pyForHub.pkgs.huggingface-hub;
           kyojinImage = pkgs.dockerTools.buildLayeredImage {
             name = "kyojin";
-            tag = "1.5.7";
+            tag = "1.5.8";
             # Layer root is the cwd here: relative paths only. /tmp must
             # exist (Python tempfile, torch cuda shims); the model volume
             # supplies persistence, container /tmp stays ephemeral.
