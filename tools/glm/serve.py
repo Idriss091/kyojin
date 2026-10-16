@@ -67,6 +67,8 @@ SPEED_ENV = {
     # 27/09: R-row verify linears in one launch (Hadamards in-kernel):
     # served R=2 round -3.04 +- 0.20 ms, +6.7 % t/s; R=1 bitwise, R=2 greedy 64/64.
     "EXL3_VERIFY_FUSE": "1",
+    # calibrated dynamic draft depth for the MTP drafter; served decode geomean x1.070 (structured x1.104, code x1.070, prose x1.036).
+    "EXL3_GLM_DYN": "3,0.70",
     # 27/09: one router launch per verify + wide MoE combine; with R=3 (--num-draft 2)
     # served +6.42 +- 1.34 % vs R=2 base (12 prompts/arm, greedy ids 128/128 x 3 equal).
     "EXL3_DEC_ROUTER_ROWS": "2",
