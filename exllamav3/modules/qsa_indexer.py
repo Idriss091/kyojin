@@ -601,7 +601,15 @@ class QSAIndexer(Module):
         npr = bt.shape[1]
         page_size = layer.raw_k.shape[1]
 
-        xc = x.contiguous()
+        # the HC mix hands the attention site a row-padded view (hc_pad_ok); q/k/v read it as is, so the indexer
+        # projection does too instead of compacting the whole block input (same bytes into the GEMM, bit-exact).
+        # EXL3_QSA_IDX_PAD=0 (read per call) goes back to the copy
+        from .quant.exl3 import _pad_view_ok, _pad_eligible
+        if not x.is_contiguous() and os.environ.get("EXL3_QSA_IDX_PAD", "1") != "0" and _pad_view_ok(x) \
+                and _pad_eligible(self.index_qk_proj, x.shape[-1], R, params):
+            xc = x
+        else:
+            xc = x.contiguous()
         qk = self.index_qk_proj.forward(xc, params).view(R, (H + 1) * dk)
         if bsz == 1 and 1 < seqlen <= 8 and params.get("dflash_verify") and (VERIFY_QSA_PROJ["on"] or QSA_SHADOW["on"]):
             qk = qk.clone()
