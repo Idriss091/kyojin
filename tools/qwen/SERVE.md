@@ -91,11 +91,6 @@ The pack is tied to one set of weights: download it from the same model repo.
 - Debug extensions (all optional): `"speculative": false` decodes plain for that request, `"cache_prompt": false`
   forgets the prompt cache first (cold run), `"return_token_ids": true` adds the generated ids. Switching
   speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache (400 with `--sessions` > 1).
-- A turn is silent on the wire for as long as the server has nothing to send (headers and one empty role
-  chunk, then nothing until text is ready — including a decode that is holding a `<tool_call>` back until
-  its XML closes), so `KYOJIN_SSE_PING_S=<seconds>` makes the server write an SSE comment
-  (`: waiting <n> s`) after that much silence. Off by default, shared with the other two servers; the
-  switch and its start-up line are in [doc/env_vars.md](../../doc/env_vars.md).
 
 - vLLM-style extensions (also used by the RigMark benchmark): `POST /tokenize` (`{"prompt"|"messages", "add_special_tokens"}` ->
   `{"tokens", "count", "max_model_len"}`); `/v1/completions` takes `prompt` as a list of token ids (`[1, 2, 3]` or `[[1, 2, 3]]`):
@@ -105,6 +100,15 @@ The pack is tied to one set of weights: download it from the same model repo.
   salts never share prompt cache. The server keeps one salt namespace at a time (requests without a salt are one namespace):
   when it changes, running requests finish, the prompt cache is dropped (a fresh Generator, as `cache_prompt: false` does), and the
   request starts. The same salt, or no salt at all, never drops anything, so only the first request after a change pays the rebuild.
+
+## Diagnostics: the request log
+
+The log and the stream keep-alive are shared code: switches, format, every event and how to read the
+output accounting are documented once, in [doc/logging.md](../../doc/logging.md). This server writes the
+same events as GLM except for `serve_start`, `img_cache` and `img_disk` (GLM's image cache and disk tier)
+and `sse_ping` (this server's pinger writes no log line); `tools/test_serve_logging.py` checks the shared
+part against all three servers at once. Turn it on with `KYOJIN_REQLOG=<path>` (or `1`) and hold a silent
+stream open with `KYOJIN_SSE_PING_S=<seconds>`; both are in [doc/env_vars.md](../../doc/env_vars.md).
 
 ## Start-up progress on `/health`
 

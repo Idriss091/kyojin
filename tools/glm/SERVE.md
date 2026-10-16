@@ -219,102 +219,18 @@ parse, otherwise kept as strings.
 
 ## Diagnostics: the request log
 
-**It is off unless you ask for it.** With `KYOJIN_REQLOG` unset, nothing is opened and every call is a
-no-op: a default deployment behaves exactly as before and writes no file. The server prints which of the
-two it is at start-up, so the switch stays discoverable:
+The log is shared code and its switches, format, every event, the shared/GLM-only split and how to read
+the output accounting are documented once, in [doc/logging.md](../../doc/logging.md). What belongs to
+this server:
 
-```
-serve: request log off (set KYOJIN_REQLOG=<path> to enable, numbers and event names only)
-serve: request log /home/you/.cache/kyojin/requests.log (heartbeat 10 s, numbers and event names only, no prompt or reply text)
-```
+* **its events are the reference vocabulary** — `img_cache`, `img_disk` and `serve_start` exist here
+  because this is the server with an image cache, a disk tier and a start-up record; the other two run
+  the same `Lifecycle` and `tools/test_serve_logging.py` holds all three to the same field lists;
+* the start-up lines an operator sees are `serve: request log …` and `serve: SSE keep-alive …`;
+* **GLM is the only server whose pinger also writes its comments to the log**, so `sse_ping` lines and
+  the `sse_ping_s` field of `serve_start` appear here and not on Qwen or MiMo.
 
-| variable | default | meaning |
-|---|---|---|
-| `KYOJIN_REQLOG` | **unset = off** | a path, or `1`/`on`/`yes` for `~/.cache/kyojin/requests.log`; `0`/`off`/`none`/`no`/`false` also disable it |
-| `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | seconds between `alive` lines while a job is queued, prefilling or decoding; `0` disables the heartbeat |
-
-Every line is `<local ISO timestamp with ms> <event> srv=glm key=value ...`, and every line of one request
-carries the same opaque `req=` id, so `grep <id>` follows one request from arrival to reply across the
-queue and the worker. Events, in the order a request that goes through produces them:
-
-| event | written when | useful fields |
-|---|---|---|
-| `serve_start` | server ready, once | `ctx`, `cache_tokens`, `sessions`, `num_draft`, `row_budget`, `vision`, `conv_gemm`, `dense_tune`, `image_cache_mb`, `image_cache_items`, `image_cache_format`, `sse_ping_s` |
-| `req_start` | request arrives | `path`, `method`, `bytes` |
-| `req_refused` | 400/404/... answer | `status`, `reason` (the server's own text; a JSON parse error is reduced to line/column) |
-| `req_queued` | handed to the worker queue | `queued_ahead`, `prompt_tokens`, `messages`, `images`, `stream` |
-| `job_start` | worker picks it up | `wait_s` (queue time), `prompt_tokens`, `images`, `sessions`, `processing`, `running` |
-| `alive` | every `KYOJIN_REQLOG_HEARTBEAT_S` while tracked | `phase` (`parse`/`queued`/`prefill`/`decode`/`stream`), `elapsed_s`, `processing`, `running`, and for a streaming reply **`out_events` / `out_chars` / `last_out_s`** — what the client has been sent so far, and how long since the last *data event* (a keep-alive comment does not count) |
-| `sse_summary` | one line when a streaming reply ends (or the client leaves) | `out_events`, `out_chars`, `last_out_s` (since the last data event), `comments` (keep-alive comments, counted apart from data events), `comment_chars`, `last_comment_s`, `errors` |
-| `job_first_token` | first generated token | `elapsed_s` — when the model first produced anything |
-| `sse_headers` / `sse_first_content` | streaming: headers sent / first frame with text | `first_s` since arrival — the gap the client experiences as silence |
-| `sse_ping` | a keep-alive comment went to the client (only with `KYOJIN_SSE_PING_S`) | `n` (which comment of this request), `waited_s` — how long the client had been waiting |
-| `job_done` | job finished | `prompt_tokens`, `cache_n`, `cache_pct`, `new_tokens`, `prefill_s`, `decode_s`, `elapsed_s` |
-| `img_cache` | image request, after `job_done` | `imgs`, `hits`, `misses`, `first_missing`, `entries`, `mb`, `budget_mb`, `item_cap`, `evicted` |
-| `img_disk` | the same request, when `--image-cache-dir` is set | `files`, `mb`, `cap_mb`, `locked`, `loaded`, `stored`, `dropped`, `skipped`, `written_bytes`, `written_mb`, `skipped_mb`, `errors` |
-| `sse_done` / `req_done` | stream closed / response returned | `out_tokens`, `status`, `elapsed_s` |
-| `client_left` | client hung up first | `path`, `stage` |
-| `job_skipped` / `job_error` / `stream_error` / `req_error` | cancelled before start / failure | `error` (type plus a truncated message) |
-
-`img_cache` is the line for image sessions: `hits` and `misses` are the embeddings the cache already held
-and the ones it re-encoded, and **`first_missing` is the index of the first picture that had to be
-re-encoded — the paged KV prefix can only match up to it.** A full hit has no `first_missing` field at all;
-`evicted` counts entries this call pushed out. Nothing in the log reports prompt, reply, tool or
-image-path text; the one exception is the server's own refusal `reason`, which is why a JSON parse error is
-reduced to line/column (its message quotes the body).
-
-**`out_events` is the number that answers "was the server actually writing?"** A client that reports
-silence for ten minutes while `out_events` climbs means the bytes were on the wire and the client did not
-show them; a flat `out_events` with a rising `last_out_s` means the server had nothing to send, and the
-`phase` then says what it was doing instead (`prefill` = still processing the prompt, `decode` = generating
-into something not sent yet, typically a tool call held until its XML closes). In the 2026-10-15 incident
-the agent aborted at its 600 s ceiling in every combination of those, and only these counters can tell
-them apart afterwards.
-
-Measured example of the decode case (a `write_file` call with a 6.8 KB argument, one generation of
-98.7 s): nine comments at 17 s … 98 s, while the heartbeat reads the same numbers throughout —
-`phase=decode out_events=135 out_chars=29397 last_out_s=2.5 → 12.5 → … → 82.5` — because the 2 144 tokens
-of the tool call were held back and the client was sent nothing for 95 s. The closing summary is
-`out_events=138 out_chars=40067 last_out_s=0 comments=9`: the reply arrived in three frames at the end.
-A client that gave up at 90 s of silence would have been aborted there, with the whole generation lost.
-
-Cost when enabled: one `write`+`flush` per event on the event loop, tens of bytes per line. When a request
-is slow, `grep -E 'alive|job_first_token|job_done' requests.log` shows whether it was waiting in the queue,
-prefilling a prompt the cache could not serve, or decoding.
-
-## Diagnostics: keeping a slow stream alive
-
-The request log makes a quiet server visible **to you**; `KYOJIN_SSE_PING_S` makes it visible **to the
-client**. A streaming request is answered with its headers and one empty role chunk, and then nothing at
-all until the prompt is prefilled — hundreds of seconds for a large image conversation — so a client that
-aborts a stream it has not heard from in two minutes gives up on a server that is working, and (the page
-cache being empty for that request) a retry starts the whole prefill again.
-
-With `KYOJIN_SSE_PING_S=<seconds>` set, a stream that has written no data event for that long gets one
-SSE **comment** line, which every event-stream client skips:
-
-```
-: waiting 105 s
-
-```
-
-It counts from the request's arrival, appears once per interval, and covers **every** silence, not only
-the prefill:
-
-* the prefill of a long prompt (the `role` chunk a client gets immediately is not output);
-* the decode of a reply that writes a file — the whole `<tool_call>` is held back until its XML closes,
-  so a 7 KB `content` argument is ~100 s of generation the client never sees. Measured on this box with
-  a `write_file` call: `sse_first_content first_s=1.3`, then nine comments at 16 s … 96 s, while
-  `job_done` reported `new_tokens=2195 prefill_s=1.1 decode_s=99.5`. Before the comments covered
-  decode, agent clients aborted those turns at ~300 s of silence and every retry paid the full prefill
-  again (the page cache of a cancelled request is released).
-
-A stream that is producing text never gets a comment. All three servers share the module
-(`tools/strix_halo/serve_ping.py`), which is one `await ping.comment(response, started)` before each
-poll. Default `0` = off: nothing is ever written and a stream is byte-for-byte what it was. Each
-comment is also one `sse_ping` line in the request log, so the two timelines can still be lined up. It
-does not replace a client-side timeout — it keeps a client that tolerates comments from giving up, and
-tells you the server was alive if one does anyway.
+Turn it on with `KYOJIN_REQLOG=<path>` (or `1`); both switches are in [doc/env_vars.md](../../doc/env_vars.md).
 
 ## Start-up progress on `/health`
 

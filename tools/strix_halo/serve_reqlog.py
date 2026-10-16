@@ -27,12 +27,16 @@ event name, then `key=value` fields; every line of one request carries the same 
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import functools
 import json
 import os
 import pathlib
 import sys
 import threading
 import time
+import uuid
 from typing import Any
 
 DEFAULT_PATH = "~/.cache/kyojin/requests.log"
@@ -128,6 +132,233 @@ class StreamWriter:
 
     async def write_eof(self) -> None:
         await self.response.write_eof()
+
+
+class Lifecycle:
+    """The request lifecycle a server logs, in one place for all of them.
+
+    Every server used to carry its own copy of this: the request table, the context variable that names
+    the request, the 'alive' heartbeat, and the route wrapper that stamps one id on every line. The
+    copies drifted (one server forgot an argument, another measured a different span, a third spelled an
+    event differently), so the machinery lives here and a server only says **when** something happened.
+
+    A server keeps its own event *call sites* — where in its worker and its routes the phases begin is
+    the one thing that genuinely differs — and calls the method for the event it has:
+
+        log = Lifecycle(ReqLog.from_env("glm"), ping=ServePing.from_env(reqlog),
+                        counters=lambda: {"processing": processing, "running": running})
+        app.router.add_post("/v1/chat/completions", log.wrapped(completions))
+        log.queued(rid, "/v1/chat/completions", prompt_tokens=n, images=len(imgs), stream=True)
+        ...
+        await log.heartbeat_forever()      # started on app startup, cancelled on cleanup
+
+    **An event or field a server does not have is simply not passed**, which is what keeps one
+    implementation usable by three servers: `ReqLog.log` skips `None` fields and accepts any event name,
+    so a missing counter or an event a server never reaches leaves no line and no branch anywhere. What a
+    server does report is up to its call sites, never to a per-server flag in here. The one event with
+    server-specific fields is the raw `log()` escape hatch (`img_cache` on GLM, `serve_start`), which
+    carries whatever that server measured.
+
+    Counters are pulled per heartbeat through `counters()`, so each server reports the ones it has
+    (GLM tracks requests in flight and running separately; Qwen and MiMo have one number).
+    """
+
+    def __init__(self, reqlog: "ReqLog", ping: Any = None, counters: Any = None,
+                 server: str | None = None) -> None:
+        self.reqlog = reqlog
+        self.ping = ping
+        self.counters = counters
+        self.server = server or getattr(reqlog, "server", None)
+        self.inflight: dict[str, dict[str, Any]] = {}
+        self.writers: dict[str, StreamWriter] = {}
+        self.current: contextvars.ContextVar[str | None] = contextvars.ContextVar("reqid", default=None)
+        self._counters: dict[str, Any] = {}
+
+    # ---- request identity and per-request state ---------------------------------------------------
+
+    def reqid(self) -> str | None:
+        """The log id of the request being handled (None outside a wrapped route)."""
+        return self.current.get()
+
+    def track(self, rid: str | None, phase: str, **fields: Any) -> None:
+        """Record the phase a request is in, and anything the heartbeat should repeat."""
+        if rid is None:
+            return
+        st = self.inflight.setdefault(rid, {"t0": time.perf_counter()})
+        st["phase"] = phase
+        st.update(fields)
+
+    def writer(self, rid: str | None, response: Any, path: str | None = None) -> StreamWriter:
+        """The request's stream writer: what it writes is counted, and the heartbeat reports it."""
+        writer = StreamWriter(response)
+        writer.path = path                     # so the summary line can name the route, as it always has
+        if rid is not None:
+            self.writers[rid] = writer
+        return writer
+
+    def log(self, event: str, **fields: Any) -> None:
+        """A line only this server writes (a start-up record, a cache report): pass it through."""
+        self.reqlog.log(event, **fields)
+
+    # ---- request level ---------------------------------------------------------------------------
+
+    def request_started(self, rid: str, request: Any) -> float:
+        """Open a request: id, arrival time, and the `req_start` line. Returns the start time."""
+        self.current.set(rid)
+        started = time.perf_counter()
+        self.track(rid, "parse")
+        self.reqlog.log("req_start", req=rid, path=request.path, method=request.method,
+                        bytes=request.content_length)
+        return started
+
+    def refused(self, rid: str, path: str, exc: Any, started: float) -> None:
+        self.reqlog.log("req_refused", req=rid, path=path, status=exc.status,
+                        reason=refusal_text(exc), elapsed_s=round(time.perf_counter() - started, 3))
+
+    def handler_left(self, rid: str, path: str) -> None:
+        self.reqlog.log("client_left", req=rid, path=path, stage="handler")
+
+    def request_error(self, rid: str, path: str, exc: BaseException, started: float) -> None:
+        self.reqlog.log("req_error", req=rid, path=path, error=sanitize(exc),
+                        elapsed_s=round(time.perf_counter() - started, 3))
+
+    def request_done(self, rid: str, path: str, response: Any, started: float) -> None:
+        self.reqlog.log("req_done", req=rid, path=path, status=response.status,
+                        elapsed_s=round(time.perf_counter() - started, 3))
+
+    def client_left(self, path: str, stage: str = "waiting", rid: str | None = None) -> None:
+        """The client hung up first: the server's side of a cancelled turn, on record."""
+        self.reqlog.log("client_left", req=rid if rid is not None else self.reqid(), path=path, stage=stage)
+
+    def wrapped(self, handler: Any) -> Any:
+        """Wrap a route so its lifecycle lands in the log: one id per request, `grep <id>` follows it."""
+        @functools.wraps(handler)
+        async def wrapper(request: Any) -> Any:
+            rid = f"r{uuid.uuid4().hex[:12]}"
+            token = self.current.set(rid)
+            started = time.perf_counter()
+            self.track(rid, "parse")
+            self.reqlog.log("req_start", req=rid, path=request.path, method=request.method,
+                            bytes=request.content_length)
+            try:
+                response = await handler(request)
+            except asyncio.CancelledError:
+                self.handler_left(rid, request.path)
+                raise
+            except Exception as exc:                                  # noqa: BLE001  classified here
+                if hasattr(exc, "status"):                            # aiohttp's HTTPException
+                    self.refused(rid, request.path, exc, started)
+                else:
+                    self.request_error(rid, request.path, exc, started)
+                raise
+            else:
+                self.request_done(rid, request.path, response, started)
+                return response
+            finally:
+                self.finish(rid)
+                self.current.reset(token)
+        return wrapper
+
+    def finish(self, rid: str) -> None:
+        """Close a request: its summary line (what the client was sent) and its bookkeeping."""
+        writer = self.writers.pop(rid, None)
+        if writer is not None:
+            for event, fields in writer.stats.lines():
+                self.reqlog.log(event, req=rid, path=getattr(writer, "path", None), **fields)
+        self.inflight.pop(rid, None)
+
+    # ---- job level (the worker side) -------------------------------------------------------------
+
+    def queued(self, rid: str | None, path: str, **fields: Any) -> None:
+        """The request is in the worker queue: what it is, and how many are ahead of it."""
+        self.track(rid, "queued", prompt_tokens=fields.get("prompt_tokens"))
+        self.reqlog.log("req_queued", req=rid, path=path, **fields)
+
+    def job_started(self, rid: str | None, wait: float, **fields: Any) -> None:
+        """The worker picked the job up: `wait` is the queue time, the rest is what this server knows."""
+        self.track(rid, "prefill", prompt_tokens=fields.get("prompt_tokens"))
+        self.reqlog.log("job_start", req=rid, wait_s=round(wait, 3), **fields)
+
+    def job_skipped(self, rid: str | None, queued_s: float) -> None:
+        """A job cancelled while it was still queued: no prefill, no decode, one line."""
+        self.reqlog.log("job_skipped", req=rid, queued_s=round(queued_s, 3))
+
+    def first_token(self, rid: str | None, started: float, **fields: Any) -> None:
+        """The model produced its first token, and the request moves to decode."""
+        self.track(rid, "decode", prompt_tokens=fields.get("prompt_tokens"))
+        self.reqlog.log("job_first_token", req=rid, elapsed_s=round(time.perf_counter() - started, 3))
+
+    def job_done(self, rid: str | None, stats: Any, started: float, prompt_tokens: int = 0) -> None:
+        """A finished job: what the prompt cache did (cache_n vs prompt tokens) and how long each phase
+        took. `prompt_tokens` is the fallback for an engine (or a fake one in tests) that reports none."""
+        st = stats or {}
+        prompt = int(st.get("prompt_tokens") or prompt_tokens or 0)
+        cache_n = int(st.get("cached_tokens") or 0)
+        self.reqlog.log("job_done", req=rid, elapsed_s=round(time.perf_counter() - started, 3),
+                        prompt_tokens=prompt, cache_n=cache_n,
+                        cache_pct=round(100.0 * cache_n / prompt, 1) if prompt else 0.0,
+                        new_tokens=int(st.get("new_tokens") or 0),
+                        prefill_s=round(float(st.get("time_prefill") or 0.0), 3),
+                        decode_s=round(float(st.get("time_generate") or 0.0), 3))
+
+    def job_error(self, rid: str | None, exc: BaseException, started: float | None = None) -> None:
+        self.reqlog.log("job_error", req=rid, error=sanitize(exc),
+                        elapsed_s=round(time.perf_counter() - started, 3) if started else None)
+
+    def stream_error(self, rid: str | None, exc: BaseException) -> None:
+        self.reqlog.log("stream_error", req=rid, error=sanitize(exc))
+
+    # ---- stream level ----------------------------------------------------------------------------
+
+    def stream_started(self, rid: str | None, path: str, response: Any, prompt_tokens: int = 0) -> StreamWriter:
+        """The SSE headers are out: register the writer the heartbeat reads and log the headers."""
+        writer = self.writer(rid, response, path)
+        self.track(rid, "stream", prompt_tokens=prompt_tokens)
+        self.reqlog.log("sse_headers", req=rid, path=path)
+        return writer
+
+    def first_content(self, rid: str | None, since: float) -> None:
+        """The first frame with text in it: the gap the client experiences as silence, in seconds."""
+        self.reqlog.log("sse_first_content", req=rid,
+                        first_s=round(time.perf_counter() - since, 3))
+
+    def stream_done(self, rid: str | None, out_tokens: int = 0) -> None:
+        self.reqlog.log("sse_done", req=rid, out_tokens=out_tokens)
+
+    # ---- heartbeat -------------------------------------------------------------------------------
+
+    def heartbeat_fields(self, st: dict[str, Any], rid: str) -> dict[str, Any]:
+        """One `alive` line's fields: the phase, the counters, and what the client has been sent."""
+        writer = self.writers.get(rid)
+        stats = writer.stats if writer is not None else None
+        return dict(phase=st.get("phase"), elapsed_s=round(time.perf_counter() - st["t0"], 2),
+                    prompt_tokens=st.get("prompt_tokens"),
+                    out_events=stats.events if stats else None,
+                    out_chars=stats.bytes if stats else None,
+                    last_out_s=round(stats.since_data_s(), 1) if stats else None)
+
+    async def heartbeat_forever(self, interval_s: float | None = None) -> None:
+        """One `alive` line per in-flight request every interval, until cancelled.
+
+        Started by a server on app startup and cancelled on cleanup; a no-op loop when the log is off
+        (nothing is in flight then either, since `track` is what fills the table)."""
+        every = interval_s if interval_s is not None else self.reqlog.heartbeat_s
+        while True:
+            await asyncio.sleep(every)
+            for rid, st in list(self.inflight.items()):
+                self._counters = dict(self.counters() if self.counters else {})
+                self.reqlog.log("alive", req=rid, **self.heartbeat_fields(st, rid), **self._counters)
+
+
+def refusal_text(exc: Any) -> str:
+    """The server's own refusal text, without the exception type (the line already names the request).
+
+    A JSON parse error is reduced to line/column: its message quotes the request body."""
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, json.JSONDecodeError):
+        return sanitize(cause)
+    text = " ".join(str(getattr(exc, "reason", "") or "").split())[:160]
+    return text or type(exc).__name__
 
 
 class ReqLog:
