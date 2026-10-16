@@ -50,6 +50,24 @@ KDA_KNOBS = {
     "lr_fused": os.environ.get("EXL3_KDA_DEC_LR_FUSED", "1") != "0",
 }
 
+# EXL3_STATE_REBASE (default 0): a speculative-round rewind sets a per-slot committed-state history index
+# instead of copying the accepted state back to history index 0 (a 0-byte rewind). Read per call so a single
+# load can interleave OFF / ON arms. Off: every state_base entry stays 0 and the ext reads index 0 exactly as
+# before (the reset below only fires if a previous ON arm left an index set, so the off path stays 0-cost).
+def _state_rebase() -> bool:
+    return os.environ.get("EXL3_STATE_REBASE", "0") == "1"
+
+# One committed-index tensor shared by every GDN layer of a cache (all layers rewind the same slot by the
+# same count, so the index is identical): the rewind then costs ONE tiny write instead of one per layer.
+_base_pool = {}
+_base_value = {}   # (cache_id, slot) -> committed index; the authoritative value behind the shared tensor
+def _shared_base(cache_id: int, max_batch_size: int, device):
+    t = _base_pool.get(cache_id)
+    if t is None or t.device != torch.device(device) or t.numel() != max_batch_size:
+        t = torch.zeros((max_batch_size,), dtype = torch.int32, device = device)
+        _base_pool[cache_id] = t
+    return t
+
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
@@ -60,8 +78,16 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
     falls back to its own .rewind() call, unchanged."""
     jobs_by_device = {}
+    base_done = set()
     for l in layers:
         if isinstance(l, GDNLayerState):
+            # EXL3_STATE_REBASE: all layers of a cache share one state_base tensor -> set it once per cache
+            if l.cache_id not in base_done:
+                if _state_rebase():
+                    l._set_base(slot, (last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+                    base_done.add(l.cache_id)
+                elif _base_value.get((l.cache_id, slot), 0) != 0:
+                    l._set_base(slot, 0); base_done.add(l.cache_id)   # undo an ON arm earlier in a mixed load
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -235,6 +261,15 @@ class GDNLayerState:
         self.max_history = max_history
         self.max_batch_size = max_batch_size
         self.cache_id = cache_id
+        # EXL3_STATE_REBASE: per-slot history index of the committed state (shared per cache; _base_value)
+        self.state_base = torch.empty((max_batch_size,), dtype = torch.int32, device = "meta")
+
+
+    def _set_base(self, slot: int, value: int):
+        key = (self.cache_id, slot)
+        if _base_value.get(key) != value:
+            self.state_base[slot] = value
+            _base_value[key] = value
 
 
     def get_checkpoint_size(self):
@@ -251,6 +286,7 @@ class GDNLayerState:
     def alloc(self, device):
         self.conv_state = torch.empty_like(self.conv_state, device = device)
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
+        self.state_base = _shared_base(self.cache_id, self.max_batch_size, device)
         self.conv_state.zero_()
         self.recurrent_state.zero_()
         self.device = device
@@ -259,6 +295,7 @@ class GDNLayerState:
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+        self.state_base = torch.empty_like(self.state_base, device = "meta")
         self.device = None
 
 
@@ -266,6 +303,7 @@ class GDNLayerState:
         if self.device is not None:
             self.conv_state[idx].zero_()
             self.recurrent_state[idx].zero_()
+            self._set_base(idx, 0)
 
 
     def get_state_tensors(self):
@@ -277,10 +315,16 @@ class GDNLayerState:
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
-        if num_tokens > 0:
-            r_state = self.recurrent_state[slot, 0]
-            r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
-            r_state.copy_(r_state_rewind)
+        if _state_rebase():
+            # 0-byte rewind: point the committed state at the accepted history index instead of copying
+            self._set_base(slot, (last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+        else:
+            if _base_value.get((self.cache_id, slot), 0) != 0:
+                self._set_base(slot, 0)   # a previous ON arm moved the commit index; stock reads index 0
+            if num_tokens > 0:
+                r_state = self.recurrent_state[slot, 0]
+                r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
+                r_state.copy_(r_state_rewind)
         cdim = self.module.conv_kernel_size
         if last_history > 0:
             c_state = self.conv_state[slot, :, :cdim]
@@ -309,6 +353,9 @@ class GDNLayerState:
     def rewind_state_job(self, slot: int, last_history: int, num_tokens: int):
         """Job descriptor for the batched recurrent-state rewind kernel (ext.batched_state_rewind),
         computed without performing any copy. Same gating condition as rewind()'s state branch."""
+        if _state_rebase():
+            # 0-byte rewind: no copy job; the shared base is set once by _collect_rewind_jobs
+            return None
         if num_tokens == 0:
             return None
         return ext.StateRewindJob(
@@ -320,8 +367,9 @@ class GDNLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
         return (
-            self.recurrent_state[slot, :1].cpu(),
+            self.recurrent_state[slot, b:b + 1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
 
@@ -330,8 +378,9 @@ class GDNLayerState:
         """Non-blocking D2H into pinned host tensors, reused from pin_pool ((shape, dtype) -> free list) when given:
         a pinned allocation costs ~1 ms of host time, more than the blocking copy it replaces."""
         cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
         out = []
-        for src in (self.recurrent_state[slot, :1], self.conv_state[slot, :, :cdim]):
+        for src in (self.recurrent_state[slot, b:b + 1], self.conv_state[slot, :, :cdim]):
             free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
             dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
             dst.copy_(src, non_blocking = True)
@@ -343,6 +392,7 @@ class GDNLayerState:
         cdim = self.module.conv_kernel_size
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
+        self._set_base(slot, 0)   # restored committed state lands at index 0
         self.conv_state[slot, :, :cdim].copy_(c)
 
 
@@ -1438,10 +1488,12 @@ class GatedDeltaNet(Module):
             else:
                 rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, recurrent_state = rsl.get_state_tensors()
+            recurrent_base = getattr(rsl, "state_base", None)
             save_state = True
         else:
             recurrent_slots = None
             conv_state, recurrent_state = None, None
+            recurrent_base = None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
@@ -1483,7 +1535,7 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_base, recurrent_slots, save_history)
             if self.tp_reduce:
                 params["backend"].all_reduce(y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1691,6 +1743,7 @@ class GatedDeltaNet(Module):
                 g = g,
                 recurrent_state = recurrent_state,
                 recurrent_slots = recurrent_slots,
+                recurrent_base = recurrent_base,
                 history = save_history,
                 save_state = save_state,
                 num_k_heads = self.num_k_heads,
