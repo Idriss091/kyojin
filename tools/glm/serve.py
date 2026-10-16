@@ -105,6 +105,10 @@ SPEED_ENV = {
     # long system prompt cached by a conversation with a long first turn resumes near the shared end instead of at token 0: served,
     # 14.7K-token system + 4.5K-token turns, 28.4 -> 8.0 s; later cold prompts equal within noise, the first one per process +~1.8 s.
     "EXL3_CKPT_INTERVAL_PP": "2048",
+    # Dense EXL3 GEMM with in-GEMM decode for forwards of 1..1023 rows (the large K 3/4 shapes skip the fp16 weight rebuild).
+    # Served GLM first token +5.7..+12.2 % on 200-900-token prompts, cold and follow-up. Quality checked against an fp32
+    # reference: top-1 vs fp32 never below the current path over 96 rows. Read per call, not latched. "0" = off.
+    "EXL3_DENSE_MPW2": "1023",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
