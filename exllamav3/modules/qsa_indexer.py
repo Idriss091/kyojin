@@ -108,9 +108,8 @@ def merge_tiles_topk(topk_fn, cand_s, cand_i, pos_out, pool_idx, k):
     pool_idx.copy_(torch.where(pos_out >= 0, torch.gather(cand_i, 1, pos_out.long().clamp(min = 0)), -1))
 
 
-# EXL3_TOPK_SPANS (read at import): few-row, wide selections (decode / verify at depth) on the span-parallel route below.
+# EXL3_TOPK_SPANS (read per call): few-row, wide selections (decode / verify at depth) on the span-parallel route below.
 # ROCm's dsa_topk runs ONE block per row, so R <= 16 rows of >= 32K pools use R blocks of a 40-CU GPU. 0 = single pass
-TOPK_SPANS = os.environ.get("EXL3_TOPK_SPANS", "1") != "0"
 TOPK_SPAN_W = 8192
 
 
@@ -118,7 +117,7 @@ def topk_spans_ok(sc, k):
     """Whether dsa_topk_spans may serve this call: few rows, a wide row, and a score view whose row stride is a multiple of
     the span width (the power-of-two scoring workspaces)."""
     R, T = sc.shape
-    return (TOPK_SPANS and torch.version.hip is not None and 1 <= R <= 16 and T >= 32768 and k <= 512
+    return (os.environ.get("EXL3_TOPK_SPANS", "1") != "0" and torch.version.hip is not None and 1 <= R <= 16 and T >= 32768 and k <= 512
             and sc.stride(1) == 1 and sc.stride(0) % TOPK_SPAN_W == 0 and sc.dtype == torch.half)
 
 
