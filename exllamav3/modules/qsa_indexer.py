@@ -108,6 +108,48 @@ def merge_tiles_topk(topk_fn, cand_s, cand_i, pos_out, pool_idx, k):
     pool_idx.copy_(torch.where(pos_out >= 0, torch.gather(cand_i, 1, pos_out.long().clamp(min = 0)), -1))
 
 
+# EXL3_TOPK_SPANS (read at import): few-row, wide selections (decode / verify at depth) on the span-parallel route below.
+# ROCm's dsa_topk runs ONE block per row, so R <= 16 rows of >= 32K pools use R blocks of a 40-CU GPU. 0 = single pass
+TOPK_SPANS = os.environ.get("EXL3_TOPK_SPANS", "1") != "0"
+TOPK_SPAN_W = 8192
+
+
+def topk_spans_ok(sc, k):
+    """Whether dsa_topk_spans may serve this call: few rows, a wide row, and a score view whose row stride is a multiple of
+    the span width (the power-of-two scoring workspaces)."""
+    R, T = sc.shape
+    return (TOPK_SPANS and torch.version.hip is not None and 1 <= R <= 16 and T >= 32768 and k <= 512
+            and sc.stride(1) == 1 and sc.stride(0) % TOPK_SPAN_W == 0 and sc.dtype == torch.half)
+
+
+def dsa_topk_spans(topk_fn, sc, out, k):
+    """Exactly topk_fn(sc, out, k, None, 0) for a few-row selection, with the row cut into spans that run in parallel.
+    sc (R, T) fp16 view of a WORKSPACE with row stride S (a multiple of TOPK_SPAN_W): the columns [T, S) are overwritten
+    with -inf, the whole rows are then read as (R * S / w, w) span rows, one launch selects each span's local top-k, and
+    merge_tiles_topk merges the (R, G * kp) candidates under the kernel's own total order (score descending, index
+    ascending; spans are disjoint and ascending, each span's output ascends) = the single pass's result.
+    out (R, kp) int32 (-1 padded)."""
+    R, T = sc.shape
+    S = sc.stride(0); w = TOPK_SPAN_W; G = S // w; kp = out.shape[1]
+    full = sc.as_strided((R, S), (S, 1))
+    full[:, T:].fill_(float("-inf"))
+    sp = full.view(R * G, w)
+    dev = sc.device
+    out_sp = torch.empty((R * G, kp), dtype = torch.int32, device = dev)
+    topk_fn(sp, out_sp, k, None, 0)
+    li = out_sp.long()
+    ok = li >= 0
+    cand_s = torch.where(ok, torch.gather(sp, 1, li.clamp(min = 0)), float("-inf")).view(R, G * kp)
+    off = (torch.arange(R * G, device = dev, dtype = torch.int32) % G * w).view(R * G, 1)
+    cand_i = torch.where(ok, out_sp + off, -1).view(R, G * kp)
+    W = -(-(G * kp) // 128) * 128
+    if W != G * kp:
+        cand_s = torch.nn.functional.pad(cand_s, (0, W - G * kp), value = float("-inf"))
+        cand_i = torch.nn.functional.pad(cand_i, (0, W - G * kp), value = -1)
+    pos = torch.empty((R, kp), dtype = torch.int32, device = dev)
+    merge_tiles_topk(topk_fn, cand_s, cand_i, pos, out, k)
+
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -391,7 +433,10 @@ class QSAIndexer(Module):
                 pool_idx.fill_(-1)
             elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
-                ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+                if topk_spans_ok(sc, min(k_sel, T_slab)):
+                    dsa_topk_spans(ext.dsa_topk, sc, pool_idx, min(k_sel, T_slab))
+                else:
+                    ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
             elif torch_merge and self.TOPK_MERGE == "torch":
                 cand = []
                 tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
