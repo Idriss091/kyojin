@@ -58,7 +58,7 @@ def kda_hf_ok(q, k, v, g, beta, initial_state, chunk_size):
 
 
 def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckpt=None, defs=None):
-    """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 2 dicts {"s": fp32 [1, HV, K, V]
+    """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 4 dicts {"s": fp32 [1, HV, K, V]
     contiguous, "chunk": n} (kda_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set."""
     if defs is None:
         # diagonal 16x16 blocks: from fla's token_parallel kernel (exact fp32 pairwise decay) by default; EXL3_KDA_HF_DIAG=1 (read
@@ -90,10 +90,10 @@ def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckp
             ctypes.c_float(scale)]
     cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
     cks = [c for c in cks if 0 < 64 * c["chunk"] <= T]
-    assert len(cks) <= 2
+    assert len(cks) <= 4      # EXL3_NC2_CKPT4: an 8192-row chunk carries 3 interior checkpoints + the last full page
     for c in cks:
         assert c["s"].dtype == torch.float32 and c["s"].is_contiguous() and c["s"].shape == (1, HV, K, K)
-    for i in range(2):
+    for i in range(4):
         c = cks[i] if i < len(cks) else None
         args += [P(0 if c is None else c["s"].data_ptr()), ctypes.c_int(-1 if c is None else 64 * c["chunk"])]
     params = (ctypes.c_void_p * len(args))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args])
