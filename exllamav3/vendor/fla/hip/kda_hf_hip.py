@@ -1,6 +1,6 @@
 # EXL3_KDA_HF (default off): GLM KDA prefill recurrence with 16-row WY chunks (kda_hf.hip, derived from hipfire's GDN kernel,
-# Apache-2.0). One kernel per layer (diagonal 16x16 blocks in-kernel) replaces token_parallel + kda_inter_off + inter_merge +
-# kda_fused_h_o. F16 WMMA operands with fp32 accumulation: NOT bitwise equal to the 64-row
+# Apache-2.0). fla's token_parallel kernel builds the exact 16x16 diagonal blocks, then one kernel per layer replaces kda_inter_off
+# + inter_merge + kda_fused_h_o (EXL3_KDA_HF_DIAG=1: blocks computed in the kernel, token_parallel skipped). F16 WMMA operands with fp32 accumulation: NOT bitwise equal to the 64-row
 # chain; quality-gated (KLD). Compiled with the ROCm SDK hipcc on first use (cached by source hash), launched on torch's stream.
 import ctypes, hashlib, os, subprocess
 import torch
@@ -57,9 +57,13 @@ def kda_hf_ok(q, k, v, g, beta, initial_state, chunk_size):
             and (initial_state is None or (initial_state.dtype == torch.float32 and initial_state.shape == (1, HV, K, V))))
 
 
-def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckpt=None, defs=""):
+def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckpt=None, defs=None):
     """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 2 dicts {"s": fp32 [1, HV, K, V]
     contiguous, "chunk": n} (kda_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set."""
+    if defs is None:
+        # diagonal 16x16 blocks: from fla's token_parallel kernel (exact fp32 pairwise decay) by default; EXL3_KDA_HF_DIAG=1 (read
+        # per call) computes them in the kernel with bf16 WMMA (faster, but heavier per-token error tails on real GLM inputs)
+        defs = "" if os.environ.get("EXL3_KDA_HF_DIAG", "0") == "1" else "KHF_TP=1"
     try:
         fn = _load(defs)
     except Exception:
