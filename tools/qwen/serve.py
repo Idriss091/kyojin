@@ -621,7 +621,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # 16/10: tensor-core MoE GEMM from 9 rows (was 32). Short prompts (17-31 tokens) stop taking the per-expert GEMV
              # path: time to first token 212 vs 360 ms on short chat prompts, decode unchanged. Vs the true next tokens over
              # 1500 prompts it moves the model no more than prefilling the same prompt in two chunks (KLD ratio 0.98).
-             ("EXL3_MOE_WMMA_MIN_ROWS", "9"))
+             ("EXL3_MOE_WMMA_MIN_ROWS", "9"),
+             # Follow-up turns resume from the reply-end checkpoint (T2 prefill x0.90, quality gated).
+             ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
