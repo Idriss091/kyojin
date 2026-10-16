@@ -94,6 +94,10 @@ SPEED_ENV = {
     # forward: served tool turn 4.34 -> 3.35 s, 2.58 -> 2.14 s; first-token KLD vs cold within the chunk-size floor
     # Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
     "EXL3_TAIL_MAXGAP": "8192",
+    # a prompt that shares cached pages but not their recurrent checkpoint (a new conversation on the same long system prompt)
+    # side-writes the state where those pages end, so the next one resumes there: first token after a shared 9K / 12.1K prefix
+    # 2.41 -> 1.94 s, 3.84 -> 2.06 s; the writing prompt is bitwise unchanged, KLD vs a cold prefill at the resumed-turn level.
+    "EXL3_BRANCH_CKPT": "1",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
