@@ -18,6 +18,7 @@
 #include <cuda_fp16.h>
 #endif
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/ops/empty.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "../util.cuh"
@@ -1785,6 +1786,62 @@ void exl3_moe_prefill_gemm_test
     else
         launch_gemm<false>((float) K, dim3(n_size / mpw::NT, slots, nz), stream,
             (const half*) A.data_ptr(), (int64_t) rows * a_ld, offs, tl, tc, tt, tt, C.data_ptr(), (int64_t) rows * n_size, size_k, n_size, false, kern, a_ld);
+    cuda_check(hipPeekAtLastError());
+}
+
+// One-group tile metadata for exl3_dense_mpw2, built on the device from the row count (no host copy):
+// expert 0 holds every row, m-tile i -> tile id i, table[0] = the trellis pointer.
+__global__ void mpw_dense_metadata_kernel(int64_t* offs, int* tiles, int* num_tiles, int64_t* table,
+                                          int64_t trellis, int rows, int mt)
+{
+    const int n = (rows + mt - 1) / mt;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) tiles[i] = i;
+    if (threadIdx.x == 0) { offs[0] = 0; offs[1] = rows; *num_tiles = n; table[0] = trellis; }
+}
+
+// Dense EXL3 GEMM through the expert prefill kernel (EXL3_DENSE_MPW2, exl3.py): C = A @ W_inner, had domain, no
+// input/output transforms, W decoded from the trellis per tile (no fp16 weight round trip). Same launch as the expert
+// GEMM with one group; bounds proven for MT 128 / NW 2, N % 256 == 0.
+void exl3_dense_mpw2
+(
+    const at::Tensor& A,
+    at::Tensor& C,
+    const at::Tensor& trellis,
+    double K
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(A.dim() == 2 && A.stride(1) == 1 && A.dtype() == at::kHalf, "exl3_dense_mpw2: A must be fp16 [rows, K] rows");
+    const int rows = A.size(0);
+    const int size_k = A.size(1);
+    const int a_ld = (int) A.stride(0);
+    const int size_n = C.size(1);
+    const int bits = (int) K;
+    TORCH_CHECK(K == 3.0 || K == 4.0, "exl3_dense_mpw2: K must be 3 or 4");
+    TORCH_CHECK(trellis.dtype() == at::kShort && trellis.is_contiguous() && trellis.dim() == 3 &&
+                trellis.size(0) * 16 == size_k && trellis.size(1) * 16 == size_n && trellis.size(2) == 16 * bits,
+                "exl3_dense_mpw2: trellis shape");
+    TORCH_CHECK(C.dim() == 2 && C.size(0) == rows && C.is_contiguous() &&
+                (C.dtype() == at::kHalf || C.dtype() == at::kFloat), "exl3_dense_mpw2: C shape");
+    TORCH_CHECK(rows >= 1 && size_k % (mpw::KS * 16) == 0 && size_n % 256 == 0, "exl3_dense_mpw2: unsupported shape");
+    const int kern = 2;
+    const int mt = mpw_mt(kern);
+    TORCH_CHECK(mt == 128 && mpw_nw(size_n) == 2, "exl3_dense_mpw2: needs MT 128 / NW 2 (MPW_MT, MPW_NW, EXL3_MPW2_VARIANT)");
+    const int slots = tile_slots(rows, 1, kern);
+    at::Tensor meta = at::empty({ 3 }, A.options().dtype(at::kLong));
+    at::Tensor tmeta = at::empty({ slots + 1 }, A.options().dtype(at::kInt));
+    int64_t* offs = (int64_t*) meta.data_ptr();
+    int64_t* tt = offs + 2;
+    int* tl = (int*) tmeta.data_ptr();
+    int* tc = tl + slots;
+    mpw_dense_metadata_kernel<<<1, 64, 0, stream>>>(offs, tl, tc, tt, (int64_t) trellis.data_ptr(), rows, mt);
+    if (C.dtype() == at::kFloat)
+        launch_gemm<true>((float) K, dim3(size_n / mpw::NT, slots, 1), stream,
+            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, size_n, false, kern, a_ld);
+    else
+        launch_gemm<false>((float) K, dim3(size_n / mpw::NT, slots, 1), stream,
+            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, size_n, false, kern, a_ld);
     cuda_check(hipPeekAtLastError());
 }
 

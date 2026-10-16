@@ -52,3 +52,12 @@ void exl3_moe_prefill_gemm_test
     at::Tensor& tiles,
     at::Tensor& tile_count
 );
+
+// Dense EXL3 GEMM (one group) through the expert prefill kernel: C = A @ W_inner, had domain, K 3 or 4, N % 256 == 0
+void exl3_dense_mpw2
+(
+    const at::Tensor& A,              // fp16 [rows, K], unit column stride
+    at::Tensor& C,                    // fp16 or fp32 [rows, N], contiguous
+    const at::Tensor& trellis,        // int16 [K / 16, N / 16, 16 * bits]
+    double K
+);

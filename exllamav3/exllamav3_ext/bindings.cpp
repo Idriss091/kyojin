@@ -451,6 +451,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("tiles"), py::arg("tile_count"),
           py::arg("act_limit") = 0.0, py::arg("mcg") = false, py::arg("addend") = py::none());
     m.def("exl3_moe_prefill_gemm_test", &exl3_moe_prefill_gemm_test, "exl3_moe_prefill_gemm_test");
+    m.def("exl3_dense_mpw2", &exl3_dense_mpw2, "exl3_dense_mpw2");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");
     m.def("dsa_topk_gfx12", &dsa_topk_gfx12, "dsa_topk_gfx12",
