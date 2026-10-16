@@ -47,6 +47,14 @@ class FakeEngine:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
+    def prompt_ids(self, prompt: str):
+        """The ids the route counts tokens with; the real engine has an incremental encode cache here.
+
+        This double counts words, so the ids are placeholders of that length: the route asks the result for
+        `numel()` and puts the number in the log, which is the same value it got before."""
+        import torch
+        return torch.zeros(int(self.count_tokens(prompt)), dtype=torch.long)
+
     async def generate(self, prompt: str, **kwargs):
         self.prompts.append(prompt)
         self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,

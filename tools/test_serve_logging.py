@@ -69,6 +69,14 @@ class FakeEngine:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
+    def prompt_ids(self, prompt: str):
+        """The ids the completion route counts tokens with; the real engines have an encode cache here.
+
+        This double counts words, so the ids are placeholders of that length - the route only asks the
+        result for `numel()`, and that number is what it puts in the log."""
+        import torch
+        return torch.zeros(int(self.count_tokens(prompt)), dtype=torch.long)
+
     def spec_stats(self) -> dict:
         return {}
 
