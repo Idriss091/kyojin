@@ -497,9 +497,9 @@ class ResidentEngine:
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
         # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
-        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: four
-        # server loads in both orders give +2.1 % first-token rate at 8K and +7.9 % at 2K. The Qwen server has it on.
-        if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Four server loads in both
+        # orders give +2.1 % first-token rate at 8K and +7.9 % at 2K, texts identical; on by default as in the Qwen server. 0 = off.
+        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
             import gc
             gc.collect()
             gc.freeze()
