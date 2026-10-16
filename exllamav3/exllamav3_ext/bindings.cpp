@@ -439,6 +439,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
           "exl3_moe_gfx12_k3_prefill");
+    m.attr("EXL3_MPW_SHORT_A") = 1;     // (ROCm branch: the attr block near the samplers is CUDA-only) exl3_moe_prefill_wmma accepts A with fewer rows than selected (zero rows)
     m.def("exl3_moe_prefill_wmma", &exl3_moe_prefill_wmma, "exl3_moe_prefill_wmma",
           py::arg("A"), py::arg("output"), py::arg("selected"), py::arg("weights"),
           py::arg("order"), py::arg("expert_count"),

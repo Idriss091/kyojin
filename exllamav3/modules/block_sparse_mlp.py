@@ -1720,7 +1720,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y_k, rw_k, sel_k = y, rw, sel
             if _MOE_ALIGN_CHUNK and num_tokens > _MOE_ALIGN_CHUNK:
                 order, flat, dummy = _aligned_expert_layout(flat, num_tokens, top_k, self.num_experts, _MOE_ALIGN_CHUNK)
-                y_k = torch.cat((y, torch.zeros((dummy, y.shape[1]), dtype = y.dtype, device = y.device)))
+                # EXL3_MPW_SHORT_A (default 1, read per call, needs the ext flag): the gather reads the dummy rows as zeros,
+                # so y is passed as is instead of copied whole to append them; same gathered bytes
+                if not (hasattr(ext, "EXL3_MPW_SHORT_A") and os.environ.get("EXL3_MPW_SHORT_A", "1") != "0"):
+                    y_k = torch.cat((y, torch.zeros((dummy, y.shape[1]), dtype = y.dtype, device = y.device)))
                 rw_k = torch.cat((rw, torch.zeros((dummy, top_k), dtype = rw.dtype, device = rw.device)))
                 sel_k = flat.view(num_tokens + dummy, top_k)
             else:
