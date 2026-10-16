@@ -1582,7 +1582,7 @@ def main() -> None:
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
             startup_health.stage("warm-up")
-            print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
+            print(f"serve: warm-up {warmup(engine, template, int(os.environ.get('EXL3_SERVE_WARMUP_TOKENS', '4608'))):.1f} s", flush=True)
             print(mem_line("warm"), flush=True)
             if engine.supports_vision:   # first tower pass pays kernel setup and allocator growth: not on the first user image
                 from PIL import Image
