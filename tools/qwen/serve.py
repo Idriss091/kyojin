@@ -849,7 +849,17 @@ class QwenEngine:
             kw.update(draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.ndt)
         elif pl:
             kw.update(ngram_match_min=pl[0], num_draft_tokens=pl[1])
-        self.generator = self.Generator(**kw)
+        # night1 1.6 hand-off port fix: the drafter-free plain lookup answers the Generator's n-gram slot itself
+        # (install_plain_lookup replaces iterate_ngram_gen), so the built-in n-gram path and its BC_SAM binding are never
+        # used. On a build without BC_SAM (this ROCm ext returns None for ext.BC_SAM(); the built-in path raises at
+        # construction) that check must not block the plain lookup. Restore the exact descriptor afterwards.
+        _val = self.Generator.__dict__["_validate_ngram_drafting_support"]
+        if pl:
+            self.Generator._validate_ngram_drafting_support = staticmethod(lambda: None)
+        try:
+            self.generator = self.Generator(**kw)
+        finally:
+            self.Generator._validate_ngram_drafting_support = _val
         if pl:
             self.uninstall = spec_policy.install_plain_lookup(self.generator, pl)
         if spec and self.draft_policy == "mix":
