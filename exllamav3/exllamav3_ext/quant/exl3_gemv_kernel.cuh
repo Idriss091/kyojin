@@ -107,11 +107,16 @@ __device__ __forceinline__ half2 decode_pair_cb2_sad_(uint32_t x0, uint32_t x1)
 #if (defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)) && defined(EXL3_MUL1_DECODE_DOT4)
     const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
     const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+    const uint32_t packed = (sum1 << 16) + sum0;
+#elif defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+    // v_sad_hi_u8 D = (SAD(S0, S1) << 16) + S2 packs the pair in one op: same bits as the form below.
+    uint32_t packed;
+    asm("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(packed) : "v"(x1), "v"(exl3_sad_u8_(x0, 0x64006400u)));
 #else
     const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
     const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
-#endif
     const uint32_t packed = (sum1 << 16) + sum0;
+#endif
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
     half_uint16 h0((uint16_t) packed);
