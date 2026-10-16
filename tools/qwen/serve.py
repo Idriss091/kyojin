@@ -42,6 +42,7 @@ sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
+from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 
 
 def _load_mimo():
@@ -743,6 +744,10 @@ class QwenEngine:
         self.sessions = sessions
         self.config = Config.from_directory(model_path)
         self.tokenizer = Tokenizer.from_config(self.config)
+        if os.environ.get("KYO_TOKCACHE", "8") == "0":
+            self.pec = None
+        else:
+            self.pec = PromptEncodeCache(self.tokenizer, n=int(os.environ.get("KYO_TOKCACHE", "8") or 0), cut="<|im_start|>", check=os.environ.get("KYO_TOKCACHE_CHECK") == "1", log=lambda m: print(f"qserve: {m}", flush=True))
         self.eos = list(self.config.eos_token_id_list)
         self.model = Model.from_config(self.config)
         # cache_bits 0 (default) = the fp16 K/V pages; 8 (--cache-bits 8) = packed int8 K/V pages (2.6 GiB less at 256K), indexer
@@ -854,6 +859,13 @@ class QwenEngine:
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
 
+    def prompt_ids(self, prompt: str):
+        if self.pec and self.pec.n:
+            return self.pec.encode(prompt)[0]
+        ids = self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True)
+        ids = ids[0] if isinstance(ids, tuple) else ids
+        return ids.reshape(-1)
+
     def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
@@ -890,7 +902,7 @@ class QwenEngine:
         for emb in embs:
             prompt = prompt.replace(IMAGE_PAD, emb.text_alias, 1)
         kw = {"embeddings": embs} if embs else {}
-        ids = self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, **kw)
+        ids = self.prompt_ids(prompt).reshape(1, -1) if not embs else self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, **kw)
         return ids, embs
 
     def _close_ids(self) -> tuple[int | None, list[int]]:
@@ -1472,7 +1484,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         stops = [stops] if isinstance(stops, str) else list(stops)
         if not all(isinstance(s, str) for s in stops):
             raise BadRequest("stop must be a string or a list of strings")
-        prompt_tokens = engine.count_tokens(prompt)
+        prompt_tokens = int(engine.prompt_ids(prompt).numel())
         ctx = getattr(engine, "ctx", None)
         max_tokens = body.get("max_completion_tokens")
         if max_tokens is None:
