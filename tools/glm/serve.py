@@ -53,7 +53,10 @@ SPEED_ENV = {
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",
-    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # plain chunks beyond 32K depth, lower peak memory at 512K ctx
+    # 16/10: big chunks at every depth (was 32768). Prefill +12.6 % at 128K, +12.1 % at 256K, +10.5 % at 500K;
+    # vs the true next tokens NLL -0.012 (95 % CI -0.027..+0.003), next-token accuracy unchanged, 500K needle found,
+    # peak memory still fits a 500K context on a 128 GB Strix Halo.
+    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "0",
     # 15/10: 8192-row prefill chunks (an 8K prompt = one forward; 4-slot KDA checkpoints keep every tail boundary).
     # Box 8K cold window -3.8 %, served 8K 697 / 32K 681 tok/s, logits + restore hashes equal to 4096 chunks.
     "EXL3_PREFILL_BIG_CHUNK": "8192",
