@@ -77,6 +77,8 @@ SPEED_ENV = {
     # 27/09: R-row verify linears in one launch (Hadamards in-kernel):
     # served R=2 round -3.04 +- 0.20 ms, +6.7 % t/s; R=1 bitwise, R=2 greedy 64/64.
     "EXL3_VERIFY_FUSE": "1",
+    # calibrated dynamic draft depth for the MTP drafter; served decode geomean x1.070 (structured x1.104, code x1.070, prose x1.036).
+    "EXL3_GLM_DYN": "3,0.70",
     # 27/09: one router launch per verify + wide MoE combine; with R=3 (--num-draft 2)
     # served +6.42 +- 1.34 % vs R=2 base (12 prompts/arm, greedy ids 128/128 x 3 equal).
     "EXL3_DEC_ROUTER_ROWS": "2",
@@ -571,6 +573,16 @@ class ResidentEngine:
         torch.set_grad_enabled(False)
         self.torch = torch
         self.Job = Job
+        # EXL3_GLM_DYN = "window,confidence": the Generator's confidence-calibrated draft stop (dynamic_draft_tokens) for the
+        # MTP drafter, `window` drafted tokens at most per round, drafting stops when the estimated probability that the next
+        # position still contributes falls below `confidence`. Overrides --num-draft. "0" = fixed --num-draft depth
+        dyn = os.environ.get("EXL3_GLM_DYN", "0").strip()
+        self.dyn = None
+        if dyn not in ("", "0") and num_draft > 0:
+            w, c = dyn.split(",")
+            self.dyn = (int(w), float(c))
+            num_draft = self.dyn[0]
+            max_history = max(max_history, num_draft)
         self.num_draft = num_draft
         # Concurrent requests batched through the one Generator. The recurrent (KDA) state is allocated per slot and per
         # history level (138 MiB each). The Cache default of 16 slots was allocated whatever --sessions said: 6.6 GiB at
@@ -648,7 +660,8 @@ class ResidentEngine:
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
             draft_model=self.draft_model, draft_cache=self.draft_cache,
             num_draft_tokens=max(self.num_draft, lookup[1] if lookup else 0) or None,   # buffers for the widest round
-            record_draft_stats=True)
+            record_draft_stats=True,
+            dynamic_draft_tokens=self.dyn is not None, draft_confidence=self.dyn[1] if self.dyn else 0.6)
         if lookup:
             qdir = str(Path(__file__).resolve().parent.parent / "qwen")
             if qdir not in sys.path:

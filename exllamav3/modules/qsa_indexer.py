@@ -321,9 +321,12 @@ class QSAIndexer(Module):
     # narrower slabs cost more than the extra top-k passes save
     SEL_SLAB = 1024
     SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
-    # Scorer launch shape "block_m,block_n,num_warps,num_stages" (unset = the scorer's own default). Every output
-    # element is computed by the same MMA sequence whatever the tile, so the scores are bit-identical
-    SCORE_CFG = os.environ.get("EXL3_QSA_SCORE_CFG", "")
+    # Scorer launch shape "block_m,block_n,num_warps,num_stages" (EXL3_QSA_SCORE_CFG, read per call; "0" = the scorer's
+    # own 64,128,8,2). Every output element is computed by the same MMA sequence whatever the tile, so the scores are
+    # bit-identical. 4 indexer heads give 4 small dots per key tile: on gfx1151, 1024-row slabs, 32,64,4,2 is x1.50 at
+    # 2K-8K pools, x1.31 at 16K, x1.33 at 32K (bitwise equal; sweep of 72 shapes); in a served Qwen load the scorer time
+    # drops x1.10-1.31 at 16K-64K prompts, logits bitwise. CUDA keeps the scorer's own default (not measured there)
+    SCORE_CFG = "32,64,4,2" if torch.version.hip else "0"
     # ROCm has no dsa_topk_tile / dsa_topk_merge_tiles: its one-block-per-row top-k scans a row three times, and
     # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 never
     # lets that kernel see a row wider than N pools: a longer selection is cut into equal tiles of at most N pools (a
@@ -392,8 +395,9 @@ class QSAIndexer(Module):
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
 
         cfg = {}
-        if self.SCORE_CFG:
-            bm, bn, nw, ns = (int(x) for x in self.SCORE_CFG.split(","))
+        score_cfg = os.environ.get("EXL3_QSA_SCORE_CFG", self.SCORE_CFG)
+        if score_cfg != "0":
+            bm, bn, nw, ns = (int(x) for x in score_cfg.split(","))
             cfg = dict(block_m = bm, block_n = bn, num_warps = nw, num_stages = ns)
 
         def tile_scores(q_slab, rows, t0, t1):
