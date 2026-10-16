@@ -321,6 +321,11 @@ class Job:
         self.last_recurrent_checkpoint_pos = None
         self.roll_ckpt = os.environ.get("EXL3_ROLL_CKPT", "0") == "1"
         self.roll_key = None
+        # EXL3_CKPT_INTERVAL_PP (default 0 = the generator's recurrent_checkpoint_interval_pp, 32768): checkpoint spacing
+        # during prompt ingestion before the tail window, read per job. A smaller grid lets a NEW conversation that shares
+        # only a long prefix (system prompt) of a cached one resume near the shared end instead of at token 0
+        self.ckpt_interval_pp = int(os.environ.get("EXL3_CKPT_INTERVAL_PP", "0"))
+        assert self.ckpt_interval_pp % PAGE_SIZE == 0, "EXL3_CKPT_INTERVAL_PP must be a multiple of the page size"
 
         # Loop detector
         self.loop_detector = None
@@ -1821,7 +1826,7 @@ class Job:
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            return (seq_pos - self.cached_pages * PAGE_SIZE) % (self.ckpt_interval_pp or self.generator.recurrent_checkpoint_interval_pp) == 0
 
 
     def mm_exact_spans(self, seq):
