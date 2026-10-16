@@ -139,9 +139,8 @@ TOOL_CLOSE = "</tool_call>"
 # ---------------------------------------------------------------------------- template
 
 
-def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                  **kwargs: Any) -> str:
-    """Render the model's own Jinja chat template (MiMo chat_template.jinja)."""
+def _template_env() -> Any:
+    """One Jinja environment per process."""
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                         extensions=["jinja2.ext.loopcontrols"])
     env.filters["tojson"] = lambda value, ensure_ascii=False, indent=None, separators=None, \
@@ -149,6 +148,24 @@ def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dic
                                     separators=separators, sort_keys=sort_keys)
     def raise_exception(msg): raise ValueError(msg)
     env.globals["raise_exception"] = raise_exception
+    return env
+
+
+_COMPILED_TEMPLATES: dict[str, Any] = {}   # template source -> compiled Template (render is thread-safe)
+
+
+def _compiled_template(template: str) -> Any:
+    """The compiled chat template, cached: compiling it per request costs ~24 ms."""
+    hit = _COMPILED_TEMPLATES.get(template)
+    if hit is None:
+        hit = _template_env().from_string(template)
+        _COMPILED_TEMPLATES[template] = hit
+    return hit
+
+
+def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                  **kwargs: Any) -> str:
+    """Render the model's own Jinja chat template (MiMo chat_template.jinja)."""
     # OpenAI sends tool-call arguments as a JSON string; the MiMo template accepts a dict or a
     # string, but normalizing keeps `tool_call.function.arguments` round-tripping exact.
     fixed = []
@@ -161,7 +178,7 @@ def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dic
                 if isinstance(c.get("function", {}).get("arguments"), str) else c
                 for c in m["tool_calls"]])
         fixed.append(m)
-    return env.from_string(template).render(
+    return _compiled_template(template).render(
         messages=fixed, tools=tools or [], add_generation_prompt=True, **kwargs)
 
 
