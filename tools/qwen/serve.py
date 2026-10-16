@@ -590,6 +590,11 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # KLD vs a cold prefill 2.1e-3 / 1.9e-3 (shipped 4.8e-3 / 3.8e-3), top-1 equal; 768 and 6144 appends unchanged (bitwise).
              # Slot files keep the tail checkpoint, so a reload does not replay the gap. 1024 goes back.
              ("EXL3_TAIL_MAXGAP", "8192"),
+             # a prompt that shares a cached prefix but not its recurrent checkpoint (a new conversation on the same long system
+             # prompt) side-writes the state at the end of the shared pages, so the next one resumes there: first token after a
+             # shared 9K / 11K / 12.1K / 14K prefix 1.04 -> 0.60, 2.25 -> 0.80, 2.92 -> 0.63, 1.62 -> 0.74 s; the writing prompt is
+             # bitwise unchanged, KLD vs a cold prefill at the level of any resumed turn. 0 = off.
+             ("EXL3_BRANCH_CKPT", "1"),
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),

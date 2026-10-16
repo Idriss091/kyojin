@@ -1418,6 +1418,20 @@ class Job:
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
+            # EXL3_BRANCH_CKPT=1 (default off, read per chunk; GDN no-tail and KDA big-tail paths): the chunk replays prompt
+            # pages whose K/V were found by hash but whose recurrent state was not (the resume fell back to an older checkpoint,
+            # e.g. a new conversation sharing a long system prompt with a cached one). The kernel also side-writes the state at
+            # the end of that shared run, so the next prompt with the same prefix resumes there instead of replaying up to a chunk
+            branch_row = None
+            if (gdn_nt or big_tail) and self.recurrent_state is not None and prefill_start % PAGE_SIZE == 0 and \
+                    os.environ.get("EXL3_BRANCH_CKPT", "0") == "1":
+                q = prefill_start // PAGE_SIZE
+                while q < len(seq.allocated_pages) and (q + 1) * PAGE_SIZE < prefill_end and \
+                        seq.allocated_pages[q].kv_position == PAGE_SIZE:
+                    q += 1
+                if q * PAGE_SIZE > prefill_start and q * PAGE_SIZE - prefill_start != no_tail_row:
+                    branch_row = q * PAGE_SIZE - prefill_start
+
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
             # ring / compressor / pool states are streams. Text chunks end at a span start and
@@ -1499,10 +1513,11 @@ class Job:
                 # EXL3_MIDCHUNK_CKPT=1 (default off): a chunk that crosses a recurrent checkpoint boundary also
                 # saves the recurrent state at that boundary (KDA layers split conv + core there), stashed below
                 if self.recurrent_state is not None and not self.embeddings and \
-                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or (gdn_nt and no_tail_row is not None)) and \
+                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or
+                         (gdn_nt and (no_tail_row is not None or branch_row is not None))) and \
                         not self.generator.model.loaded_tp and prefill_start % PAGE_SIZE == 0:
                     if gdn_nt:
-                        rows = [] if no_tail_row is None else [no_tail_row]
+                        rows = sorted(r for r in (branch_row, no_tail_row) if r is not None)   # the kernel side-writes 2
                     else:
                         rows = [
                             p - prefill_start
@@ -1511,6 +1526,11 @@ class Job:
                         ]
                         if no_tail_row is not None:
                             rows = sorted(set(rows + [no_tail_row]))
+                        # the branch row only where the kernel has a free slot (a list over the limit drops every row)
+                        cap = (4 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else
+                               2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1)
+                        if branch_row is not None and branch_row not in rows and len(rows) < cap:
+                            rows = sorted(rows + [branch_row])
                     if rows:
                         params["checkpoint_rows"] = rows
                         # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
