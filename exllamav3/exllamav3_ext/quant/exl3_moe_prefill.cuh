@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <c10/util/Optional.h>
 
 // Grouped EXL3 MoE prefill for gfx11.5 (RDNA3.5 WMMA): tokens are sorted by expert and every
 // projection runs as ONE launch over all experts. Trellis tiles are decoded in the GEMM (to LDS),
@@ -33,7 +34,8 @@ void exl3_moe_prefill_wmma
     at::Tensor& tiles,                // int32 [>= ceil(A / 64) + E]
     at::Tensor& tile_count,           // int32 [1]
     double act_limit,                 // clamped SwiGLU limit, 0 = unclamped
-    bool mcg                          // trellis codebook: true = mcg, false = mul1
+    bool mcg,                         // trellis codebook: true = mcg, false = mul1
+    const c10::optional<at::Tensor>& addend   // fp16 [<= rows, H] widened and added to output rows (shared expert), or none
 );
 
 // Standalone grouped GEMM on pre-sorted rows (test / benchmark entry): C[sorted rows] =
@@ -49,4 +51,13 @@ void exl3_moe_prefill_gemm_test
     at::Tensor& expert_offsets,
     at::Tensor& tiles,
     at::Tensor& tile_count
+);
+
+// Dense EXL3 GEMM (one group) through the expert prefill kernel: C = A @ W_inner, had domain, K 3 or 4, N % 256 == 0
+void exl3_dense_mpw2
+(
+    const at::Tensor& A,              // fp16 [rows, K], unit column stride
+    at::Tensor& C,                    // fp16 or fp32 [rows, N], contiguous
+    const at::Tensor& trellis,        // int16 [K / 16, N / 16, 16 * bits]
+    double K
 );

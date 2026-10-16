@@ -664,6 +664,11 @@ class Attention(Module):
 
         if x is None:
             return None                          # kv_only, see decode_flash_attn
+        # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
+        # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 

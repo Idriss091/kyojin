@@ -52,6 +52,9 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # rows); EXL3_MOE_DEDUP=0 restores the per-assignment kernel
 _MOE_DEDUP = os.environ.get("EXL3_MOE_DEDUP", "1") != "0"
 
+def _nc2_shared_fuse() -> bool:
+    return os.environ.get("EXL3_NC2_SHARED_FUSE", "0") == "1"
+
 def _moe_sync_free_count() -> bool:
     # Default on: torch.bincount on a device tensor synchronizes the host once per MoE
     # layer per chunk (48 layers), locking the host to the device. The scatter_add_
@@ -1701,7 +1704,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # decoded inside the GEMM; replaces the per-expert reconstruct + hgemm loop at prefill
         elif (
             self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
-            y.dtype == torch.half and y.is_contiguous() and
+            y.dtype == torch.half and (y.is_contiguous() or                 # or a row-padded producer view
+                                       (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
             os.environ.get("EXL3_MOE_WMMA", "1") != "0" and
             not params.get("activate_all_experts") and
             not params.get("reconstruct") and not params.get("autosplit_measure")
@@ -1716,7 +1720,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y_k, rw_k, sel_k = y, rw, sel
             if _MOE_ALIGN_CHUNK and num_tokens > _MOE_ALIGN_CHUNK:
                 order, flat, dummy = _aligned_expert_layout(flat, num_tokens, top_k, self.num_experts, _MOE_ALIGN_CHUNK)
-                y_k = torch.cat((y, torch.zeros((dummy, y.shape[1]), dtype = y.dtype, device = y.device)))
+                # EXL3_MPW_SHORT_A (default 1, read per call, needs the ext flag): the gather reads the dummy rows as zeros,
+                # so y is passed as is instead of copied whole to append them; same gathered bytes
+                if not (hasattr(ext, "EXL3_MPW_SHORT_A") and os.environ.get("EXL3_MPW_SHORT_A", "1") != "0"):
+                    y_k = torch.cat((y, torch.zeros((dummy, y.shape[1]), dtype = y.dtype, device = y.device)))
                 rw_k = torch.cat((rw, torch.zeros((dummy, top_k), dtype = rw.dtype, device = rw.device)))
                 sel_k = flat.view(num_tokens + dummy, top_k)
             else:
@@ -1734,6 +1741,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gu_had = ws["gu_had"][:2 * assignments * self.hidden_size].view(2 * assignments, self.hidden_size)
             # down_out aliases gu_had: the gate/up input is dead once the gate/up GEMM has run
             down_out = ws["gu_had"][:2 * assignments * self.hidden_size].view(torch.float).view(assignments, self.hidden_size)
+            # EXL3_NC2_SHARED_FUSE=1 (default off, read per call): the shared expert runs first (it only
+            # reads x) and returns its down GEMM's fp16 output; the reduce widens it (exact) and adds it in
+            # fp32 in its epilogue = the arithmetic of the widen copy + `final_hidden_states += y` it
+            # replaces; both kernels disappear. Bit-exact.
+            sh_add = None
+            if (_nc2_shared_fuse() and self.shared_experts and not self.shared_gate and
+                    not self.shared_experts_post_norm and not self.tp_reduce and
+                    self.routed_post_norm is None and self.latent_out is None):
+                sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
+                sh_params["nc2_down_half"] = True
+                sh_add = self.shared_experts.forward(x, sh_params)
+                if sh_add.dtype == torch.half and sh_add.is_contiguous():
+                    sh_add = sh_add.view(num_tokens, self.hidden_size)
+                    bc_sh_exp = True    # shared expert summed in by the reduce: skip the tail add
+                else:
+                    raise RuntimeError(f"EXL3_NC2_SHARED_FUSE: shared expert output {sh_add.dtype}, contiguous "
+                                       f"{sh_add.is_contiguous()}: fp16 contiguous needed")
             ext.exl3_moe_prefill_wmma(
                 y_k, output, sel_k, rw_k, order, expert_count,
                 self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
@@ -1744,7 +1768,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 ws["gu_out"][:2 * assignments * self.intermediate_size_padded].view(2 * assignments, self.intermediate_size_padded),
                 down_out,
                 ws["offsets"], ws["inverse"][:assignments], ws["tiles"], ws["tile_count"],
-                float(self.act_limit), bool(self.wmma_mcg),
+                float(self.act_limit), bool(self.wmma_mcg), sh_add,
             )
             final_hidden_states = output[:num_tokens].view(eshape)
 
@@ -2051,7 +2075,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
         # Shared experts
-        if self.shared_experts and not bc_sh_exp:
+        # EXL3_SHGATE_FUSE (default 1, read per call): prefill rows with a shared gate take the shared expert's fp16 down output
+        # and add float(y) * sigmoid(gate) into the routed sum in one pass (gr_pf.shgate_add), replacing the fp32 widen copy, the
+        # torch multiply and the torch add of add_sigmoid_gate's fallback. Same arithmetic, bit-identical. 0 goes back.
+        if (self.shared_experts and not bc_sh_exp and self.shared_gate and bsz > 32 and not self.tp_reduce
+                and not self.shared_experts_post_norm and final_hidden_states.dtype == torch.float
+                and final_hidden_states.is_contiguous() and os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"):
+            sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
+            sh_params["nc2_down_half"] = True
+            yh = self.shared_experts.forward(x, sh_params)
+            z = self.shared_gate.forward(x, params)
+            if yh.dtype == torch.half and yh.is_contiguous() and z.dtype == torch.float and z.is_contiguous():
+                from .gated_delta_net_fn.gr_pf import shgate_add
+                shgate_add(final_hidden_states.view(-1, self.hidden_size), yh.view(-1, self.hidden_size), torch.sigmoid(z))
+            else:
+                ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
+        elif self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)

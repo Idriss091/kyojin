@@ -19,6 +19,7 @@ from .attention_fn.mla_triton import (
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
+from .qsa_indexer import topk_spans_ok, dsa_topk_spans
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -550,6 +551,11 @@ class MLAttention(Module):
                 raise ValueError(f"Unknown attn_mode: {attn_mode}")
         if x is None:
             return None                          # EXL3_PF_SKIP: kv_only, see _attend
+        # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
+        # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -584,7 +590,25 @@ class MLAttention(Module):
                 x2 = x.reshape(rows, lin.in_features)
                 y = torch.cat([dec_proj_single(lin, x2[r : r + 1]) for r in range(rows)], dim = 0)
             return to2(y.view(x.shape[:-1] + (lin.out_features,)), None, lin.out_dtype)
+        if lin is self.o_proj and params.get("pfe_y_half") and self._nc2_oproj_f16(lin, x, params):
+            return lin.forward(x, params, torch.half)
         return lin.forward(x, params)
+
+
+    def _nc2_oproj_f16(self, m, x: torch.Tensor, params: dict) -> bool:
+        """EXL3_NC2_MLA_OPROJ_F16: the block's residual apply reads fp16 y (params["pfe_y_half"]), so o_proj may return
+        its fp16 GEMM output instead of the fp32 widen of it (same predicate as Attention.project_o): bit-exact."""
+        if os.environ.get("EXL3_NC2_MLA_OPROJ_F16", "0") != "1" or "capture" in params or "quant_preserve" in params:
+            return False
+        from .quant import exl3 as _exl3
+        rows = x.numel() // x.shape[-1]
+        return bool(
+            _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1)
+            and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None
+            and not self.config.infer_params.no_reconstruct and not params.get("reconstruct")
+            and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0
+            and m.softcap == 0.0 and m.out_features == m.out_features_unpadded
+        )
 
 
     @staticmethod
@@ -915,7 +939,10 @@ class MLAttention(Module):
                     elif (EXL3_DSA_DEC_NOTILE and seqlen <= 8) or _pf_notile_ok(rows, pools_slab):
                         sc = tile_scores(0, pools_slab)   # pow2 stride, see _indexer_topk
                         pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
-                        ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
+                        if topk_spans_ok(sc, k_sel):
+                            dsa_topk_spans(ext.dsa_topk, sc, pool_idx, k_sel)
+                        else:
+                            ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
                         pool_idx = pool_idx[:, :k_sel]
                         # Same score-descending order as the tiled merge's final topk: the sparse
                         # attention accumulates in index order, so order is not free
@@ -1278,9 +1305,23 @@ class MLAttention(Module):
         """Unfold W_UV per head from the flat layout (the kernel emits token-major output, so it
         feeds o_proj without a permute), then o_proj. Context-length independent; the piecewise
         block graph captures it with the MLP half."""
+        k = self.num_q_heads * self.v_head_dim
+        pitch = self._nc2_o_pitch(o_lat.shape[1], params)
+        if pitch:
+            buf = torch.empty((o_lat.shape[1], pitch), dtype = torch.half, device = o_lat.device)[:, :k]
+            mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim, out = buf)
+            return self._dec_proj(self.o_proj, buf.view(bsz, seqlen, k), params)
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim)
+        o = o.reshape(bsz, seqlen, k)
         return self._dec_proj(self.o_proj, o, params)
+
+    def _nc2_o_pitch(self, rows: int, params: dict) -> int:
+        """EXL3_NC2_MLA_OPAD (default off): row pitch for the o_proj input so the unfold writes it padded and o_proj
+        skips its pad_copy_in (same values, bit-exact). 0 = dense."""
+        if os.environ.get("EXL3_NC2_MLA_OPAD", "0") != "1" or self.o_proj is None:
+            return 0
+        from .quant.exl3 import row_pad_pitch
+        return row_pad_pitch(self.o_proj, self.num_q_heads * self.v_head_dim, rows, params)
 
 
     def _attend_split(self, q, q_pe, q_lat, head, seqlen, params, ckv_cache, kpe_cache,
@@ -1297,7 +1338,12 @@ class MLAttention(Module):
         q_pe = q_pe.reshape(R, H, D_r)
         qh = q[:head]
         qh[:, :, self.qk_nope_head_dim:] = q_pe[:head]
-        o = torch.empty((R, H, self.v_head_dim), dtype = torch.half, device = q.device)
+        pitch = self._nc2_o_pitch(R, params)
+        if pitch:
+            o2 = torch.empty((R, pitch), dtype = torch.half, device = q.device)[:, :H * self.v_head_dim]
+            o = o2.view(R, H, self.v_head_dim)
+        else:
+            o = torch.empty((R, H, self.v_head_dim), dtype = torch.half, device = q.device)
         o[:head] = mla_attn_triton_prefill_mha(
             qh,
             self.w_uk_flat, self.w_uv_flat,
@@ -1314,6 +1360,9 @@ class MLAttention(Module):
             qc = qc,
             pool_len = int(host_seqlens[0]) + seqlen,
         )
+        if pitch:
+            mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim, out = o2[head:])
+            return self._dec_proj(self.o_proj, o2.view(1, seqlen, H * self.v_head_dim), params)
         o[head:] = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim).view(tail, H, self.v_head_dim)
         o = o.view(1, seqlen, H * self.v_head_dim)
         return self._dec_proj(self.o_proj, o, params)

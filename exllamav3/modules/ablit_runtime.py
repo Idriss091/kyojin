@@ -139,6 +139,19 @@ try:
         r = tl.load(r_ptr + offs, mask = m, other = 0.0)
         d = tl.sum(y.to(tl.float32) * r, axis = 0)
         tl.store(y_ptr + row * H + offs, (y.to(tl.float32) - (w * d) * r).to(y.dtype), mask = m)
+
+    @triton.jit
+    def _project_widen_kernel(x_ptr, y_ptr, r_ptr, w, H: tl.constexpr, BLOCK: tl.constexpr):
+        # EXL3_NC2_ABLIT_F16: _project_kernel on an fp32 y that is the exact widen of fp16 x, without materialising it:
+        # reads x (fp16), writes y (fp32); same fp32 values in, same arithmetic
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        m = offs < H
+        # contiguity hint 4: the fp16 load keeps _project_kernel's 4-wide layout (8-wide would change the tl.sum tree)
+        y = tl.load(x_ptr + row * H + tl.max_contiguous(offs, 4), mask = m, other = 0.0).to(tl.float32)
+        r = tl.load(r_ptr + offs, mask = m, other = 0.0)
+        d = tl.sum(y.to(tl.float32) * r, axis = 0)
+        tl.store(y_ptr + row * H + offs, (y.to(tl.float32) - (w * d) * r).to(tl.float32), mask = m)
 except ImportError:
     triton = None
 
@@ -187,4 +200,16 @@ def project(y: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> 
     else:
         d = torch.mv(y2.float(), r32).to(y2.dtype)
         y2.addr_(d, r16, alpha = -w)
+    return y
+
+
+def project_widen(x: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> torch.Tensor:
+    """EXL3_NC2_ABLIT_F16: fp32 result of project(x.float(), ...) for an fp16 x, in one pass when the Triton kernel
+    applies (bit-equal: the widen is exact and the kernel arithmetic is the fp32 one). Returns a new fp32 tensor."""
+    h = r32.shape[0]
+    if w == 0.0 or ROW_MODE is not None or not _USE_TRITON or not x.is_contiguous() or x.dtype != torch.half:
+        return project(x.float(), w, r32, r16)
+    y = torch.empty(x.shape, dtype = torch.float32, device = x.device)
+    x2 = x.view(-1, h)
+    _project_widen_kernel[(x2.shape[0],)](x2, y.view(-1, h), r32, w, H = h, BLOCK = _block(h))
     return y

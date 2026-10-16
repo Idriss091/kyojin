@@ -290,7 +290,7 @@ class OnlineRule(CostRule):
         self.acc_ema = float(accepted) if self.acc_ema is None else (1 - a) * self.acc_ema + a * accepted
         if self.pred_ema > 1e-6: self.scale = min(self.hi, max(self.lo, self.acc_ema / self.pred_ema))
 
-# measured plain-batch step ms for 1..8 rows (kamel T52) + 3.1 ms per drafted depth + 2 ms of round overhead: cycle ms for D drafts
+# measured plain-batch step ms for 1..8 rows + 3.1 ms per drafted depth + 2 ms of round overhead: cycle ms for D drafts
 CYCLE_MS = [30.3 + 2.0, 41.6 + 3.1 + 2.0, 50.2 + 6.2 + 2.0, 58.6 + 9.3 + 2.0, 68.8 + 12.4 + 2.0, 75.1 + 15.5 + 2.0, 84.7 + 18.6 + 2.0, 92.9 + 21.7 + 2.0]
 
 class TableRule(ProductRule):
@@ -363,17 +363,43 @@ def install_lookup(g, ngram, stats=None):
                 if len(getattr(j, "sequences", ())) == 1: fol.sync(j.sequences[0].sequence_ids)
         return r
     g.enqueue = enq
+    # Gate (QWSPEC_NGRAM_GATE=0 turns it off): per request, the mean tokens gained per lookup round and per drafter round
+    # (from the sequence growth seen at the next round). A lookup round runs only while its mean is not below the drafter
+    # round's, with one probe every PROBE drafter rounds so a copy section later in the answer turns it back on. Long prompts
+    # hold many 16-token matches that do not continue (GLM 128K essay: lookup on 26.4 tok/s, off 30.7); copies keep it on.
+    gate = os.environ.get("QWSPEC_NGRAM_GATE", "1") != "0"
+    PROBE, A = 32, 0.25
+    # drafter prior: 1 + 0.6 per draft token (GLM 128K essay: 0.67 accepted per draft); it is measured from the first
+    # drafter round on, and lookup rounds start at the optimistic K + 1
+    dr0 = lambda: 1.0 + 0.6 * max(1, int(g.num_draft_tokens))
+    st = {"sid": None, "n": 0, "kind": None, "ng": float(K + 1), "dr": dr0(), "skip": 0}
+    def gate_ok(sid, n):
+        if sid is not st["sid"]:
+            st.update(sid=sid, kind=None, ng=float(K + 1), dr=dr0(), skip=0)
+        elif st["kind"] is not None and n > st["n"]:
+            k = st["kind"]; st[k] = (1 - A) * st[k] + A * (n - st["n"])
+        st["n"] = n
+        if not gate or st["ng"] >= st["dr"] or st["skip"] >= PROBE: return True
+        return False
     def wrapped(results):
-        cont = None
+        cont = None; sid = None
         if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
-            idx = fol.sync(g.active_jobs[0].sequences[0].sequence_ids)
+            sid = g.active_jobs[0].sequences[0].sequence_ids
+            idx = fol.sync(sid)
             L, c = idx.match(K)
             if L >= lmin and c:
                 cont = c
                 if cmin > 0:
                     a = idx.witness_len(c)
                     if a < len(c): cont = c[:a] if a >= cmin else None
-        if cont is None: return orig(results)
+            if not gate_ok(sid, len(sid)):
+                if cont is not None and stats is not None: stats["ng_gated"] = stats.get("ng_gated", 0) + 1
+                cont = None
+        if cont is None:
+            if sid is not None:
+                st["kind"] = "dr"; st["skip"] += 1
+            return orig(results)
+        st["kind"] = "ng"; st["skip"] = 0
         w = g.num_draft_tokens; g.num_draft_tokens = 1
         try: out = orig(results)
         finally: g.num_draft_tokens = w

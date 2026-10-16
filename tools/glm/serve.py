@@ -63,7 +63,14 @@ SPEED_ENV = {
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",
-    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # plain chunks beyond 32K depth, lower peak memory at 512K ctx
+    # 16/10: big chunks at every depth (was 32768). Prefill +12.6 % at 128K, +12.1 % at 256K, +10.5 % at 500K;
+    # vs the true next tokens NLL -0.012 (95 % CI -0.027..+0.003), next-token accuracy unchanged, 500K needle found,
+    # peak memory still fits a 500K context on a 128 GB Strix Halo.
+    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "0",
+    # 15/10: 8192-row prefill chunks (an 8K prompt = one forward; 4-slot KDA checkpoints keep every tail boundary).
+    # Box 8K cold window -3.8 %, served 8K 697 / 32K 681 tok/s, logits + restore hashes equal to 4096 chunks.
+    "EXL3_PREFILL_BIG_CHUNK": "8192",
+    "EXL3_NC2_CKPT4": "1",
     # 27/09: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
     # served accept +0.077 +- 0.008 (n=24), target ids 24/24 equal, serve_accept decode +4.8 %.
     # The pack ships the sidecar as mtp_eh_proj.st; loaded by default (see apply_eh_sidecar_default()).
@@ -93,6 +100,25 @@ SPEED_ENV = {
     "EXL3_MLA_PF_FAST": "1",
     "EXL3_KDA_PF_SPLIT": "2",
     "EXL3_PF_NO_TAIL": "1",
+    # 15/10: a turn that resumes mid-page (tail checkpoint) and adds >= 1024 tokens no longer pays a separate last-page
+    # forward: served tool turn 4.34 -> 3.35 s, 2.58 -> 2.14 s; first-token KLD vs cold within the chunk-size floor
+    # Slot files keep the tail checkpoint (slot_store format 2), so a reload does not replay the gap.
+    "EXL3_TAIL_MAXGAP": "8192",
+    # a prompt that shares cached pages but not their recurrent checkpoint (a new conversation on the same long system prompt)
+    # side-writes the state where those pages end, so the next one resumes there: first token after a shared 9K / 12.1K prefix
+    # 2.41 -> 1.94 s, 3.84 -> 2.06 s; the writing prompt is bitwise unchanged, KLD vs a cold prefill at the resumed-turn level.
+    "EXL3_BRANCH_CKPT": "1",
+    # such a resume (page-aligned, off the 2048 chunk grid) with a short remainder keeps the tail in its one chunk (prompt-end tail
+    # checkpoint) instead of a separate last-page forward: 2.00 -> 1.42 s, 2.44 -> 1.51 s; KLD vs a cold prefill unchanged in class.
+    "EXL3_TAIL_OFFGRID": "1",
+    # cold prompts checkpoint every 2048 rows before the tail window too (default grid 32768), so the FIRST new conversation on a
+    # long system prompt cached by a conversation with a long first turn resumes near the shared end instead of at token 0: served,
+    # 14.7K-token system + 4.5K-token turns, 28.4 -> 8.0 s; later cold prompts equal within noise, the first one per process +~1.8 s.
+    "EXL3_CKPT_INTERVAL_PP": "2048",
+    # Dense EXL3 GEMM with in-GEMM decode for forwards of 1..1023 rows (the large K 3/4 shapes skip the fp16 weight rebuild).
+    # Served GLM first token +5.7..+12.2 % on 200-900-token prompts, cold and follow-up. Quality checked against an fp32
+    # reference: top-1 vs fp32 never below the current path over 96 rows. Read per call, not latched. "0" = off.
+    "EXL3_DENSE_MPW2": "1023",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
@@ -108,6 +134,24 @@ SPEED_ENV = {
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
     "EXL3_SPEC_SAMPLED": "1",
+    # 14/10: prefill producers write GEMM-padded rows (KDA o_proj input, mHC norm outputs) and the shared expert is
+    # added in the routed-MoE reduce epilogue: no pad copies, no separate widen + fp32 add. Bitwise: first-token and restored-
+    # prompt logits equal on vs off (3 x 8K + 1 x 32K, one load, ABBA). 8K prefill +3.7..+6.2 % (these four + the async
+    # stash, which alone shows no gain and stays off), 32K +0.3 % (shared fuse) / +2.2 % (pads). 0 = off.
+    "EXL3_NC2_SHARED_FUSE": "1",
+    "EXL3_NC2_KDA_OPAD": "1",
+    "EXL3_NC2_HC_YPAD": "1",
+    "EXL3_NC2_HC_YPAD_MLP": "1",
+    # 15/10: silu_mul, the MLA unfold and the KDA prefill norm write their GEMM input at the padded
+    # pitch; attention / MLA o_proj / the ablit projection keep fp16 output where the residual reads it. Bitwise (one load,
+    # ABBA, on top of the four above: first-token and restored-prompt logits equal, 3 x 8K + 1 x 32K); prefill +0.3 % at 8K (iGPU
+    # heat), +0.8 % at 32K. 0 = off.
+    "EXL3_NC2_SILU_PAD": "1",
+    "EXL3_NC2_MLA_OPAD": "1",
+    "EXL3_NC2_ATTN_F16": "1",
+    "EXL3_NC2_ABLIT_F16": "1",
+    "EXL3_NC2_MLA_OPROJ_F16": "1",
+    "EXL3_NC2_KDA_NPAD": "1",
 }
 
 # Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.0 MiB for a
@@ -585,9 +629,9 @@ class ResidentEngine:
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
         # rebuild of a cache_salt change pays 0.4 s for it inside time to first token. EXL3_GC_FREEZE=1 keeps them out of the
-        # collector, before the first Generator exists (a frozen Generator would never be freed). Off by default here: four
-        # server loads in both orders give +2.1 % first-token rate at 8K and +7.9 % at 2K. The Qwen server has it on.
-        if os.environ.get("EXL3_GC_FREEZE", "0") != "0":
+        # collector, before the first Generator exists (a frozen Generator would never be freed). Four server loads in both
+        # orders give +2.1 % first-token rate at 8K and +7.9 % at 2K, texts identical; on by default as in the Qwen server. 0 = off.
+        if os.environ.get("EXL3_GC_FREEZE", "1") != "0":
             import gc
             gc.collect()
             gc.freeze()
