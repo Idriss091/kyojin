@@ -190,6 +190,71 @@ class T(unittest.TestCase):
         self.assertEqual((fols[0].sid is g.job.sequences[0].sequence_ids, len(fols[0].idx)), (True, 42))
         self.assertEqual(g.iterate_draftmodel_mtp_gen([]).tolist(), [[118, 119, 1000]])
 
+    def test_plain_lookup_from_env(self):
+        # QWSPEC_PLAIN_LOOKUP = "lmin,K[,cmin[,rows]]"; unset / off / 0 / none -> None; rows defaults to the row_budget argument
+        os.environ.pop("QWSPEC_PLAIN_LOOKUP", None)
+        self.assertIsNone(sp.plain_lookup_from_env())
+        for v in ("off", "0", "none", "OFF", " None "):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try: self.assertIsNone(sp.plain_lookup_from_env())
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        for v, want in (("2,15", (2, 15, 1, 0)), ("2,15,3", (2, 15, 3, 0)), (" 2 , 15 , 1 , 16 ", (2, 15, 1, 16))):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try: self.assertEqual(sp.plain_lookup_from_env(), want)
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15"                 # 2 fields: rows = the default (row_budget)
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 1, 16))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15,3"               # 3 fields: rows = the default
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 3, 16))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15,1,4"             # explicit 4th field wins over the default
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 1, 4))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        for v in ("2", "2,15,1,4,9", "0,15", "2,0", "2,15,-1", "x,15"):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try:
+                with self.assertRaises(ValueError): sp.plain_lookup_from_env()
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+
+    def test_install_plain_lookup(self):
+        # drafter-free lookup: answers iterate_ngram_gen. A match returns its continuation (K cap, cmin cut) as ONE draft per
+        # round and needs NO drafter forward; no match = a plain round (no draft); uninstall restores the generator's slot.
+        from exllamav3.util.tensor import SeqTensor
+        row = lambda v: list(range(100, 120)) + [v] + [7, 8, 9]
+
+        class PJob:
+            def __init__(s, ids):
+                sid = SeqTensor((1, 1), torch.long, -1, init_cap=256)
+                sid.append(torch.tensor([ids], dtype=torch.long))
+                s.sequences = [type("S", (), {"sequence_ids": sid})()]
+            def is_prefill_done(s): return True
+
+        class PGen:
+            def __init__(s):
+                s.active_jobs = []; s.forwards = 0
+            def enqueue(s, j): s.active_jobs.append(j)
+            def iterate_ngram_gen(s, results): s.forwards += 1; return None   # the generator's own slot
+
+        def gen(ids):
+            g = PGen(); st = {}; un = sp.install_plain_lookup(g, (2, 7, 1, 0), st); g.enqueue(PJob(ids)); return g, st, un
+        # one earlier occurrence: the whole continuation (K = 7), one draft row, no drafter forward
+        g1, st1, un = gen(row(1000) + list(range(100, 118)))
+        out = g1.iterate_ngram_gen([])
+        self.assertEqual((out.tolist(), out.shape[-1], g1.forwards, st1),
+                         ([[118, 119, 1000, 7, 8, 9, 100]], 7, 0, {"ng": 1, "ng_tokens": 7}))
+        # the two latest occurrences agree on only 2 tokens: cmin 1 cuts the draft to the common prefix
+        g2, _, _ = gen(row(1000) + row(2000) + list(range(100, 118)))
+        self.assertEqual(g2.iterate_ngram_gen([]).tolist(), [[118, 119]])
+        # no match: no draft, and the generator's own slot was never used
+        g3, _, _ = gen(list(range(40)))
+        self.assertIsNone(g3.iterate_ngram_gen([])); self.assertEqual(g3.forwards, 0)
+        self.assertIn("iterate_ngram_gen", g1.__dict__)                        # the lookup answers the slot
+        un()
+        self.assertNotIn("enqueue", g1.__dict__)
+        self.assertNotIn("iterate_ngram_gen", g1.__dict__)                     # the generator's own slot is back
+        self.assertEqual((g1.iterate_ngram_gen([]), g1.forwards), (None, 1))
+
     def test_witness_len(self):
         # a templated list: the constant part is copied, the copy stops at the value that changes from row to row
         row = lambda v: list(range(100, 120)) + [v, v + 1] + [7, 8, 9]

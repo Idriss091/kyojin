@@ -754,7 +754,9 @@ class QwenEngine:
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
-        ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0))  # buffers fit the deepest draft
+        import spec_policy  # tools/qwen/spec_policy.py
+        pl = spec_policy.plain_lookup_from_env(row_budget if sessions > 1 else 0)   # drafter-free lookup (plain rounds): its K needs the same history depth
+        ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0), pl[1] if pl else 0)  # buffers fit the deepest draft
         self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
         self.sessions = sessions
         self.config = Config.from_directory(model_path)
@@ -841,11 +843,16 @@ class QwenEngine:
         self.torch.cuda.empty_cache()
         spec = spec and self.draft_model is not None
         kw = dict(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
+        import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
+        pl = None if spec else spec_policy.plain_lookup_from_env(self.row_budget)
         if spec:
             kw.update(draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.ndt)
+        elif pl:
+            kw.update(ngram_match_min=pl[0], num_draft_tokens=pl[1])
         self.generator = self.Generator(**kw)
+        if pl:
+            self.uninstall = spec_policy.install_plain_lookup(self.generator, pl)
         if spec and self.draft_policy == "mix":
-            import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
             thf, thv, maxd = spec_policy.env_defaults(self.ndt)   # 0.6 / 0.3 / ndt unless QWSPEC_THF / THV / MAXD are set
             fx = os.environ.get("QWSPEC_FIXD")
             self.uninstall = spec_policy.install(self.generator, self.draft_model, self.model,
