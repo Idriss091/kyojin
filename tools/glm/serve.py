@@ -101,6 +101,10 @@ SPEED_ENV = {
     # such a resume (page-aligned, off the 2048 chunk grid) with a short remainder keeps the tail in its one chunk (prompt-end tail
     # checkpoint) instead of a separate last-page forward: 2.00 -> 1.42 s, 2.44 -> 1.51 s; KLD vs a cold prefill unchanged in class.
     "EXL3_TAIL_OFFGRID": "1",
+    # cold prompts checkpoint every 2048 rows before the tail window too (default grid 32768), so the FIRST new conversation on a
+    # long system prompt cached by a conversation with a long first turn resumes near the shared end instead of at token 0: served,
+    # 14.7K-token system + 4.5K-token turns, 28.4 -> 8.0 s; later cold prompts equal within noise, the first one per process +~1.8 s.
+    "EXL3_CKPT_INTERVAL_PP": "2048",
     "EXL3_HOST_LEAN": "1",
     "EXL3_HOST_CUTS": "1",
     "EXL3_PF_GLUE": "1",
