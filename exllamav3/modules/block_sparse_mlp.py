@@ -2072,7 +2072,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
         # Shared experts
-        if self.shared_experts and not bc_sh_exp:
+        # EXL3_SHGATE_FUSE (default 1, read per call): prefill rows with a shared gate take the shared expert's fp16 down output
+        # and add float(y) * sigmoid(gate) into the routed sum in one pass (gr_pf.shgate_add), replacing the fp32 widen copy, the
+        # torch multiply and the torch add of add_sigmoid_gate's fallback. Same arithmetic, bit-identical. 0 goes back.
+        if (self.shared_experts and not bc_sh_exp and self.shared_gate and bsz > 32 and not self.tp_reduce
+                and not self.shared_experts_post_norm and final_hidden_states.dtype == torch.float
+                and final_hidden_states.is_contiguous() and os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"):
+            sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
+            sh_params["nc2_down_half"] = True
+            yh = self.shared_experts.forward(x, sh_params)
+            z = self.shared_gate.forward(x, params)
+            if yh.dtype == torch.half and yh.is_contiguous() and z.dtype == torch.float and z.is_contiguous():
+                from .gated_delta_net_fn.gr_pf import shgate_add
+                shgate_add(final_hidden_states.view(-1, self.hidden_size), yh.view(-1, self.hidden_size), torch.sigmoid(z))
+            else:
+                ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
+        elif self.shared_experts and not bc_sh_exp:
             y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
