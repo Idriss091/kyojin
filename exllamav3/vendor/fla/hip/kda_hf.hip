@@ -10,7 +10,7 @@
 
 // KDA prefill recurrence on gfx11 WMMA, 16-row chunks. Per value head (block) and chunk, G the 16-row-local cumulative log2
 // decay (a vector per row, G = g - g[c0 - 1] from the caller's 64-row-local cumsum), GL = G of the chunk's last row:
-//   L = -Akk (strictly lower, beta_i sum_c k_i k_j 2^{G_i - G_j}),  T = (I - L)^-1 = (I + L)(I + L^2)(I + L^4)(I + L^8)
+//   L = -Akk (strictly lower, beta_i sum_c k_i k_j 2^{G_i - G_j}),  T = (I - L)^-1 (fp32 forward substitution)
 //   Vnew = T (v beta - ((k beta) * 2^G) S)
 //   O    = ((q scale) * 2^G) S + Aqk Vnew                  (Aqk = scale sum_c q_i k_j 2^{G_i - G_j}, j <= i)
 //   S    = diag(2^GL) S + (k * 2^{GL - G})^T Vnew
@@ -70,6 +70,7 @@ extern "C" __global__ void kda_chunk16_wmma(
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
     __shared__ float l_s[16][16];                      // Akk diagonal block (masked j < i)
     __shared__ __align__(16) _Float16 t_s[16][16];
+    __shared__ float lf_s[16][17];                     // L (fp32) for the substitution
     __shared__ __align__(16) _Float16 p_s[16][16];     // Aqk diagonal block (masked j <= i)
     __shared__ float gl_s[128], egl_s[128];            // GL, 2^GL per key channel
     __shared__ __align__(16) unsigned short out_s[16][136];
@@ -185,8 +186,8 @@ extern "C" __global__ void kda_chunk16_wmma(
         if (t0 + 16 < rows) fetch(t0 + 16);
         GC_BARRIER();
         if (wave == 0) {
-            // L strictly lower; T = (I - L)^-1 = (I + L)(I + L^2)(I + L^4)(I + L^8).
-            gc_f8 T, P;
+            // L strictly lower.
+            gc_f8 P;
 #ifndef KHF_TP
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
@@ -201,29 +202,22 @@ extern "C" __global__ void kda_chunk16_wmma(
 #else
                 P[r] = -l_s[i][j];
 #endif
-                T[r] = P[r] + (i == j ? 1.f : 0.f);
             }
+            // T = (I - L)^-1 by forward substitution in fp32, rounded to f16 once [exllamav3 change: the product form
+            // (I + L)(I + L^2)(I + L^4)(I + L^8) with f16 operands lost up to 10-15 % of T on real, correlated keys, |L^8| ~ 7e2]
 #pragma unroll
-            for (int s = 0; s < 3; ++s) {
-                // P as A: rows via LDS (t_s scratch), as B: half-wave swap.
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)P[r];
-                GC_WAVE_SYNC();
-                const gc_h16 pa_ = *(const gc_h16*)&t_s[l16][0];
-                const gc_h16 pbv = gc_c_to_b(P, hi);
-                GC_WAVE_SYNC();
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
-                GC_WAVE_SYNC();
-                const gc_h16 ta = *(const gc_h16*)&t_s[l16][0];
-                gc_f8 P2 = {0, 0, 0, 0, 0, 0, 0, 0};
-                P2 = GC_WMMA(pa_, pbv, P2);
-                T = GC_WMMA(ta, gc_c_to_b(P2, hi), T);
-                P = P2;
-                GC_WAVE_SYNC();
+            for (int r = 0; r < 8; ++r) lf_s[2 * r + hi][l16] = P[r];
+            GC_WAVE_SYNC();
+            if (hi == 0) {   // in place, lane l16 = column c: lf_s[i][c] <- T[i][c] = (i == c) + sum_{j < i} L[i][j] T[j][c]
+                             // (row i of L is read before it is overwritten; T[j][c] is this lane's own earlier store)
+#pragma unroll 1
+                for (int i = 0; i < 16; ++i) {   // rolled: unrolled, the 120 LDS loads are hoisted into VGPRs (occupancy 6 -> 5)
+                    float a = i == l16 ? 1.f : 0.f;
+                    for (int j = 0; j < i; ++j) a = fmaf(lf_s[i][j], lf_s[j][l16], a);
+                    lf_s[i][l16] = a;
+                    t_s[i][l16] = (_Float16)a;
+                }
             }
-#pragma unroll
-            for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
         }
 #ifndef KHF_TP
         else if (wave == 1) {

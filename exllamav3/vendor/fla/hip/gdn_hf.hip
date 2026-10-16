@@ -1,7 +1,8 @@
 // Adapted from hipfire (https://github.com/warpfront/hipfire, v0.4.2.1-13-gbfb90b9, kernels/src/gated_delta_chunk_wmma.gfx1151.hip),
 // Copyright the hipfire authors, licensed under the Apache License 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
 // Changes for exllamav3 (EXL3_GDN_HF): KYO_RAW build = no gated RMSNorm epilogue, the chunk's BF16 o rows are stored as they are
-// (our fused_gated_rms_norm runs after, unchanged); z / norm arguments are then unused (may be null). Everything else is the original.
+// (our fused_gated_rms_norm runs after, unchanged); z / norm arguments are then unused (may be null); prefix-cache checkpoint
+// side-write; T = (I - L)^-1 by fp32 forward substitution instead of the f16 product form (PPL, see the comment at the solve).
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
@@ -15,7 +16,7 @@
 //   Vnew = T (v beta - (k beta e^G) S)          (S the state entering the chunk)
 //   O    = e^G (q S) + (q k^T e^{G_i - G_j}, j <= i) Vnew
 //   S    = e^{G_last} S + (k e^{G_last - G})^T Vnew
-// T is the product (I + L)(I + L^2)(I + L^4)(I + L^8) (L is nilpotent).  All
+// T by fp32 forward substitution (exllamav3; hipfire: the product (I + L)(I + L^2)(I + L^4)(I + L^8)).  All
 // products are F16 WMMA with F32 accumulation (q/k are BF16 values; S, T,
 // Vnew and the decayed operands round to F16), so the route is KLD-gated;
 // the gate is gated_delta_gate_bf16_f32_batched's expression.
@@ -80,6 +81,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     __shared__ __align__(16) _Float16 kdT[128][16];    // (k e^{GL-G})^T
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
     __shared__ __align__(16) _Float16 t_s[16][16];
+    __shared__ float lf_s[16][17];                     // L (fp32) for the substitution [exllamav3 change]
     __shared__ __align__(16) _Float16 p_s[16][16];
     __shared__ float g_s[16], bt_s[16], inv_s[16];
     __shared__ __align__(16) unsigned short out_s[16][136];
@@ -205,35 +207,28 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
             for (int s = 0; s < 8; ++s)
                 c = GC_WMMA(*(const gc_h16*)&k_s[l16][16 * s], *(const gc_h16*)&k_s[l16][16 * s], c);
-            // L strictly lower; T = (I - L)^-1 = (I + L)(I + L^2)(I + L^4)(I + L^8).
-            gc_f8 T, P;
+            // L strictly lower.
+            // T = (I - L)^-1 by forward substitution in fp32, rounded to f16 once [exllamav3 change: the product form
+            // (I + L)(I + L^2)(I + L^4)(I + L^8) with f16 operands lost up to 10-15 % of T on real, correlated keys, |L^8| ~ 7e2]
+            gc_f8 P;
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
                 P[r] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
-                T[r] = P[r] + (i == j ? 1.f : 0.f);
             }
 #pragma unroll
-            for (int s = 0; s < 3; ++s) {
-                // P as A: rows via LDS (t_s scratch), as B: half-wave swap.
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)P[r];
-                GC_WAVE_SYNC();
-                const gc_h16 pa = *(const gc_h16*)&t_s[l16][0];
-                const gc_h16 pbv = gc_c_to_b(P, hi);
-                GC_WAVE_SYNC();
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
-                GC_WAVE_SYNC();
-                const gc_h16 ta = *(const gc_h16*)&t_s[l16][0];
-                gc_f8 P2 = {0, 0, 0, 0, 0, 0, 0, 0};
-                P2 = GC_WMMA(pa, pbv, P2);
-                T = GC_WMMA(ta, gc_c_to_b(P2, hi), T);
-                P = P2;
-                GC_WAVE_SYNC();
+            for (int r = 0; r < 8; ++r) lf_s[2 * r + hi][l16] = P[r];
+            GC_WAVE_SYNC();
+            if (hi == 0) {   // in place, lane l16 = column c: lf_s[i][c] <- T[i][c] = (i == c) + sum_{j < i} L[i][j] T[j][c]
+                             // (row i of L is read before it is overwritten; T[j][c] is this lane's own earlier store)
+#pragma unroll 1
+                for (int i = 0; i < 16; ++i) {   // rolled: unrolled, the 120 LDS loads are hoisted into VGPRs (occupancy 6 -> 5)
+                    float a = i == l16 ? 1.f : 0.f;
+                    for (int j = 0; j < i; ++j) a = fmaf(lf_s[i][j], lf_s[j][l16], a);
+                    lf_s[i][l16] = a;
+                    t_s[i][l16] = (_Float16)a;
+                }
             }
-#pragma unroll
-            for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
