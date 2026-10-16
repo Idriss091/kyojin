@@ -104,6 +104,15 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
     with torch.cuda.device(q.device.index):
         qn = _gdn_pf.l2norm_strided(q)
         kn = _gdn_pf.l2norm_strided(k)
+        # EXL3_GDN_HF=1 (default off, read per call): 16-row-chunk WY kernel adapted from hipfire (hip/gdn_hf.hip) replaces
+        # kkt_solve + the chunk kernel, incl. the prefix-cache checkpoint side-write; takes the raw log decay (its own chunk
+        # cumsum). Not bitwise (f16 WMMA operands)
+        from .hip.gdn_hf_hip import gdn_hf_ok, chunk_gdn_hf
+        if gdn_hf_ok(q, v, qn, kn, g, beta, initial_state):
+            try:
+                return chunk_gdn_hf(q, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=ckpt)
+            except Exception as e:
+                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush=True)
         g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
         if os.environ.get("EXL3_GDN_FUSE", "0") == "1":
             from .gdn_fused import chunk_gdn_fused
