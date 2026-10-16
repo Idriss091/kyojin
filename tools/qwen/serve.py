@@ -43,6 +43,7 @@ sys.path.append(str(HERE.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
+from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
 # KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
 # not look like a hung server to a client that only watches its socket.
@@ -79,6 +80,7 @@ NO_CTX_REPLY = 32768  # reply budget when the engine reports no context length
 DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 # OpenAI effort names -> the Qwen template names (xhigh, medium, low).
 EFFORT_ALIASES = {"high": "xhigh", "minimal": "low"}
+
 
 
 class BadRequest(Exception):
@@ -628,7 +630,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # 16/10: tensor-core MoE GEMM from 9 rows (was 32). Short prompts (17-31 tokens) stop taking the per-expert GEMV
              # path: time to first token 212 vs 360 ms on short chat prompts, decode unchanged. Vs the true next tokens over
              # 1500 prompts it moves the model no more than prefilling the same prompt in two chunks (KLD ratio 0.98).
-             ("EXL3_MOE_WMMA_MIN_ROWS", "9"))
+             ("EXL3_MOE_WMMA_MIN_ROWS", "9"),
+             # Follow-up turns resume from the reply-end checkpoint (T2 prefill x0.90, quality gated).
+             ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
@@ -748,6 +752,10 @@ class QwenEngine:
         self.sessions = sessions
         self.config = Config.from_directory(model_path)
         self.tokenizer = Tokenizer.from_config(self.config)
+        if os.environ.get("KYO_TOKCACHE", "8") == "0":
+            self.pec = None
+        else:
+            self.pec = PromptEncodeCache(self.tokenizer, n=int(os.environ.get("KYO_TOKCACHE", "8") or 0), cut="<|im_start|>", check=os.environ.get("KYO_TOKCACHE_CHECK") == "1", log=lambda m: print(f"qserve: {m}", flush=True))
         self.eos = list(self.config.eos_token_id_list)
         self.model = Model.from_config(self.config)
         # cache_bits 0 (default) = the fp16 K/V pages; 8 (--cache-bits 8) = packed int8 K/V pages (2.6 GiB less at 256K), indexer
@@ -859,6 +867,13 @@ class QwenEngine:
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
 
+    def prompt_ids(self, prompt: str):
+        if self.pec and self.pec.n:
+            return self.pec.encode(prompt)[0]
+        ids = self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True)
+        ids = ids[0] if isinstance(ids, tuple) else ids
+        return ids.reshape(-1)
+
     def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
@@ -895,7 +910,7 @@ class QwenEngine:
         for emb in embs:
             prompt = prompt.replace(IMAGE_PAD, emb.text_alias, 1)
         kw = {"embeddings": embs} if embs else {}
-        ids = self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, **kw)
+        ids = self.prompt_ids(prompt).reshape(1, -1) if not embs else self.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, **kw)
         return ids, embs
 
     def _close_ids(self) -> tuple[int | None, list[int]]:
@@ -944,6 +959,7 @@ class QwenEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        rf_wait = 0.0
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -961,6 +977,22 @@ class QwenEngine:
                     if not fut.done():
                         fut.set_result(res)
             if not self.generator.num_remaining_jobs():
+                # EXL3_REPLY_FIRST: release the finished jobs (reply-end stash) once idle AND their handlers have
+                # dropped their routes (_drop is the last driver command a request waits for before its reply ends), at most
+                # 50 ms after the step; a new request's iterate() releases them first anyway
+                dj = getattr(self.generator, "deferred_jobs", None)
+                if dj and not self._cmds:
+                    if rf_wait < 0.05 and any(self._routes.get(getattr(j, "serial_number", None), (None,))[0] is j for j in dj):
+                        self._wake.clear()
+                        try:
+                            await asyncio.wait_for(self._wake.wait(), 0.005)
+                        except asyncio.TimeoutError:
+                            pass
+                        rf_wait += 0.005
+                        continue
+                    rf_wait = 0.0
+                    await loop.run_in_executor(None, self.generator.flush_deferred)
+                    continue
                 self._wake.clear()
                 if not self._cmds:
                     await self._wake.wait()
@@ -1510,7 +1542,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         stops = [stops] if isinstance(stops, str) else list(stops)
         if not all(isinstance(s, str) for s in stops):
             raise BadRequest("stop must be a string or a list of strings")
-        prompt_tokens = engine.count_tokens(prompt)
+        prompt_tokens = int(engine.prompt_ids(prompt).numel())
         ctx = getattr(engine, "ctx", None)
         max_tokens = body.get("max_completion_tokens")
         if max_tokens is None:

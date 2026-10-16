@@ -26,6 +26,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
+from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 # serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: one line per request
@@ -554,6 +555,7 @@ def load_image(url: str) -> tuple[Any, str]:
 MAX_SESSIONS = 16   # upper bound of --sessions (the Cache default max_batch_size)
 
 
+
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
@@ -596,6 +598,10 @@ class ResidentEngine:
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
+        if os.environ.get("KYO_TOKCACHE", "8") == "0":
+            self.pec = None
+        else:
+            self.pec = PromptEncodeCache(self.tokenizer, n=int(os.environ.get("KYO_TOKCACHE", "8") or 0), cut=["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"], check=os.environ.get("KYO_TOKCACHE_CHECK") == "1", log=lambda m: print(f"serve: {m}", flush=True))
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
@@ -683,8 +689,17 @@ class ResidentEngine:
             self.slot_store.generator = self.greedy_generator
             self.slot_store.erase()
 
+    async def settle_reply(self) -> None:
+        """EXL3_REPLY_FIRST, single-session path: the previous request's finished job is released in an executor
+        thread after its reply went out (see generate's finally); wait for it before anything touches the Generator or Cache."""
+        fut = getattr(self, "_reply_first_fut", None)
+        if fut is not None:
+            self._reply_first_fut = None
+            await fut
+
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (cache_salt namespace change). The caller has drained the requests."""
+        await self.settle_reply()
         if self.sessions > 1:
             await self._post(self._rebuild_generator)    # on the driver, between two steps
         else:
@@ -775,6 +790,13 @@ class ResidentEngine:
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
 
+    def prompt_ids(self, prompt: str):
+        if self.pec and self.pec.n:
+            return self.pec.encode(prompt)[0]
+        ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+        ids = ids[0] if isinstance(ids, tuple) else ids
+        return ids.reshape(-1)
+
     def encode_ids(self, text: str, add_special_tokens: bool = False) -> list[int]:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
@@ -796,6 +818,7 @@ class ResidentEngine:
         import torch
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
         t0 = time.perf_counter()
+        await self.settle_reply()
         probe = getattr(self, "rss_probe", None)
         embs = []
         if prompt_ids is not None:   # token-id prompt: exactly these ids, no template, no BOS, no re-encoding
@@ -815,7 +838,7 @@ class ResidentEngine:
             room = reply_room(self, int(ids.numel()))
             max_tokens = min(max_tokens, room) if room else max_tokens
         else:
-            ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+            ids = self.prompt_ids(prompt).reshape(1, -1)
             if getattr(self, "slot_store", None) is not None:
                 self.slot_store.note_prompt(prompt, ids)
         self.last_stats = {}
@@ -834,8 +857,8 @@ class ResidentEngine:
             async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe):
                 yield piece
             return
-        generator.enqueue(job)
         loop = asyncio.get_running_loop()
+        generator.enqueue(job)
         try:
             while generator.num_remaining_jobs():
                 if cancel is not None and cancel.is_set():
@@ -860,6 +883,8 @@ class ResidentEngine:
             # a leftover job would run inside the next request.
             if generator.num_remaining_jobs():
                 generator.clear_queue()
+            if getattr(generator, "deferred_jobs", None):    # EXL3_REPLY_FIRST: release (reply-end stash) while the reply goes out
+                self._reply_first_fut = loop.run_in_executor(None, generator.flush_deferred)
 
     # Shared mode (sessions > 1). One driver task is the only code that touches the Generator: it runs queued commands
     # (enqueue, cancel, image tower, slot actions) between two iterate() calls and routes the events of each step to the
@@ -896,6 +921,7 @@ class ResidentEngine:
 
     async def _drive_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        rf_wait = 0.0
         while True:
             while self._cmds:
                 fn, args, fut = self._cmds.pop(0)
@@ -914,6 +940,22 @@ class ResidentEngine:
             # read every round: _rebuild_generator (cache_salt change) replaces the Generator between two steps
             generator = self.greedy_generator
             if not generator.num_remaining_jobs():
+                # EXL3_REPLY_FIRST: release the finished jobs (reply-end stash) once idle AND their handlers have
+                # dropped their routes (forget is the last driver command a request waits for before its reply ends), at most
+                # 50 ms after the step; a new request's iterate() releases them first anyway
+                dj = getattr(generator, "deferred_jobs", None)
+                if dj and not self._cmds:
+                    if rf_wait < 0.05 and any(self._routes.get(getattr(j, "serial_number", None)) is not None for j in dj):
+                        self._wake.clear()
+                        try:
+                            await asyncio.wait_for(self._wake.wait(), 0.005)
+                        except asyncio.TimeoutError:
+                            pass
+                        rf_wait += 0.005
+                        continue
+                    rf_wait = 0.0
+                    await loop.run_in_executor(None, generator.flush_deferred)
+                    continue
                 self._wake.clear()
                 if not self._cmds:
                     await self._wake.wait()
@@ -1385,7 +1427,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise web.HTTPBadRequest(reason="image parts and image placeholders do not match (the chat template must write one image placeholder per image part)")
             images = [load_image(u) for u in urls]
             body["_images"] = images or None
-            prompt_tokens = engine.count_tokens(prompt) + sum(engine.image_tokens(im) - 1 for im, _ in images)
+            prompt_tokens = int(engine.prompt_ids(prompt).numel()) + sum(engine.image_tokens(im) - 1 for im, _ in images)
             body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
@@ -1780,6 +1822,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         body = await request.json() if request.can_read_body else {}
         try:
             async with exclusive():
+                if hasattr(engine, "settle_reply"):
+                    await engine.settle_reply()
                 if action == "erase":
                     return web.json_response(store.erase())
                 if action not in ("save", "restore"):
