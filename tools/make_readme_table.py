@@ -51,7 +51,7 @@ def long_block():
     t = '<table align="center">\n<tr><th align="left">Model</th>' + "".join(f"<th>{ck(c)}</th>" for c in pts) + "</tr>\n"
     for m in ms:
         t += f'<tr><td>{label(m)}</td>' + "".join(f'<td align="right">{f(m["prefill"][str(c)])} / {f(m["decode"][str(c)])}</td>' for c in pts) + "</tr>\n"
-    return (t + "</table>\n\n"
+    return ("<p align=\"center\"><b>Long context: up to 500K tokens</b></p>\n\n" + t + "</table>\n\n"
             f'<p align="center"><sub>Prefill / speculative decode, tokens per second, Kyojin {ver} on one Ryzen AI Max+ 395 with 128 GB. '
             'One real document read as a growing prompt (500K = 499,712 tokens); prefill as reported by the server. '
             'Both models recalled two facts hidden at 40 % and 85 % of a ~500K-token prompt (needle test, Kyojin 1.5.3, 15/10).</sub></p>\n\n'

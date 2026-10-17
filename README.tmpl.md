@@ -21,8 +21,6 @@ Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https:/
 <img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
 
-<p align="center"><b>Long context: up to 500K tokens</b></p>
-
 {{LONG}}
 
 ## Made with our models
