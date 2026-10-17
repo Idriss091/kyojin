@@ -639,7 +639,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # 1500 prompts it moves the model no more than prefilling the same prompt in two chunks (KLD ratio 0.98).
              ("EXL3_MOE_WMMA_MIN_ROWS", "9"),
              # Follow-up turns resume from the reply-end checkpoint (T2 prefill x0.90, quality gated).
-             ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"))
+             ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"),
+             # 17/10: multi-block exact decode top-k (bitwise on 24+ cases, decode R<=1 T>=32768 only; saves 0.13/0.42/0.91 ms per token at 128K/256K/500K). 0 = one-block.
+             ("EXL3_TOPK_PAR", "1"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
@@ -888,6 +890,20 @@ class QwenEngine:
         while self.generator.num_remaining_jobs():
             list(self.generator.iterate())
         self.torch.cuda.synchronize()
+        # The first full-size prefill chunk costs ~1.2 s more than every later one (one-time lazy init inside the
+        # forward at chunk size). Pay it at load, not on the first request: one chunk plus a short tail of ordinary text
+        # (EXL3_WARM_PREFILL=0 = off).
+        if os.environ.get("EXL3_WARM_PREFILL", "1") != "0":
+            chunk = int(self.generator.max_chunk_size)
+            text = "<|im_start|>user\n" + "The quick brown fox jumps over the lazy dog near the river bank. " * (chunk // 6 + 64)
+            ids = self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True)
+            ids = ids[:, :chunk + 64].contiguous()
+            job = self.Job(input_ids=ids, max_new_tokens=2, sampler=self._sampler({"temperature": 0.0}),
+                           stop_conditions=self.eos)
+            self.generator.enqueue(job)
+            while self.generator.num_remaining_jobs():
+                list(self.generator.iterate())
+            self.torch.cuda.synchronize()
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())

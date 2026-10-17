@@ -847,7 +847,7 @@ class Generator:
             pos = job.mtp_defer_end
             self.draft_model.prefill(seq.sequence_ids.torch_slice(pos, pos + 1), {
                 "attn_mode": "flash_attn",
-                "block_table": seq.block_index_tensor,
+                "block_table": seq.prefill_block_table(),
                 "cache": self.draft_cache,
                 "cache_seqlens": torch.tensor([pos], dtype = torch.int32),
                 "target_hidden": job.mtp_defer_carry,

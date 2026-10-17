@@ -1509,7 +1509,7 @@ class Job:
 
                 params = {
                     "attn_mode": "flash_attn",
-                    "block_table": seq.block_index_tensor,
+                    "block_table": seq.prefill_block_table(),
                     "cache": self.generator.cache,
                     "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                     "recurrent_states": [self.recurrent_state] if self.recurrent_state is not None else None,
@@ -1564,7 +1564,7 @@ class Job:
                         target_hidden = params.get("export_states"),
                         cache = self.generator.draft_cache,
                         params = {
-                            "block_table": seq.block_index_tensor,
+                            "block_table": seq.prefill_block_table(),
                             "cache_seqlens": params["cache_seqlens"],
                         }
                     )
@@ -1582,7 +1582,7 @@ class Job:
                     draft_params = {
                         "target_hidden": shifted_hidden,
                         "attn_mode": "flash_attn",
-                        "block_table": seq.block_index_tensor,
+                        "block_table": seq.prefill_block_table(),
                         "cache": self.generator.draft_cache,
                         "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
                         "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,

@@ -16,7 +16,12 @@ DASH = {"mimo": "9 6"}
 SHORT = {"qwen": "Qwen3.8-Flash-Next", "glm": "GLM-5.3-Flash", "mimo": "MiMo-V2.6-Flash"}
 FONT = "font-family=\"'Ubuntu Sans','DejaVu Sans',Helvetica,Arial,sans-serif\""
 def fmt(v): return f"{v:,.0f}" if v >= 100 else f"{v:.1f}"
-def ck(c): return f"{int(c) // 1024}K"
+def ck(c): return "500K" if int(c) == 499712 else f"{int(c) // 1024}K"   # 499712 = the 500K point (a 524288-token window)
+BASE_TICKS = [8192, 16384, 32768, 65536, 131072, 262144]
+def ctx_ticks():
+    """Context ticks 8K..256K, plus the 500K tick when any model publishes that point."""
+    pub = {int(c) for m in M for k in ("prefill", "decode") for c, v in m[k].items() if v}
+    return BASE_TICKS + ([499712] if 499712 in pub else [])
 def t(x, y, s, size, fill=TXT, anchor="start", weight="400"):
     return f'<text x="{x}" y="{y}" fill="{fill}" font-size="{size}" text-anchor="{anchor}" font-weight="{weight}">{s}</text>'
 
@@ -69,7 +74,7 @@ def draw(key, headline, footer, xs, label, pos, getter, note=None):
     return draw_lines(headline, footer, xs, label, pos, series, note)
 
 def prefill_chart():
-    ticks = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    ticks = [4096] + ctx_ticks()
     allx = sorted({int(c) for m in M for c, v in m["prefill"].items() if v})
     xs = sorted(set(ticks) | set(allx)); lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
     pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in xs}
@@ -89,7 +94,7 @@ def decode_chart():
 def prefill_context_chart():
     """Prefill against context length: Kyojin and the rivals where a figure exists (Strata by the independent lab, Gufo measured by us)."""
     q = M[0]; R = F.get("rivals", {})
-    ticks = [8192, 16384, 32768, 65536, 131072, 262144]
+    ticks = ctx_ticks()
     ints = lambda d: {int(c): v for c, v in d.items() if v}
     series = [{"name": "Kyojin", "color": BLUE, "pts": ints(q["prefill"]), "below": True, "first_label": False}]
     if R.get("strata"):
@@ -105,7 +110,7 @@ def prefill_context_chart():
 def decode_context_chart():
     """Speculative decode against context length: Kyojin now and before, and the rivals where a figure exists at that context."""
     q = M[0]; R = F.get("rivals", {})
-    ticks = [8192, 16384, 32768, 65536, 131072, 262144]
+    ticks = ctx_ticks()
     lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
     pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in ticks}
     ints = lambda d: {int(c): v for c, v in d.items() if v}
@@ -119,7 +124,7 @@ def decode_context_chart():
 
 def decode_models_chart():
     """Speculative decode against context length, one line per model."""
-    ticks = [8192, 16384, 32768, 65536, 131072, 262144]
+    ticks = ctx_ticks()
     lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
     pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in ticks}
     qd = {int(c): v for c, v in M[0]["decode"].items() if v}; cmax = max(qd)
