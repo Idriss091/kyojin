@@ -104,6 +104,18 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
     return room
 
 
+def draft_timings(st: dict[str, Any]) -> dict[str, Any]:
+    """Speculative-decoding fields for `timings`, only when drafting ran. Names are the engine stats keys of
+    tools/glm/serve.py (`accepted_draft_tokens`, `rejected_draft_tokens`) plus the rounds and the per-round mean."""
+    accepted, rejected = int(st.get("accepted_draft_tokens", 0)), int(st.get("rejected_draft_tokens", 0))
+    if accepted + rejected <= 0:
+        return {}
+    steps = int(st.get("draft_steps") or 0)
+    per_step = float(st["accepted_per_step"]) if st.get("accepted_per_step") is not None else (accepted / steps if steps else 0.0)
+    return {"accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected, "draft_steps": steps,
+            "accepted_per_step": round(per_step, 4)}
+
+
 def sse(data: dict[str, Any], event: str | None = None) -> bytes:
     prefix = f"event: {event}\n" if event else ""
     return (prefix + f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n").encode()
@@ -184,7 +196,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens", 0)),
             predicted=int(st.get("new_tokens", 0)),
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
-            drafts=proposed // num_draft if proposed and num_draft else 0,
+            drafts=int(st.get("draft_steps") or 0) or (proposed // num_draft if proposed and num_draft else 0),
             draft_tokens=proposed, accepted=accepted)
 
     async def health(_: web.Request) -> web.Response:
@@ -429,7 +441,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
                     "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
                     "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                    "predicted_per_second": n / gen if gen else 0.0}
+                    "predicted_per_second": n / gen if gen else 0.0, **draft_timings(st)}
 
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -583,7 +595,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             "tokens_predicted": engine.count_tokens(text),
             "cache_prompt": bool(body.get("cache_prompt", True)),
             "stop": True, "stopped_eos": bool(st.get("eos")), "stopped_word": stopped,
-            "timings": {"prompt_n": int(st.get("cached_tokens", 0)), "predicted_n": int(st.get("new_tokens", 0))}})
+            "timings": {"prompt_n": int(st.get("cached_tokens", 0)), "predicted_n": int(st.get("new_tokens", 0)),
+                        **draft_timings(st)}})
 
     async def tokenize(request: web.Request) -> web.Response:
         """vLLM POST /tokenize: {prompt | messages, add_special_tokens?} -> {tokens, count, max_model_len}.
@@ -806,6 +819,9 @@ def main() -> None:
                              "'stub' = canned replies, no GPU")
     parser.add_argument("--engine-opt", action="append", default=[], metavar="KEY=VALUE",
                         help="extra keyword argument for the loader (JSON value or plain string); repeatable")
+    parser.add_argument("--num-draft", type=int, default=0, metavar="N",
+                        help="DSpark speculative decoding: up to N draft tokens per round (1..block size, 5 for this model), "
+                             "passed to the loader as num_draft; 0 = off (default)")
     parser.add_argument("--default-temperature", type=float, default=None,
                         help="used when a request omits temperature (default: generation_config.json of the pack, else 1.0)")
     parser.add_argument("--default-top-p", type=float, default=None,
@@ -820,6 +836,11 @@ def main() -> None:
 
     defaults = build_defaults(args)
     engine_opts = parse_engine_opts(args.engine_opt)
+    if args.num_draft < 0:
+        raise SystemExit("serve: --num-draft must be >= 0")
+    if args.num_draft:
+        engine_opts["num_draft"] = args.num_draft              # only when on: a loader without drafting never sees it
+        print(f"serve: DSpark speculative decoding on, up to {args.num_draft} draft tokens per round", flush=True)
     if args.loader != "stub":
         startup_health.check_model_dir("serve", args.model, ("config.json", "tokenizer.json"))
     startup_health.start("ds41", ["model"], args.host, args.port, routes=ROUTES)

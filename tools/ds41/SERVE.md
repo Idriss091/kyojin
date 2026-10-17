@@ -9,6 +9,7 @@ the prompt renderer and the output parser run and are tested without a GPU.
 |---|---|
 | `serve.py` | HTTP layer, flags, sampling defaults |
 | `ds41_chat.py` | prompt renderer: port of the official `encoding/encoding_dsv4.py` plus the OpenAI mapping |
+| `dspark.py` | DSpark speculative-decoding controller (framework agnostic, see below) |
 | `ds41_parse.py` | reply parser: thinking / answer split, DSML tool calls, streaming |
 | `ds41_engine.py` | engine contract, `load_model` hook, `StubEngine` |
 | `test_ds41_*.py` | pytest suites (CPU, no weights) |
@@ -32,6 +33,7 @@ python3 tools/ds41/serve.py --model <model-folder> --loader stub --engine-opt re
 | `-c`, `--max-ctx` | `131072` | context window in tokens |
 | `--loader` | `ds41_model:load_model` | `module:function` that builds the engine; `stub` = canned replies |
 | `--engine-opt KEY=VALUE` | none | extra keyword argument for the loader (JSON value or plain string), repeatable |
+| `--num-draft` | `0` (off) | DSpark speculative decoding: up to N draft tokens per round, at most the block size (5). Given to the loader as `num_draft` only when above 0 |
 | `--default-temperature` | pack file, else `1.0` | used when a request omits `temperature` |
 | `--default-top-p` | pack file, else `1.0` | used when a request omits `top_p` |
 | `--default-max-tokens` | all free context | reply budget (thinking included) when a request omits it |
@@ -124,8 +126,47 @@ An explicit thinking switch beats `reasoning_effort: "none"`. `low`, `high` and 
 * `prompt_ids` tokenizes a rendered prompt with special tokens parsed and no extra BOS (the prompt has one).
 * `stats` / `last_stats` get `cached_tokens`, `new_tokens`, `time_prefill`, `time_generate` at the end.
 * `reset_prefix_cache` is called when `cache_salt` changes.
+* With `--num-draft N` the loader gets `num_draft=N` and the engine exposes `num_draft` (the reply budget keeps room
+  for the draft window). It adds `accepted_draft_tokens`, `rejected_draft_tokens`, `draft_steps` to its job stats
+  (`DSparkStats.as_engine_stats()`); the server then adds those and `accepted_per_step` to `timings` and counts the
+  rounds in `/metrics`. Without drafting these fields are absent.
 
 `StubEngine` implements it over canned replies (`--loader stub`, or `StubEngine(replies)` in code).
+
+## DSpark speculative decoding
+
+`dspark.py` holds the draft/verify loop; the engine supplies two small Protocol objects: a `Target` (`prefill`, `verify`
+a block of tokens returning logits and the hidden states of the target layers, `truncate` the cache) and a `Drafter`
+(the three DSpark stages, `draft`). It has no torch import except in `GumbelSampler`.
+
+The official `inference/` code has the DSpark forward pass but **no speculative loop**: its README says generation is
+plain autoregressive and nothing calls `Transformer.forward_spec`. So the acceptance rule and the rollback are ours,
+built on what `forward_spec` defines:
+
+1. The stages take the token the target just chose followed by `dspark_block_size - 1` noise tokens
+   (`dspark_noise_token_id`) and return `block_size` draft tokens, chained through the Markov head (rank
+   `dspark_markov_rank`). Their attention reads a window of main-model context made from the concatenated
+   hidden states of `dspark_target_layer_ids`, one window slot per position.
+2. The target verifies `[anchor, d1..dK]` in one block. Greedy: accept `d_k` while it equals the argmax; the next
+   argmax is the correction (or a bonus token when all matched). Output equals plain greedy, token for token.
+3. Sampling: the target token of each position is drawn in order with the official Gumbel-max `sample` rule and a
+   draft is accepted when it equals the draw (standard speculative sampling for a one-hot draft; same output law,
+   and the same tokens as the plain loop under the same seed). Drafts that carry their laws `q` use `min(1, p/q)` with
+   the `max(0, p - q)` residual instead. The model's confidence head is not used (the official code does not say how).
+4. Rollback: `truncate(n)` must leave the target cache as if only positions `0..n-1` had been run. A ring-buffer
+   sliding window cannot be cut by length (a rejected position overwrites a slot an older position still needs), so
+   an engine must snapshot or keep history for the verify block. The drafter needs no rollback: it is fed only
+   accepted positions, and must be fed every one of them, in order.
+
+The official layer code runs a full prefill or a single token at a later position, so the test adapter
+(`dspark_refkit.py`) verifies a block as single-token steps and rolls back by restoring a snapshot and replaying.
+A real engine does a native block forward.
+
+Stats (`DSparkStats`): rounds, proposed and accepted tokens, `accepted_per_step`, `tokens_per_step`, a histogram of
+draft lengths and one of accepted counts. The server reports `accepted_draft_tokens`, `rejected_draft_tokens`,
+`draft_steps` and `accepted_per_step` in `timings`.
+
+Off by default: nothing is drafted until the real loader supports `num_draft`.
 
 ## Tests
 
@@ -138,3 +179,8 @@ CPU only, no weights. Golden tests compare against the vendored official encoder
 `tokenizer.json`: set `DS41_REF_DIR` to a folder holding it, or run `python3 tools/ds41/fetch_reference.py <dir>`
 (downloads only config, tokenizer and encoding files, never weights). Without it those tests are skipped and
 reported as skipped.
+
+`test_ds41_dspark.py` runs the controller on a bigram table and on a tiny random-weight model built from the
+unmodified official `model.py` (vendored in `testdata/reference/inference`, MIT; CUDA kernels replaced by torch
+equivalents in `dspark_refkit.py`). It checks greedy and seeded-sampling output against the official `generate.py`,
+cache rollback against a fresh prefill, EOS inside a block and `max_tokens` mid-block.
