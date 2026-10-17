@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import threading
 import time
 import torch
 
@@ -249,9 +250,9 @@ class ImageEmbeddingDisk:
     def cleanup_stale_tmp(self, grace_s: float = STALE_TMP_S) -> int:
         """Remove the `.tmp` files a write left behind, older than `grace_s`.
 
-        Every picture is written to `<name>.tmp` and moved onto its final name with `os.replace`, so a
-        `.pt` is always complete and a leftover `.tmp` can only come from a process that died mid-write
-        (`kill -9`, the OOM killer, a power cut). Nothing else looks at those files - not the cap, not the
+        Every picture is written to its own `<name>.<pid>.<thread>.tmp` and moved onto its final name with
+        `os.replace`, so a `.pt` is always complete and a leftover `.tmp` can only come from a process that
+        died mid-write (`kill -9`, the OOM killer, a power cut). Nothing else looks at those files - not the cap, not the
         set of pictures present, not the eviction order - so without this they would stay for ever, taking
         room the cap does not know about.
 
@@ -328,7 +329,8 @@ class ImageEmbeddingDisk:
                 # environment out, this makes a file that got in some other way visible instead of silent
                 payload["env_fingerprint"] = self.env_fingerprint
             path = self._file(key, mode)
-            tmp = path.with_suffix(".tmp")
+            # one temp file per writer: two requests storing the same picture must not interleave into one file
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             try:
                 # torch.save() would create the temp file with the process umask (0644 on a 0022 host) and
                 # os.replace() moves that mode onto the final name, so the file is made owner-only here.
