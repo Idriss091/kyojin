@@ -165,6 +165,8 @@ SPEED_ENV = {
     "EXL3_NC2_ABLIT_F16": "1",
     "EXL3_NC2_MLA_OPROJ_F16": "1",
     "EXL3_NC2_KDA_NPAD": "1",
+    # 17/10: multi-block exact decode top-k (bitwise on 24+ cases, decode R<=1 T>=32768 only; saves 0.13/0.42/0.91 ms per token at 128K/256K/500K). 0 = one-block.
+    "EXL3_TOPK_PAR": "1",
 }
 
 # Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.0 MiB for a
