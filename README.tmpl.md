@@ -17,9 +17,13 @@ Open source. Our own quantised builds of GLM and Qwen. Built on <a href="https:/
 <p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
 
 <p align="center">
-<img src="doc/img/readme_prefill.svg" alt="Prefill speed against context length" width="49%">
-<img src="doc/img/readme_decode.svg" alt="Speculative decode speed against context length" width="49%">
+<img src="doc/img/prefill.svg" alt="Prefill speed against context length" width="49%">
+<img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
+
+<p align="center"><b>Long context: up to 500K tokens</b></p>
+
+{{LONG}}
 
 ## Made with our models
 
