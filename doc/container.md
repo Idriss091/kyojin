@@ -27,7 +27,7 @@ docker build -f docker/Dockerfile --build-arg MODEL=glm  -t kyojin-glm  .   # ca
 docker build -f docker/Dockerfile --build-arg MODEL=mimo -t kyojin-mimo .
 ```
 
-No GPU needed. First build: 22 minutes on a 32-thread machine at 18 MB/s download (about 14 GB of wheels); the other two tags take 17 s. The torch wheel is a nightly, so two builds on different days can carry different versions. `podman build -f docker/Dockerfile` is untested.
+No GPU needed. First build: 12.5 minutes measured here (32 threads; about 14 GB of wheels; the extension alone takes 7). The other two tags take under a second: every layer but the last `MODEL` one is shared. A rebuild after a Python-only edit takes 3 s (only the last code layer, ~26 MB uncompressed, is re-pushed; users re-download MBs, not ~3 GB). A native-source edit (`exllamav3/exllamav3_ext/`, `setup.py`, `build.sh`, `tools/strix_halo/env.sh` or `rebuild.sh`) or a version bump (`exllamav3/version.py`) rebuilds the 136 MB extension layer, so a release re-downloads about 160 MB. The torch and SDK versions are pinned in the Dockerfile (`TORCH_VERSION`, `ROCM_SDK_VERSION`), so two builds carry the same versions until the pins are bumped deliberately. `podman build -f docker/Dockerfile` is untested.
 
 ## Run with docker (tested)
 
