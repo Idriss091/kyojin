@@ -108,6 +108,27 @@ def merge_tiles_topk(topk_fn, cand_s, cand_i, pos_out, pool_idx, k):
     pool_idx.copy_(torch.where(pos_out >= 0, torch.gather(cand_i, 1, pos_out.long().clamp(min = 0)), -1))
 
 
+# EXL3_TOPK_PAR (read per call, default off in the library; the GLM and Qwen servers set it to 1). ROCm's dsa_topk
+# runs ONE block per row, so a decode selection of a wide row leaves 39 of 40 CUs idle (2.63 ms/token over 12 layers
+# at 459K). dsa_topk_par (dsa_topk_par.cu) cuts the same two-pass radix select into four kernels over nb blocks per
+# row and is bitwise identical to ext.dsa_topk on the same buffer; it saves 0.91 ms/token at 500K. "1" = on;
+# EXL3_TOPK_PAR_MIN_ROWS widens the row count beyond decode (kernel limit 16).
+TOPK_PAR_MIN_T = int(os.environ.get("EXL3_TOPK_PAR_MIN_T", "32768"))
+TOPK_PAR_MIN_ROWS = int(os.environ.get("EXL3_TOPK_PAR_MIN_ROWS", "1"))
+
+
+def topk_par_ok(sc, k):
+    """Whether dsa_topk_par may serve this call: few rows, a wide row, and the gfx12 kernel's own
+    input contract (fp16 (R, T) with a 128-aligned row stride, k <= 512 <= output width), so the
+    one-block kernel stays legal on the same buffer as the fallback."""
+    from ..ext import exllamav3_ext as ext
+    R, T = sc.shape
+    return (os.environ.get("EXL3_TOPK_PAR", "0") == "1" and torch.version.hip is not None and
+            hasattr(ext, "dsa_topk_par") and 1 <= R <= TOPK_PAR_MIN_ROWS <= 16 and
+            T >= TOPK_PAR_MIN_T and 1 <= k <= 512 and sc.dtype == torch.half and
+            sc.stride(1) == 1 and sc.stride(0) >= T and sc.stride(0) % 128 == 0)
+
+
 # EXL3_TOPK_SPANS (read per call, default off): few-row, wide selections (decode / verify at depth) on the span-parallel route
 # below. ROCm's dsa_topk runs ONE block per row, so R <= 16 rows of >= 32K pools use R blocks of a 40-CU GPU. 1 = spans
 TOPK_SPAN_W = 8192
@@ -436,10 +457,13 @@ class QSAIndexer(Module):
                 pool_idx.fill_(-1)
             elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
-                if topk_spans_ok(sc, min(k_sel, T_slab)):
-                    dsa_topk_spans(ext.dsa_topk, sc, pool_idx, min(k_sel, T_slab))
+                k_call = min(k_sel, T_slab)
+                if topk_par_ok(sc, k_call):
+                    ext.dsa_topk_par(sc, pool_idx, k_call)
+                elif topk_spans_ok(sc, k_call):
+                    dsa_topk_spans(ext.dsa_topk, sc, pool_idx, k_call)
                 else:
-                    ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+                    ext.dsa_topk(sc, pool_idx, k_call, None, 0)
             elif torch_merge and self.TOPK_MERGE == "torch":
                 cand = []
                 tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
