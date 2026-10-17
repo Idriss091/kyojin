@@ -66,6 +66,27 @@
             "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.libc.dev}/include"
           ];
 
+          # Narrowed source for the native extension compile: the only
+          # repo files setup.py + torch's cpp_extension read (verified:
+          # no #include escapes exllamav3_ext/, setup.py loads
+          # build_config.py and util/arch_list.py by file path, the
+          # version comes from an AST read of version.py, and README.md
+          # feeds the wheel metadata). Python/docs/tests changes leave
+          # this store path untouched, so the cached .so below survives
+          # them (magic-nix-cache) instead of recompiling (~11 min).
+          exllamaNativeSrc = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./setup.py
+              ./pyproject.toml
+              ./README.md
+              ./exllamav3/__init__.py
+              ./exllamav3/version.py
+              ./exllamav3/util/arch_list.py
+              ./exllamav3/exllamav3_ext
+            ];
+          };
+
           # 1. Load workspace (pyproject.toml + uv.lock at eval time)
           workspace = inputs.uv2nix.lib.workspace.loadWorkspace {
             workspaceRoot = ./.;
@@ -192,6 +213,55 @@
               withCudaPatch = old: (ignoreCuda old) // (cudaSearchHook old);
               # hipSysIncludes lives at perSystem scope (shared with the
               # runtime JIT wrappers below); referenced as ${hipSysIncludes}.
+              # Engine extension compile env, shared by the cached native
+              # build (exllamav3-ext) and the pure wheel (exllamav3):
+              # setup.py imports torch (cpp_extension) and compiles HIP
+              # sources with the SDK toolchain. torch comes from
+              # buildInputs (importable via PYTHONPATH in the pep517
+              # build); providers must be importable too (torch's
+              # _rocm_init preloads through them at import time).
+              exllamaExtBuildInputs =
+                old:
+                (old.buildInputs or [ ])
+                ++ [
+                  final.torch
+                  rocmSdk
+                  # torch's own top-level imports (needed to import torch
+                  # during setup.py's cpp_extension build).
+                  final.filelock
+                  final."typing-extensions"
+                  final.sympy
+                  final.networkx
+                  final.jinja2
+                  final.fsspec
+                ];
+              exllamaExtPreBuild = ''
+                export HOME="$TMPDIR"
+                echo "ENVDBG CPATH=$CPATH CPLUS=$CPLUS_INCLUDE_PATH CINC=$C_INCLUDE_PATH" >&2
+                echo "ENVDBG NIX_CFLAGS=$NIX_CFLAGS_COMPILE" >&2
+                # NOTE: export ROCM_HOME only (torch reads it for -I).
+                # ROCM_PATH/HIP_PATH are deliberately UNSET: hipcc
+                # self-locates its version + data files correctly without
+                # them, but misdetects (HIP 3.5.0) when they point at a
+                # tree whose share/hip/version it can't resolve.
+                export ROCM_HOME="${rocmSdk}"
+                unset ROCM_PATH HIP_PATH
+                export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
+                export PYTORCH_ROCM_ARCH="gfx1151"
+                export EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD"
+                export PYTHONPATH="${rocmProviders}/lib/python3.12/site-packages:$PYTHONPATH"
+                export LD_LIBRARY_PATH="${
+                  lib.makeLibraryPath [
+                    pkgs.gcc.cc.lib
+                    rocmSdk
+                    rocmLibs
+                  ]
+                }:$LD_LIBRARY_PATH"
+                # SDK clang runs outside the cc wrapper: system headers for
+                # host and device passes alike (plus NIX_CFLAGS_COMPILE's
+                # python/SDK includes).
+                export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes} $NIX_CFLAGS_COMPILE -v"
+              '';
             in
             lib.genAttrs nvidiaSibs (
               n:
@@ -276,53 +346,44 @@
                   '';
                 }
               );
-              # Engine extension build: setup.py imports torch (cpp_extension)
-              # and compiles HIP sources with the SDK toolchain. torch comes
-              # from buildInputs (importable via PYTHONPATH in the pep517
-              # build); providers must be importable too (torch's _rocm_init
-              # preloads through them at import time).
-              exllamav3 = prev.exllamav3.overrideAttrs (old: {
-                buildInputs = (old.buildInputs or [ ]) ++ [
-                  final.torch
-                  rocmSdk
-                  # torch's own top-level imports (needed to import torch
-                  # during setup.py's cpp_extension build).
-                  final.filelock
-                  final."typing-extensions"
-                  final.sympy
-                  final.networkx
-                  final.jinja2
-                  final.fsspec
-                ];
+              # Native extension, compiled ONLY from the narrowed native
+              # sources (exllamaNativeSrc above). Its store path (and the
+              # magic-nix-cache entry) is untouched by python/docs/tests
+              # changes, so CI reuses the .so instead of recompiling.
+              "exllamav3-ext" = prev.exllamav3.overrideAttrs (old: {
+                src = exllamaNativeSrc;
+                buildInputs = exllamaExtBuildInputs old;
                 nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
                   rocmSdk
                 ];
-                preBuild = ''
-                  export HOME="$TMPDIR"
-                  echo "ENVDBG CPATH=$CPATH CPLUS=$CPLUS_INCLUDE_PATH CINC=$C_INCLUDE_PATH" >&2
-                  echo "ENVDBG NIX_CFLAGS=$NIX_CFLAGS_COMPILE" >&2
-                  # NOTE: export ROCM_HOME only (torch reads it for -I).
-                  # ROCM_PATH/HIP_PATH are deliberately UNSET: hipcc
-                  # self-locates its version + data files correctly without
-                  # them, but misdetects (HIP 3.5.0) when they point at a
-                  # tree whose share/hip/version it can't resolve.
-                  export ROCM_HOME="${rocmSdk}"
-                  unset ROCM_PATH HIP_PATH
-                  export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
-                  export PYTORCH_ROCM_ARCH="gfx1151"
-                  export EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD"
-                  export PYTHONPATH="${rocmProviders}/lib/python3.12/site-packages:$PYTHONPATH"
-                  export LD_LIBRARY_PATH="${
-                    lib.makeLibraryPath [
-                      pkgs.gcc.cc.lib
-                      rocmSdk
-                      rocmLibs
-                    ]
-                  }:$LD_LIBRARY_PATH"
-                  # SDK clang runs outside the cc wrapper: system headers for
-                  # host and device passes alike (plus NIX_CFLAGS_COMPILE's
-                  # python/SDK includes).
-                  export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes} $NIX_CFLAGS_COMPILE -v"
+                preBuild = exllamaExtPreBuild;
+              });
+              # Engine wheel: pure-python build (EXLLAMA_NOCOMPILE, seconds
+              # even on a full-src rebuild) plus the cached .so injected
+              # into site-packages, so ext.py finds the precompiled
+              # extension at the same top-level import path as before.
+              exllamav3 = prev.exllamav3.overrideAttrs (old: {
+                buildInputs = exllamaExtBuildInputs old;
+                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                  rocmSdk
+                ];
+                preBuild = exllamaExtPreBuild + ''
+                  # Pure wheel only: the native compile is skipped here;
+                  # the .so comes from exllamav3-ext (postInstall below).
+                  export EXLLAMA_NOCOMPILE=1
+                '';
+                postInstall = (old.postInstall or "") + ''
+                  extSo=${final."exllamav3-ext"}/lib/python3.12/site-packages
+                  copied=0
+                  for f in "$extSo"/exllamav3_ext*.so; do
+                    [ -e "$f" ] || continue
+                    cp "$f" $out/lib/python3.12/site-packages/
+                    copied=1
+                  done
+                  if [ "$copied" -eq 0 ]; then
+                    echo "exllamav3: FATAL: no exllamav3_ext*.so in exllamav3-ext output ($extSo)" >&2
+                    exit 1
+                  fi
                 '';
               });
             };
@@ -848,6 +909,9 @@
             rocm-libs = rocmLibs;
             rocm-providers = rocmProviders;
             inherit (pythonSet) exllamav3;
+            # Native extension alone (narrowed sources, cached across
+            # python-only changes); the .so is injected into .#exllamav3.
+            exllama-ext = pythonSet."exllamav3-ext";
             hip-sysroot = hipSysroot;
             kyojin = kyojinServe;
             docker = kyojinImage;
