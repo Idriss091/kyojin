@@ -129,7 +129,8 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
     """flat: (num_tokens * top_k) int64 expert ids, slot = token * top_k + k. Returns (order, sel_flat, dummy_tokens):
     order lists the assignment slots grouped by expert, each (expert, chunk of `chunk` tokens) segment in slot order
     and padded to an even length with dummy slots; sel_flat is the expert id of every slot including the dummy ones
-    (slots >= num_tokens * top_k belong to dummy tokens num_tokens .. num_tokens + dummy_tokens - 1). No host sync."""
+    (slots >= num_tokens * top_k belong to dummy tokens num_tokens .. num_tokens + dummy_tokens - 1). No host sync
+    (EXL3_MOE_ALIGN_SYNC_FREE, default on)."""
     dev = flat.device
     a0 = num_tokens * top_k
     nc = (num_tokens + chunk - 1) // chunk
@@ -138,7 +139,9 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
     total = a0 + dummy_tokens * top_k
     key = flat * nc + torch.arange(a0, device = dev) // (top_k * chunk)
     srt = key.argsort(stable = True)
-    kc = torch.bincount(key, minlength = nseg)
+    # torch.bincount on a device tensor syncs the host (min/max reduction + D2H) once per MoE layer: with big chunks (> 4096 rows)
+    # that drained the queue 36-39 times per forward. Same int64 histogram, device only (EXL3_MOE_ALIGN_SYNC_FREE=0 = bincount, read per call).
+    kc = _scatter_expert_count(key, nseg) if os.environ.get("EXL3_MOE_ALIGN_SYNC_FREE", "1") != "0" else torch.bincount(key, minlength = nseg)
     odd = kc & 1
     padbefore = torch.cumsum(odd, 0) - odd
     pos = torch.arange(a0, device = dev) + padbefore[key[srt]]
