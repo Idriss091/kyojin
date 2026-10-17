@@ -94,6 +94,10 @@ SPEED_ENV = {
     # 27/09: DSA indexer glue fused (n=27/arm paired): decode 29.53 -> 30.04 t/s,
     # +1.74 +- 0.43 %; greedy ids 3x64 and MTP accept identical. (round2's stack saw -0.08 % at n=12.)
     "EXL3_DSA_GLUE_FUSE": "1",
+    # sparse (> index_topk 2048) DSA decode fast path: bsz >= 3 takes one batched call, bsz 1/2 stay
+    # byte-identical; long-context decode +4.34 % (3/3 paired reps, N=8 homogeneous ~3.6K-token batch).
+    # Staged default: inert until the DSA rowloop knob reads it (mu1/dsa port). 0 = per-job calls.
+    "EXL3_MU_DSA_ATTN_ROWLOOP_OFF_BSZ": "3",
     # 27/09: prefill mHC apply + next mix_norm fused; 16K 574.3 -> 579.8
     # (+0.95 +- 0.07 %), 4K +1.46 +- 0.48 % (n=10). Decode neutral. Needs the rebuilt ext.
     "EXL3_PF_HC_FUSE": "1",
