@@ -55,6 +55,10 @@ magic-nix-cache and finish in minutes, while native changes still rebuild
 and test it. The serve wrappers, the venv, and the container all consume
 the same package, so nothing drifts. First build compiles the extension
 once (8-10 min); afterwards only native changes pay that again.
+Only these paths invalidate the cached extension: `setup.py`,
+`exllamav3/exllamav3_ext/`, `exllamav3/util/arch_list.py`,
+`exllamav3/version.py`, `pyproject.toml`, `README.md`. Every other change
+(python, tests, tools, docs) reuses the cached `.so`.
 
 `nix fmt` doubles as the clean-tree gate: it exits non-zero when a hook
 fails or rewrites files.
