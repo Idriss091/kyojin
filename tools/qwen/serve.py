@@ -754,11 +754,12 @@ class QwenEngine:
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
+        self.sessions = sessions
+        self.row_budget = 0   # drafter-free lookup row cap: this tree has no --row-budget plumbing (rows = 0 = one active request only)
         import spec_policy  # tools/qwen/spec_policy.py
-        pl = spec_policy.plain_lookup_from_env(row_budget if sessions > 1 else 0)   # drafter-free lookup (plain rounds): its K needs the same history depth
+        pl = spec_policy.plain_lookup_from_env(self.row_budget)   # drafter-free lookup (plain rounds): its K needs the same history depth
         ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0), pl[1] if pl else 0)  # buffers fit the deepest draft
         self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
-        self.sessions = sessions
         self.config = Config.from_directory(model_path)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
