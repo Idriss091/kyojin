@@ -47,6 +47,7 @@ Quick test:
 | `--default-max-tokens` | free context | reply budget when a request omits `max_tokens`; unset, a reply may use all the context left |
 | `--slot-save-path` | `~/cache/llama-slots` | directory for slot files |
 | `--sessions` | 1 | requests decoded together; see below |
+| `--max-batch` | 1 | same as `--sessions` |
 
 Environment: the server sets the measured Qwen configuration with `setdefault` before the engine loads (the list is
 `SERVE_ENV` in `serve.py`; the start-up log prints the effective `EXL3_*` / `MPW*` environment). It covers decode and

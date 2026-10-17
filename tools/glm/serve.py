@@ -1893,6 +1893,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     return app
 
 
+def resolve_batch_flags(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """--max-batch is the task-facing name of --sessions: one value, both spellings accepted, a conflict is an error."""
+    if args.max_batch is None:
+        return
+    if args.sessions not in (1, args.max_batch):
+        parser.error(f"--max-batch {args.max_batch} and --sessions {args.sessions} disagree; give one of them")
+    args.sessions = args.max_batch
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -1949,7 +1958,10 @@ def main() -> None:
                         help="reply budget when a request omits max_tokens, thinking included (default: all the free context)")
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
+    parser.add_argument("--max-batch", type=int, default=None,
+                        help="same as --sessions: up to N requests decoded together in one batched step (default 1 = one request at a time)")
     args = parser.parse_args()
+    resolve_batch_flags(parser, args)
     if not 1 <= args.sessions <= MAX_SESSIONS:
         parser.error(f"--sessions must be 1..{MAX_SESSIONS}")
     if args.sessions > 1:

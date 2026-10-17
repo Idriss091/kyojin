@@ -2150,7 +2150,13 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1,
                         help="requests decoded together (default 1: one at a time, in order). Every session reserves the "
                              "pages for prompt + max_tokens when it starts, so a request that does not fit waits")
+    parser.add_argument("--max-batch", type=int, default=None,
+                        help="same as --sessions: up to N requests decoded together (default 1 = one at a time)")
     args = parser.parse_args()
+    if args.max_batch is not None:
+        if args.sessions not in (1, args.max_batch):
+            parser.error(f"--max-batch {args.max_batch} and --sessions {args.sessions} disagree; give one of them")
+        args.sessions = args.max_batch
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
     # measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
