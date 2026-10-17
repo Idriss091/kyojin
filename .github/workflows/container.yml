@@ -1,10 +1,16 @@
 name: Build & Publish Container Images
-run-name: Build & Publish Container Images (${{ inputs.tag || github.ref_name }})
+run-name: Build & Publish Container Images (${{ inputs.ref || github.ref_name }})
 
 # Builds docker/Dockerfile once per model and pushes ghcr.io/<owner>/kyojin-<model>, the images
-# doc/container.md tells people to pull. Runs on a version tag push. workflow_dispatch builds the
-# given tag (to rebuild a release), or the selected branch when the tag is empty, and only pushes
-# when asked. A tag build writes the tag into exllamav3/version.py first.
+# doc/container.md tells people to pull.
+#
+# Triggers:
+#   - push of a v* tag: builds and pushes; the tag is written into exllamav3/version.py first
+#   - workflow_dispatch: builds `ref` (a branch, tag or commit hash; empty is the selected branch)
+#     and only pushes when `push` is ticked. `override_version` writes `version` into
+#     exllamav3/version.py before the build, whatever the checked out ref says
+#   - pull_request that changes this file: build only, never pushes, so edits to the workflow can
+#     be tested before they are merged
 #
 # amd64 only: the image targets Strix Halo (gfx1151), so there is no multi-arch manifest to join.
 # All models build in ONE job on purpose. Only the last layer (ARG MODEL) differs between them, so
@@ -15,10 +21,23 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/container.yml'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag to build, e.g. v1.5.5. Empty builds the selected branch'
+      ref:
+        description: 'Branch, tag or commit hash to build, e.g. main, v1.5.5 or 3f2a9c1. Empty builds the selected branch'
+        default: ''
+        required: false
+        type: string
+      override_version:
+        description: 'Write the version below into exllamav3/version.py instead of keeping the one in the checkout'
+        default: false
+        required: true
+        type: boolean
+      version:
+        description: 'Version to bake in when override_version is ticked, e.g. 1.5.6 or 1.5.6-rc1'
         default: ''
         required: false
         type: string
@@ -57,35 +76,44 @@ jobs:
           large-packages: false
           swap-storage: true
 
-      # Two steps rather than `ref: ${{ inputs.tag }}`: act only uses the local working copy when
-      # checkout has no ref at all, so a plain checkout keeps tag pushes testable locally
+      # Two steps rather than `ref: ${{ inputs.ref }}`: act only uses the local working copy when
+      # checkout has no ref at all, so a plain checkout keeps pushes testable locally
       - name: Checkout
-        if: ${{ !inputs.tag }}
+        if: ${{ !inputs.ref }}
         uses: actions/checkout@v4
 
-      - name: Checkout ${{ inputs.tag }}
-        if: ${{ inputs.tag }}
+      - name: Checkout ${{ inputs.ref }}
+        if: ${{ inputs.ref }}
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.ref }}
 
-      # Tag builds (pushed, or given to workflow_dispatch) stamp the tag into exllamav3/version.py
-      # before the image is built, so the package inside reports the version the image is tagged
-      # with. Branch builds keep the file as it is.
+      # The version baked into exllamav3/version.py, so the package inside the image reports the
+      # version the image is tagged with:
+      #   - override_version: the `version` input
+      #   - pushed tag: the tag
+      #   - anything else: the file as checked out
       - name: Resolve version
         id: version
         env:
-          INPUT_TAG: ${{ inputs.tag }}
+          OVERRIDE: ${{ inputs.override_version }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          tag="$INPUT_TAG"
-          if [[ -z "$tag" && "$GITHUB_REF_TYPE" == "tag" ]]; then
-            tag="$GITHUB_REF_NAME"
+          requested=""
+          if [[ "$OVERRIDE" == "true" ]]; then
+            requested="$INPUT_VERSION"
+            if [[ -z "$requested" ]]; then
+              echo "::error file=container.yml::override_version is ticked but version is empty"
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_EVENT_NAME" == "push" ]]; then
+            requested="$GITHUB_REF_NAME"
           fi
-          if [[ -n "$tag" ]]; then
-            version="${tag#v}"
+          if [[ -n "$requested" ]]; then
+            version="${requested#v}"
             # The version lands in Python source and in image tags: digits first, no quotes
             if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
-              echo "::error file=container.yml::Tag $tag is not a version (expected v1.2.3 or 1.2.3)"
+              echo "::error file=container.yml::$requested is not a version (expected 1.2.3 or v1.2.3)"
               exit 1
             fi
             printf '__version__ = "%s"' "$version" > exllamav3/version.py
