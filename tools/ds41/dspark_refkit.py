@@ -94,11 +94,13 @@ def load_official() -> tuple[Any, Any]:
     noop = lambda *a, **k: None  # noqa: E731
     encoding = _stub("encoding", encode_case=noop, encode_messages=noop, load_cases=noop,
                      parse_message_from_completion_text=noop, parse_tagged_text=noop, to_json=noop)
-    borrowed = ("kernel", "encoding", "model", "engram", "vision", "image_processor")
+    stubs = {"kernel": kernel, "encoding": encoding, "transformers": _stub("transformers", AutoTokenizer=None),
+             "safetensors": _stub("safetensors"), "safetensors.torch": _stub("safetensors.torch", load_model=None)}
+    borrowed = (*stubs, "model", "engram", "vision", "image_processor")
     saved = {n: sys.modules.get(n) for n in borrowed}
     sys.path.insert(0, str(REF))
     try:
-        sys.modules["kernel"], sys.modules["encoding"] = kernel, encoding
+        sys.modules.update(stubs)                    # generate.py imports these; generate() itself needs none of them
         model = _load("dsv41_model", REF / "model.py")
         sys.modules["model"] = model
         generate = _load("dsv41_generate", REF / "generate.py")
@@ -127,9 +129,33 @@ TINY = dict(
     # differently for different tensor shapes, so prefill and decode would pick different groups
     index_n_heads=16, index_head_dim=16, index_topk=4, candidate_source_layer=-1, hc_mult=2, hc_sinkhorn_iters=4,
     original_seq_len=0, compress_rope_theta=10000.0, route_scale=1.5,
+    # engram on layers 1 and 3: 3-gram hash state kept in a per-position token cache (see FakeTokenizer)
+    engram_layer_ids=(1, 3), engram_num_embeddings=(1200, 1200), engram_max_ngram_size=3, engram_vocab_size=50,
+    engram_n_heads=2, engram_head_dim=32, engram_pad_id=2, engram_compressed_vocab_size=26,
     dspark_block_size=5, dspark_noise_token_id=31, dspark_target_layer_ids=(3, 4, 5), dspark_markov_rank=8,
     dspark_n_routed_experts=8, dspark_n_activated_experts=3,
 )
+
+
+class FakeTokenizer:
+    """The three things engram.build_compressed_token_map reads from a tokenizer: token i is the letter a..z for i < 26 and
+    A..F after, so ids 26..31 collapse onto 0..5 (26 compressed ids)."""
+
+    def __init__(self, n=32):
+        self.n = n
+        self.backend_tokenizer = self
+
+    def __len__(self):
+        return self.n
+
+    def _text(self, i):
+        return chr(97 + i) if i < 26 else chr(65 + i - 26)
+
+    def decode(self, ids, skip_special_tokens=False):
+        return self._text(ids[0])
+
+    def id_to_token(self, i):
+        return self._text(i)
 
 
 def build_tiny(seed: int = 0, **overrides: Any):
@@ -140,10 +166,13 @@ def build_tiny(seed: int = 0, **overrides: Any):
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.float32)
     try:
-        model = mod.Transformer(args)
+        model = mod.Transformer(args, FakeTokenizer(args.vocab_size))
     finally:
         torch.set_default_dtype(prev)
     model.float().eval()
+    for layer in model.layers:                # the engram table is fp8 in the checkpoint: float32 here, bf16 out of the lookup
+        if layer.engram is not None:
+            layer.engram.embed.register_forward_hook(lambda mod, inp, out: out.float())
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -153,7 +182,7 @@ def build_tiny(seed: int = 0, **overrides: Any):
                 p.copy_(torch.randn(p.shape, generator=g))
             elif name.endswith((".bias", "_base")):
                 p.copy_(0.3 * torch.randn(p.shape, generator=g))
-            elif name.endswith("_scale"):
+            elif name.endswith(("_scale", "embed.scale")):
                 p.copy_(0.5 + 0.2 * torch.rand(p.shape, generator=g))
             elif p.ndim >= 2:
                 gain = {"embed.weight": 1.0, "head.weight": 3.0}.get(name, 1.0)
@@ -190,6 +219,8 @@ def live_view(model, n: int, *, draft_n: int | None = None) -> dict[str, torch.T
     compressed rows of completed groups, the tail of the open group, the indexer keys. Stale slots are left out, they
     legitimately differ between two histories. The DSpark stages' windows are viewed at `draft_n` positions."""
     out: dict[str, torch.Tensor] = {}
+    if model.engram_hash is not None:
+        out["engram_hash.cache"] = model.engram_hash.cache[:, :n].clone()
     for name, mod in model.named_modules():
         attn = mod if hasattr(mod, "window_kv_cache") else None
         if attn is not None:

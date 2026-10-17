@@ -260,7 +260,9 @@ class DSparkDecoder:
         pos = n_prompt                                # position of `tok`
         while tok != self.eos_id and count < max_tokens:
             remaining = max_tokens - count
-            draft = DraftOut([]) if remaining <= 1 else self.drafter.draft(tok, hidden, pos - 1)
+            # no draft for the last token of the budget, nor from a one-token context (the stack needs start_pos > 0;
+            # position 0 then never reaches the drafter, a hole in its window that cannot change the output)
+            draft = DraftOut([]) if remaining <= 1 or pos < 2 else self.drafter.draft(tok, hidden, pos - 1)
             k = min(len(draft.tokens), self.num_draft, remaining - 1)
             out = self.target.verify([tok, *draft.tokens[:k]], pos)
             tokens, matches = self._walk(out, draft, k, remaining)
