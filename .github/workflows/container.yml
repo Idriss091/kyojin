@@ -14,7 +14,8 @@ run-name: Build & Publish Container Images (${{ inputs.ref || github.ref_name }}
 #
 # amd64 only: the image targets Strix Halo (gfx1151), so there is no multi-arch manifest to join.
 # All models build in ONE job on purpose. Only the last layer (ARG MODEL) differs between them, so
-# the first build pays for the hours-long torch/SDK/extension layer and the others are seconds.
+# the first build pays for the torch/SDK/extension layers (about 17 minutes on a cold cache) and the
+# others are seconds.
 # A matrix would put each model on its own runner and compile everything again.
 
 on:
