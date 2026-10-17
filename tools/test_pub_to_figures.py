@@ -102,14 +102,59 @@ def test_500k_point_not_published_without_flag(tmp_path, capsys):
     assert "499712 key" in capsys.readouterr().err
 
 
-def test_500k_point_with_flag_writes_key(tmp_path):
-    # make_charts.py has no 499712 tick yet: rendering a published 500K point fails (see NOTEBOOK.md)
+def test_500k_point_with_flag_writes_key_and_renders(tmp_path):
     root, scratch = make_root(tmp_path), make_scratch(tmp_path)
-    assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234",
-                     "--add-500k", "--no-render"]) == 0
+    assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234", "--add-500k"]) == 0
     q = model(load(root), "qwen")
     assert q["prefill"]["499712"] == 1291 and q["decode"]["499712"] == 36.2
     assert list(q["prefill"])[-1] == "499712"
+    # the charts reach the 500K tick, labelled "500K" (499712 // 1024 would print 488K)
+    svg = (root / "doc" / "img" / "decode_models.svg").read_text(encoding="utf-8")
+    assert ">500K</text>" in svg and "488K" not in svg
+    for name in ("prefill", "prefill_context", "decode_context"):
+        assert ">500K</text>" in (root / "doc" / "img" / f"{name}.svg").read_text(encoding="utf-8")
+    md = (root / "doc" / "benchmarks.md").read_text(encoding="utf-8")
+    assert "Prefill 500K" in md and "488K" not in md
+
+
+def test_charts_without_500k_keep_the_256k_axis(tmp_path):
+    root, scratch = make_root(tmp_path), make_scratch(tmp_path)
+    assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234"]) == 0
+    assert "500K" not in (root / "doc" / "img" / "decode_models.svg").read_text(encoding="utf-8")
+
+
+def test_keep_card_leaves_spec_and_needs_no_bench(tmp_path):
+    root, scratch = make_root(tmp_path), make_scratch(tmp_path)
+    old = load(root)
+    for f in scratch.glob("bench_*.md"):
+        f.unlink()
+    assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234", "--keep-card",
+                     "--add-500k"]) == 0
+    F = load(root)
+    for mid in ("qwen", "glm"):
+        m = model(F, mid)
+        assert m["spec"] == model(old, mid)["spec"] and m["table"]["decode"] == model(old, mid)["table"]["decode"]
+        assert m["before"]["spec"] == model(old, mid)["spec"]
+        assert m["prefill"]["499712"] > 0
+    assert model(F, "qwen")["prefill"]["8192"] == 1502 and F["date"] == "2026-10-17"
+
+
+def test_partial_dry_run_one_model_without_500k(tmp_path, capsys):
+    """What can be run while the other curves are still being measured."""
+    root, scratch = make_root(tmp_path), make_scratch(tmp_path)
+    for f in scratch.glob("*qwen*"):
+        f.unlink()
+    (scratch / "curve_glm_c524288.json").unlink()
+    rc = p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234", "--keep-card",
+                   "--models", "glm", "--skip-500k", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "+    \"8192\": 656," in out and "1502" not in out
+
+
+def test_scratch_is_required():
+    with pytest.raises(SystemExit):
+        p2f.main(["--dry-run"])
 
 
 def test_missing_point_refuses_and_writes_nothing(tmp_path, capsys):
@@ -140,3 +185,16 @@ def test_bad_prompt_token_count_refuses(tmp_path, capsys):
     path.write_text(json.dumps(d), encoding="utf-8")
     assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234"]) == 1
     assert "prompt_tokens=40000" in capsys.readouterr().err
+
+
+def test_qwen_decode_is_client_timed_glm_is_server_counter(tmp_path):
+    root, scratch = make_root(tmp_path), make_scratch(tmp_path)
+    for mid in ("qwen", "glm"):
+        path = scratch / f"curve_{mid}_c272384.json"
+        d = json.loads(path.read_text(encoding="utf-8"))
+        d["points"]["8192"]["client_decode_tok_s"] = 20.0
+        path.write_text(json.dumps(d), encoding="utf-8")
+    assert p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234", "--no-render"]) == 0
+    F = load(root)
+    assert model(F, "qwen")["decode"]["8192"] == 20.0
+    assert model(F, "glm")["decode"]["8192"] == 30.1
