@@ -33,6 +33,13 @@ class FakeEngine:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
+    def prompt_ids(self, prompt: str):
+        """The ids the routes count prompt tokens with (the real engines read them from an encode cache).
+
+        Placeholders of count_tokens() length: the routes only ask for numel()."""
+        import torch
+        return torch.zeros(self.count_tokens(prompt), dtype=torch.long)
+
     async def generate(self, prompt: str, **kwargs):
         self.prompts.append(prompt)
         self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,
