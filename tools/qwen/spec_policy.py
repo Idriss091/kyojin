@@ -77,6 +77,15 @@ class NgramIndex:
     def truncate(self, p):
         n = len(self.toks)
         assert 0 <= p <= n
+        if p == 0 and n:
+            # a whole new context (a new conversation): the walk below undoes every push one by one (11-23 ms at 8K tokens, inside the
+            # time to first token) and ends in the freshly built state, so build that state directly (checked by test_ngram_index)
+            lmax, nmin = self.lmax, self.nmin
+            self.toks = array("i")
+            self.key = [None] + [array("q", [-1]) for _ in range(lmax)]
+            self.prev = [None] + [array("i", [-1]) if m >= nmin else None for m in range(1, lmax + 1)]
+            self.latest = [None] + [{} if m >= nmin else None for m in range(1, lmax + 1)]
+            return
         key, prev, latest = self.key, self.prev, self.latest
         for e in range(n, p, -1):
             for m in range(self.nmin, self.lmax + 1):
@@ -411,6 +420,79 @@ def install_lookup(g, ngram, stats=None):
     g.iterate_draftmodel_mtp_gen = wrapped
     def uninstall():
         g.__dict__.pop("iterate_draftmodel_mtp_gen", None)
+        if g.__dict__.get("enqueue") is enq: g.__dict__.pop("enqueue")
+    return uninstall
+
+def plain_lookup_from_env(rows_default=0):
+    """Drafter-free n-gram lookup for a Generator WITHOUT a drafter (rtx1 14/10, rule "S2"): QWSPEC_PLAIN_LOOKUP = "lmin,K[,cmin[,rows]]"
+    (unset / off = none). Returns (lmin, K, cmin, rows) or None. Measured on the 3090 (EXL3, greedy, 18 prompts x 2, text = plain up
+    to near-ties): lmin 2, cmin 1, K = rows the backend verifies for ~free - 1 (15 for EXL3 dense on Ampere, 7 for a MoE pack
+    whose MoE kernels change cost above 8 rows): dense x1.46 overall / x2.9 on edits, MoE x1.26 / x2.0, ahead of the upstream
+    SAM defaults (x1.30 / x1.21). lmin 16 (ngram_from_env) is the right cut only when a drafter competes for the round.
+    Optional 4th field rows (default rows_default = 0 = one active request only): with B >= 2 requests decoding together each one
+    drafts, capped at rows // B - 1 tokens, and short drafts are padded to the longest (rtx1 sim19 / prof19: the batch keeps the
+    longest copy instead of the shortest). rows = the backend's ~free verify rows (16 for EXL3 dense on Ampere). serve.py passes
+    the served row_budget as rows_default so the plain-lookup cap matches the drafter-path row budget; an explicit 4th field wins.
+    """
+    v = (os.environ.get("QWSPEC_PLAIN_LOOKUP") or "").strip().lower()
+    if v in ("", "off", "0", "none"): return None
+    f = [int(x) for x in v.split(",")]
+    if not (2 <= len(f) <= 4 and f[0] >= 1 and f[1] >= 1 and min(f) >= 0): raise ValueError(f"QWSPEC_PLAIN_LOOKUP={v}")
+    return (f[0], f[1], f[2] if len(f) > 2 else 1, f[3] if len(f) > 3 else rows_default)
+
+def install_plain_lookup(g, pl, stats=None):
+    """Answers the Generator's n-gram slot (Generator(ngram_match_min > 0) -> iterate_ngram_gen) with the NgramIndex: the
+    longest earlier suffix match (>= lmin tokens) proposes its continuation, capped at K and cut to the prefix that the
+    previous occurrence of the same gram also continues with (>= cmin tokens, 0 = no cut); no match = a plain round.
+    rows = 0: one active request only (batched rounds decode plain). rows > 0: every prefill-done request drafts, capped at
+    rows // B - 1 for B requests, and short drafts are padded to the longest with the request's last token (filler the
+    verification rejects, or accepts only where it IS the target's choice), so one request without a match no longer turns
+    the lookup off for the batch (the generator's own slot trims to the shortest draft). Greedy verification: changes speed,
+    not the accepted text. The cache needs max_history >= K. Returns an uninstall function."""
+    lmin, K, cmin = pl[:3]; rows = pl[3] if len(pl) > 3 else 0
+    fol = SeqFollower(2); fols = {}
+    orig_enqueue = g.enqueue
+    def enq(job):
+        r = orig_enqueue(job)
+        for j in (job if isinstance(job, list) else [job]):
+            if len(getattr(j, "sequences", ())) == 1: (fols.setdefault(id(j), SeqFollower(2)) if rows else fol).sync(j.sequences[0].sequence_ids)
+        return r
+    def draft(f, sid, k):
+        idx = f.sync(sid)
+        L, c = idx.match(k)
+        if L < lmin or not c: return []
+        if cmin:
+            w = idx.witness_len(c)
+            if w < len(c):
+                if w < cmin: return []
+                c = c[:w]
+        return c
+    def rnd(results):
+        job = g.active_jobs[0] if len(g.active_jobs) == 1 else None
+        if job is None or not job.is_prefill_done() or len(job.sequences) != 1: return None
+        c = draft(fol, job.sequences[0].sequence_ids, K)
+        if not c: return None
+        if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + len(c)
+        return torch.tensor([c], dtype=torch.long)
+    def rnd_rows(results):
+        jobs = [j for j in g.active_jobs if j.is_prefill_done()]   # the generator's verify order (iterate_ngram_gen)
+        if not jobs or any(len(j.sequences) != 1 for j in jobs): return None
+        k = min(K, rows // len(jobs) - 1)
+        if k < 1: return None
+        live = {id(j) for j in g.active_jobs}
+        for d in [d for d in fols if d not in live]: del fols[d]
+        fs = [fols.setdefault(id(j), SeqFollower(2)) for j in jobs]
+        cs = [draft(f, j.sequences[0].sequence_ids, k) for f, j in zip(fs, jobs)]
+        w = max(len(c) for c in cs)
+        if not w: return None
+        if stats is not None:
+            stats["ng"] = stats.get("ng", 0) + 1; stats["ng_tokens"] = stats.get("ng_tokens", 0) + sum(len(c) for c in cs)
+            stats["ng_pad"] = stats.get("ng_pad", 0) + sum(w - len(c) for c in cs)
+        return torch.tensor([c + [f.idx.toks[-1]] * (w - len(c)) for c, f in zip(cs, fs)], dtype=torch.long)
+    g.enqueue = enq
+    g.iterate_ngram_gen = rnd_rows if rows else rnd
+    def uninstall():
+        g.__dict__.pop("iterate_ngram_gen", None)
         if g.__dict__.get("enqueue") is enq: g.__dict__.pop("enqueue")
     return uninstall
 

@@ -595,6 +595,13 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # checkpoint the decode state at the end of every answer, so the next chat turn only prefills
              # the new message (without it an answer shorter than the 2048-token grid is prefilled again). 0 = off.
              ("EXL3_ROLL_CKPT", "1"),
+             # recurrent-state stashes (mid-prompt checkpoint, prompt-end tail) copy device -> pinned host without a host sync (a worker
+             # thread settles them before any reader): the 72 per-layer .cpu() syncs of an 8K prompt drained the queue twice (idle 55-64 ms
+             # of a 5.2 s prefill); bitwise (first-token + tail-resume logits equal, base vs on). 0 = the synchronous stash.
+             ("EXL3_NC2_ASYNC_STASH", "1"),
+             # a speculative rewind records the accepted recurrent-state history index in a per-slot base instead of copying
+             # it back to index 0: bit-exact (ids equal off vs on, Qwen GDN ndt 7). 0 = copy.
+             ("EXL3_STATE_REBASE", "1"),
              # a turn that resumes mid-page (tail checkpoint) and adds 1024..4095 tokens in one chunk no longer pays a separate
              # last-page forward: follow-up after a 12K conversation 1.47 -> 1.26 s (+1536 tokens), 2.37 -> 2.11 s (+3072), first-token
              # KLD vs a cold prefill 2.1e-3 / 1.9e-3 (shipped 4.8e-3 / 3.8e-3), top-1 equal; 768 and 6144 appends unchanged (bitwise).
@@ -747,9 +754,12 @@ class QwenEngine:
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
-        ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0))  # buffers fit the deepest draft
-        self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
         self.sessions = sessions
+        self.row_budget = 0   # drafter-free lookup row cap: this tree has no --row-budget plumbing (rows = 0 = one active request only)
+        import spec_policy  # tools/qwen/spec_policy.py
+        pl = spec_policy.plain_lookup_from_env(self.row_budget)   # drafter-free lookup (plain rounds): its K needs the same history depth
+        ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0), pl[1] if pl else 0)  # buffers fit the deepest draft
+        self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
         self.config = Config.from_directory(model_path)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
@@ -834,11 +844,26 @@ class QwenEngine:
         self.torch.cuda.empty_cache()
         spec = spec and self.draft_model is not None
         kw = dict(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
+        import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
+        pl = None if spec else spec_policy.plain_lookup_from_env(self.row_budget)
         if spec:
             kw.update(draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.ndt)
-        self.generator = self.Generator(**kw)
+        elif pl:
+            kw.update(ngram_match_min=pl[0], num_draft_tokens=pl[1])
+        # night1 1.6 hand-off port fix: the drafter-free plain lookup answers the Generator's n-gram slot itself
+        # (install_plain_lookup replaces iterate_ngram_gen), so the built-in n-gram path and its BC_SAM binding are never
+        # used. On a build without BC_SAM (this ROCm ext returns None for ext.BC_SAM(); the built-in path raises at
+        # construction) that check must not block the plain lookup. Restore the exact descriptor afterwards.
+        _val = self.Generator.__dict__["_validate_ngram_drafting_support"]
+        if pl:
+            self.Generator._validate_ngram_drafting_support = staticmethod(lambda: None)
+        try:
+            self.generator = self.Generator(**kw)
+        finally:
+            self.Generator._validate_ngram_drafting_support = _val
+        if pl:
+            self.uninstall = spec_policy.install_plain_lookup(self.generator, pl)
         if spec and self.draft_policy == "mix":
-            import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
             thf, thv, maxd = spec_policy.env_defaults(self.ndt)   # 0.6 / 0.3 / ndt unless QWSPEC_THF / THV / MAXD are set
             fx = os.environ.get("QWSPEC_FIXD")
             self.uninstall = spec_policy.install(self.generator, self.draft_model, self.model,

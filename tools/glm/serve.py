@@ -94,6 +94,10 @@ SPEED_ENV = {
     # 27/09: DSA indexer glue fused (n=27/arm paired): decode 29.53 -> 30.04 t/s,
     # +1.74 +- 0.43 %; greedy ids 3x64 and MTP accept identical. (round2's stack saw -0.08 % at n=12.)
     "EXL3_DSA_GLUE_FUSE": "1",
+    # sparse (> index_topk 2048) DSA decode fast path: bsz >= 3 takes one batched call, bsz 1/2 stay
+    # byte-identical; long-context decode +4.34 % (3/3 paired reps, N=8 homogeneous ~3.6K-token batch).
+    # Staged default: inert until the DSA rowloop knob reads it (mu1/dsa port). 0 = per-job calls.
+    "EXL3_MU_DSA_ATTN_ROWLOOP_OFF_BSZ": "3",
     # 27/09: prefill mHC apply + next mix_norm fused; 16K 574.3 -> 579.8
     # (+0.95 +- 0.07 %), 4K +1.46 +- 0.48 % (n=10). Decode neutral. Needs the rebuilt ext.
     "EXL3_PF_HC_FUSE": "1",
@@ -127,6 +131,12 @@ SPEED_ENV = {
     "EXL3_PF_GLUE": "1",
     "EXL3_PF_MSPLIT": "2048",
     "EXL3_PF_SKIP": "1",
+    # recurrent-state stashes (mid-prompt checkpoints, prompt-end tail) copy to pinned host memory without a host sync: bitwise
+    # (first-token + tail-resume logits equal, 5 reps x 8K/32K, base vs on); removes ~33 x 0.6 ms of idle at the end of a prefill. 0 = off.
+    "EXL3_NC2_ASYNC_STASH": "1",
+    # a speculative rewind records the accepted recurrent-state history index in a per-slot base instead of copying
+    # it back to index 0 (272 MiB, ~1.3 ms per launch): bit-exact (ids equal off vs on, GLM KDA depth 2). 0 = copy.
+    "EXL3_STATE_REBASE": "1",
     # 14/10: verify of 5..8 rows (GLM_NGRAM lookup rounds of 4..7 copied tokens), the Qwen server's switches: MoE row split,
     # one-launch 8-row fused MoE, one-launch 6-row dense GEMV. Bit-identical per row, rows <= 4 untouched (--num-draft 2 rounds).
     # Harness, one load each: 6-row round +6.9 % (RM6), 8-row round +2.6 %, ids equal. 0 = off.
@@ -371,16 +381,33 @@ def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
     return kw
 
 
-def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                  **kwargs: Any) -> str:
-    """Render the model's own Jinja chat template."""
-    # Same environment as transformers' apply_chat_template.
+def _template_env() -> Any:
+    """One Jinja environment per process (same settings as transformers' apply_chat_template)."""
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                         extensions=["jinja2.ext.loopcontrols"])
     env.filters["tojson"] = lambda value, ensure_ascii=False, indent=None, separators=None, sort_keys=False: \
         json.dumps(value, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
     def raise_exception(msg): raise ValueError(msg)
     env.globals["raise_exception"] = raise_exception
+    return env
+
+
+_COMPILED_TEMPLATES: dict[str, Any] = {}   # template source -> compiled Template (render is thread-safe)
+
+
+def _compiled_template(template: str) -> Any:
+    """The compiled chat template, cached: compiling it per request costs ~24 ms (8.6 KB GLM template)."""
+    hit = _COMPILED_TEMPLATES.get(template)
+    if hit is None:
+        hit = _template_env().from_string(template)
+        _COMPILED_TEMPLATES[template] = hit
+    return hit
+
+
+def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                  **kwargs: Any) -> str:
+    """Render the model's own Jinja chat template."""
+    # Same environment as transformers' apply_chat_template.
     # OpenAI sends tool-call arguments as a JSON string; the GLM template iterates them as a dict.
     fixed = []
     for m in messages:
@@ -392,7 +419,7 @@ def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dic
                 if isinstance(c.get("function", {}).get("arguments"), str) else c
                 for c in m["tool_calls"]])
         fixed.append(m)
-    return env.from_string(template).render(
+    return _compiled_template(template).render(
         messages=fixed, tools=tools or [], add_generation_prompt=True, **kwargs)
 
 
