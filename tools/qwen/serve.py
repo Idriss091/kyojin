@@ -890,6 +890,20 @@ class QwenEngine:
         while self.generator.num_remaining_jobs():
             list(self.generator.iterate())
         self.torch.cuda.synchronize()
+        # The first full-size prefill chunk costs ~1.2 s more than every later one (one-time lazy init inside the
+        # forward at chunk size). Pay it at load, not on the first request: one chunk plus a short tail of ordinary text
+        # (EXL3_WARM_PREFILL=0 = off).
+        if os.environ.get("EXL3_WARM_PREFILL", "1") != "0":
+            chunk = int(self.generator.max_chunk_size)
+            text = "<|im_start|>user\n" + "The quick brown fox jumps over the lazy dog near the river bank. " * (chunk // 6 + 64)
+            ids = self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True)
+            ids = ids[:, :chunk + 64].contiguous()
+            job = self.Job(input_ids=ids, max_new_tokens=2, sampler=self._sampler({"temperature": 0.0}),
+                           stop_conditions=self.eos)
+            self.generator.enqueue(job)
+            while self.generator.num_remaining_jobs():
+                list(self.generator.iterate())
+            self.torch.cuda.synchronize()
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
