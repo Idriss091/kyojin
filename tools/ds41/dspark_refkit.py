@@ -303,33 +303,38 @@ class OfficialDrafter:
             first, hidden, n = n - 1, hidden[n - 1:], 1
         for j in range(n - 1):                # accepted positions: one window slot per call, outputs unused
             self.model.forward_spec(torch.tensor([self.noise]), hidden[j][None, None], first + j)
-        ids, logits, _conf = self.model.forward_spec(torch.tensor([token]), hidden[n - 1][None, None], start_pos)
+        ids, logits, conf = self.model.forward_spec(torch.tensor([token]), hidden[n - 1][None, None], start_pos)
         self.fed = start_pos + 1
         toks = [int(t) for t in ids[0, 1:]]
+        scores = [float(c) for c in conf[0]]        # confidence head: one raw score per slot, known before the slot's token
         if self.temperature > 0:
             q = [torch.softmax(logits[0, i] / max(self.temperature, 1e-5), dim=-1) for i in range(self.block_size)]
-            return dspark.DraftOut(toks, q)
-        return dspark.DraftOut(toks)
+            return dspark.DraftOut(toks, q, scores)
+        return dspark.DraftOut(toks, conf=scores)
 
 
 class OracleDrafter:
     """Proposes the true continuation `truth` (the plain loop's tokens, EOS included when it ended there) and replaces
     each token with a random one with probability `p_err`, so every acceptance length shows up. Not a model."""
 
-    def __init__(self, truth, n_prompt, vocab, rng, p_err=0.2, block_size=5):
+    def __init__(self, truth, n_prompt, vocab, rng, p_err=0.2, block_size=5, conf_sigma=None):
         self.truth, self.n_prompt, self.vocab, self.rng = list(truth), n_prompt, vocab, rng
         self.p_err, self.block_size = p_err, block_size
+        self.conf_sigma = conf_sigma          # not None: also return a synthetic confidence, +-2 plus N(0, sigma) noise
 
     def draft(self, token, hidden, start_pos):
         c = start_pos + 1 - self.n_prompt                  # index of the anchor in the completion
         assert self.truth[c] == token, (c, self.truth[c], token)
-        toks = []
+        toks, conf = [], []
         for i in range(self.block_size):
             t = self.truth[c + 1 + i] if c + 1 + i < len(self.truth) else int(self.rng.integers(self.vocab))
             if self.rng.random() < self.p_err:
                 t = int(self.rng.integers(self.vocab))
             toks.append(t)
-        return dspark.DraftOut(toks)
+            if self.conf_sigma is not None:
+                right = c + 1 + i < len(self.truth) and t == self.truth[c + 1 + i]
+                conf.append((2.0 if right else -2.0) + float(self.rng.normal()) * self.conf_sigma)
+        return dspark.DraftOut(toks, conf=conf or None)
 
 
 def reference_generate(model, prompt, max_new, eos_id, temperature=0.0, seed=None):

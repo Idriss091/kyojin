@@ -106,14 +106,26 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
 
 def draft_timings(st: dict[str, Any]) -> dict[str, Any]:
     """Speculative-decoding fields for `timings`, only when drafting ran. Names are the engine stats keys of
-    tools/glm/serve.py (`accepted_draft_tokens`, `rejected_draft_tokens`) plus the rounds and the per-round mean."""
+    tools/glm/serve.py (`accepted_draft_tokens`, `rejected_draft_tokens`) plus the rounds and the per-round mean.
+    Cost fields, when the engine reports them: `draft_len_mean` (drafts sent to verify per round), `verify_positions`
+    (positions the target ran to verify), `conf_dropped_tokens` (drafts the confidence stop kept out of verify, each one
+    a verify position saved), `conf_cut_rounds`, `tuner_k` (last length the auto tuner chose; 0 when not tuning)."""
     accepted, rejected = int(st.get("accepted_draft_tokens", 0)), int(st.get("rejected_draft_tokens", 0))
-    if accepted + rejected <= 0:
+    dropped = int(st.get("conf_dropped_tokens") or 0)
+    if accepted + rejected + dropped <= 0:
         return {}
     steps = int(st.get("draft_steps") or 0)
     per_step = float(st["accepted_per_step"]) if st.get("accepted_per_step") is not None else (accepted / steps if steps else 0.0)
-    return {"accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected, "draft_steps": steps,
-            "accepted_per_step": round(per_step, 4)}
+    out = {"accepted_draft_tokens": accepted, "rejected_draft_tokens": rejected, "draft_steps": steps,
+           "accepted_per_step": round(per_step, 4)}
+    if st.get("draft_len_mean") is not None:
+        out["draft_len_mean"] = round(float(st["draft_len_mean"]), 4)
+    for key in ("verify_positions", "conf_dropped_tokens", "conf_cut_rounds"):
+        if st.get(key) is not None:
+            out[key] = int(st[key])
+    if st.get("tuner_k"):
+        out["draft_tuner_k"] = int(st["tuner_k"])
+    return out
 
 
 def sse(data: dict[str, Any], event: str | None = None) -> bytes:
@@ -822,6 +834,12 @@ def main() -> None:
     parser.add_argument("--num-draft", type=int, default=0, metavar="N",
                         help="DSpark speculative decoding: up to N draft tokens per round (1..block size, 5 for this model), "
                              "passed to the loader as num_draft; 0 = off (default)")
+    parser.add_argument("--draft-auto", action="store_true",
+                        help="choose the draft length of each request round from the running acceptance (1..4, at most "
+                             "--num-draft; --num-draft defaults to 4 with this flag). Passed as draft_auto=true. Exact outputs")
+    parser.add_argument("--draft-conf", type=float, default=None, metavar="P",
+                        help="stop drafting at the first slot whose DSpark confidence is below P (0 < P < 1). Passed as "
+                             "draft_conf_threshold. Exact outputs; needs --num-draft or --draft-auto")
     parser.add_argument("--default-temperature", type=float, default=None,
                         help="used when a request omits temperature (default: generation_config.json of the pack, else 1.0)")
     parser.add_argument("--default-top-p", type=float, default=None,
@@ -838,6 +856,16 @@ def main() -> None:
     engine_opts = parse_engine_opts(args.engine_opt)
     if args.num_draft < 0:
         raise SystemExit("serve: --num-draft must be >= 0")
+    if args.draft_conf is not None and not 0 < args.draft_conf < 1:
+        raise SystemExit("serve: --draft-conf must be between 0 and 1 (exclusive)")
+    if args.draft_auto and not args.num_draft:
+        args.num_draft = 4
+    if args.draft_conf is not None and not args.num_draft:
+        raise SystemExit("serve: --draft-conf needs --num-draft or --draft-auto")
+    if args.draft_auto:
+        engine_opts["draft_auto"] = True
+    if args.draft_conf is not None:
+        engine_opts["draft_conf_threshold"] = args.draft_conf
     if args.num_draft:
         engine_opts["num_draft"] = args.num_draft              # only when on: a loader without drafting never sees it
         print(f"serve: DSpark speculative decoding on, up to {args.num_draft} draft tokens per round", flush=True)

@@ -14,8 +14,9 @@ built on the contract `forward_spec` defines:
   layers `dspark_target_layer_ids`, concatenated, at position L-1.
 * The output is `block_size` draft tokens for positions L+1 .. L+block_size. Each one is chosen from the stage logits
   plus a rank-`dspark_markov_rank` bigram bias that depends on the previous drafted token (the Markov head), so the
-  block is chained. A confidence head also scores each position; the official code does not say how to use it, and
-  this module does not.
+  block is chained. A confidence head (`DSparkConfidenceHead`, one linear layer on [hidden, markov_embed], fp32) also
+  returns one raw score per slot. The official code does not say what it means or how to use it. We read it as a
+  logit of "this slot's draft will be accepted" and use it only as a stopping rule (see "Early stop" below).
 * The stack keeps one window-KV slot per context position, written from `main_hidden` of that position. Each call
   writes exactly one slot, so the drafter must see the hidden state of EVERY accepted position, in order. A skipped
   position leaves a hole in its window and lowers acceptance (it never makes the output wrong).
@@ -39,18 +40,35 @@ same seed the output matches the plain `generate()` loop token for token. When t
 from (`DraftOut.q`), the standard rule is used instead: accept with probability min(1, p/q), resample from the
 normalised max(0, p - q) on rejection; same output distribution, no seed parity with the plain loop.
 
+Truncated sampling. `GumbelSampler(top_k, top_p, min_p)` filters the softmax law (top_k, then top_p, then min_p, then
+renormalise) and runs Gumbel-max on it. The filter is a pure function of the logits row, and the noise draw count is
+still one per emitted token, so the exactness argument above holds unchanged: same seed, same tokens as the plain loop
+(the plain loop uses the same sampler). With draft laws `q`, `p` is the filtered law, so the output law is the filtered one.
+
+Early stop and draft length. How many drafted tokens go to verify (`k`) is a free choice of the controller, as long as
+it is made before the target rows of the round are seen. It then only changes cost, never the output: the walk
+draws one noise value per emitted token whatever `k` is. Two rules choose `k`:
+
+* Early stop: drafted slot i (0-based) is verified only if the confidence scores of slots 0..i are all at least
+  logit(`conf_threshold`). The score of slot i is computed before token i is drawn (the Markov embedding of slot i
+  is that of the previous token), so the stop depends on the tokens before i only; with drafts that carry laws `q`
+  this keeps the p/q rule exact.
+* `DraftTuner` (auto draft length): picks k in 1..4 from the running per-position acceptance, maximising expected
+  tokens per round over a cost of 1 + cost_per_position * k.
+
 Plain EOS handling follows `generate.py`: a token counts against `max_tokens` when it is sampled; the EOS token is
 not part of the returned completion; the last emitted token is never in the target cache.
 """
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["TargetOut", "DraftOut", "Target", "Drafter", "Sampler", "GreedySampler", "GumbelSampler",
-           "DSparkStats", "DSparkDecoder", "decode"]
+__all__ = ["TargetOut", "DraftOut", "Target", "Drafter", "Sampler", "GreedySampler", "GumbelSampler", "truncated_probs",
+           "DraftTuner", "DSparkStats", "DSparkDecoder", "decode"]
 
 
 # ---- interfaces ---------------------------------------------------------------------------------------------------
@@ -67,9 +85,11 @@ class TargetOut:
 
 @dataclass
 class DraftOut:
-    """Draft tokens for positions L+1.. . `q[i]`, when given, is the probability vector `tokens[i]` was drawn from."""
+    """Draft tokens for positions L+1.. . `q[i]`, when given, is the probability vector `tokens[i]` was drawn from.
+    `conf[i]`, when given, is the raw confidence-head score of slot i (a logit of acceptance), known before token i."""
     tokens: list[int]
     q: Sequence[Any] | None = None
+    conf: Sequence[float] | None = None
 
 
 @runtime_checkable
@@ -132,27 +152,55 @@ class GreedySampler:
     uniform = draw = probs
 
 
+def truncated_probs(logits_row: Any, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 0, min_p: float = 0.0) -> Any:
+    """softmax(logits / temperature) restricted to the top_k most likely tokens, then to the smallest set whose mass
+    reaches top_p (the most likely token always stays), then to tokens with p >= min_p * p_max; renormalised. Ties are
+    broken by token id (stable sort), so the result is a deterministic function of the row. float32, shape (V,)."""
+    import torch
+    probs = torch.softmax(logits_row.reshape(-1) / max(temperature, 1e-5), dim=-1, dtype=torch.float32)
+    n = probs.numel()
+    if not (0 < top_k < n or top_p < 1.0 or min_p > 0.0):
+        return probs
+    order = torch.sort(probs, descending=True, stable=True).indices
+    sp = probs[order]
+    keep = torch.ones(n, dtype=torch.bool)
+    if 0 < top_k < n:
+        keep[top_k:] = False
+    if top_p < 1.0:
+        before = torch.cumsum(sp, 0) - sp                         # mass of the tokens ranked above
+        keep &= before < top_p
+    if min_p > 0.0:
+        keep &= sp >= min_p * sp[0]
+    keep[0] = True
+    out = torch.zeros_like(probs)
+    out[order[keep]] = sp[keep]
+    return out / out.sum()
+
+
 class GumbelSampler:
     """The official `model.sample` rule: Gumbel-max over softmax(logits / temperature), one exponential draw per call.
+    `top_k` (0 = off), `top_p` (1 = off) and `min_p` (0 = off) truncate the law first (see `truncated_probs`).
     Uses torch's global RNG unless a `torch.Generator` is given. temperature 0 is argmax."""
     stochastic = True
 
-    def __init__(self, temperature: float = 1.0, generator: Any = None):
+    def __init__(self, temperature: float = 1.0, generator: Any = None, *, top_p: float = 1.0, top_k: int = 0,
+                 min_p: float = 0.0):
+        if not 0 <= top_p <= 1 or top_k < 0 or not 0 <= min_p <= 1:
+            raise ValueError("need 0 <= top_p <= 1, top_k >= 0, 0 <= min_p <= 1")
         self.temperature = temperature
         self.generator = generator
+        self.top_p, self.top_k, self.min_p = top_p, top_k, min_p
 
     def sample(self, logits_row: Any) -> int:
         import torch
         if self.temperature == 0:
             return int(logits_row.argmax())
-        logits = logits_row.reshape(1, -1) / max(self.temperature, 1e-5)
-        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        probs = self.probs(logits_row).reshape(1, -1)
         noise = torch.empty_like(probs).exponential_(1, generator=self.generator)
         return int(probs.div_(noise).argmax(dim=-1))
 
     def probs(self, logits_row: Any) -> Any:
-        import torch
-        return torch.softmax(logits_row.reshape(-1) / max(self.temperature, 1e-5), dim=-1, dtype=torch.float32)
+        return truncated_probs(logits_row, self.temperature, self.top_p, self.top_k, self.min_p)
 
     def uniform(self) -> float:
         import torch
@@ -161,6 +209,44 @@ class GumbelSampler:
     def draw(self, probs: Any) -> int:
         import torch
         return int(torch.multinomial(probs, 1, generator=self.generator))
+
+
+class DraftTuner:
+    """Picks the draft length of each round from the running acceptance. The per-position acceptance `a` is a decayed
+    count (success / trials, with a prior); a round that drafts k tokens is expected to emit 1 + a + ... + a^k tokens
+    and to cost 1 + cost_per_position * k (one verify of k+1 positions, relative to a plain step). The best k in
+    [k_min, k_max] wins, ties go to the smaller k. It only ever sees past rounds, so the output stays exact."""
+
+    def __init__(self, k_min: int = 1, k_max: int = 4, *, cost_per_position: float = 0.1, decay: float = 0.9,
+                 prior_rate: float = 0.7, prior_weight: float = 2.0):
+        if not 1 <= k_min <= k_max:
+            raise ValueError("need 1 <= k_min <= k_max")
+        self.k_min, self.k_max, self.cost, self.decay = k_min, k_max, cost_per_position, decay
+        self.succ, self.trials = prior_rate * prior_weight, prior_weight
+        self.last = k_max
+
+    @property
+    def rate(self) -> float:
+        return self.succ / self.trials
+
+    def choose(self, cap: int | None = None) -> int:
+        a = self.rate
+        hi = self.k_max if cap is None else max(self.k_min, min(self.k_max, cap))
+        best_k, best = self.k_min, -1.0
+        for k in range(self.k_min, hi + 1):
+            tokens = (k + 1) if a >= 1 else (1 - a ** (k + 1)) / (1 - a)
+            score = tokens / (1 + self.cost * k)
+            if score > best + 1e-12:
+                best_k, best = k, score
+        self.last = best_k
+        return best_k
+
+    def observe(self, proposed: int, compared: int, accepted: int) -> None:
+        """A round sent `proposed` drafts; `compared` of them were checked (up to the first miss); `accepted` matched."""
+        if proposed <= 0:
+            return
+        self.succ = self.succ * self.decay + accepted
+        self.trials = self.trials * self.decay + compared
 
 
 # ---- statistics ---------------------------------------------------------------------------------------------------
@@ -175,6 +261,11 @@ class DSparkStats:
     emitted: int = 0                # tokens returned, EOS included
     draft_len_hist: Counter = field(default_factory=Counter)      # draft length -> rounds
     accepted_hist: Counter = field(default_factory=Counter)       # accepted drafts -> rounds
+    verify_calls: int = 0           # target.verify calls
+    verify_positions: int = 0       # positions run by those calls (the cost of verifying)
+    conf_cut_rounds: int = 0        # rounds where the confidence rule sent fewer drafts than the length cap allowed
+    conf_dropped: int = 0           # drafted tokens the confidence rule kept out of verify
+    tuner_k: int = 0                # last draft length the tuner chose (0 = no tuner)
 
     @property
     def rejected(self) -> int:
@@ -190,29 +281,52 @@ class DSparkStats:
         """Mean tokens emitted per drafting round (accepted + the correction or bonus token)."""
         return (self.accepted + self.steps) / self.steps if self.steps else 0.0
 
+    @property
+    def draft_len_mean(self) -> float:
+        return self.proposed / self.steps if self.steps else 0.0
+
     def as_engine_stats(self) -> dict[str, Any]:
         """The keys tools/glm/serve.py reads from an engine job (`accepted_draft_tokens`, `rejected_draft_tokens`)
         plus the step count and the per-step mean."""
         return {"accepted_draft_tokens": self.accepted, "rejected_draft_tokens": self.rejected,
                 "draft_steps": self.steps, "accepted_per_step": round(self.accepted_per_step, 4),
-                "draft_len_hist": dict(sorted(self.draft_len_hist.items()))}
+                "draft_len_hist": dict(sorted(self.draft_len_hist.items())),
+                "draft_len_mean": round(self.draft_len_mean, 4), "verify_calls": self.verify_calls,
+                "verify_positions": self.verify_positions, "conf_cut_rounds": self.conf_cut_rounds,
+                "conf_dropped_tokens": self.conf_dropped, "tuner_k": self.tuner_k}
 
 
 # ---- the loop -----------------------------------------------------------------------------------------------------
 
 
 class DSparkDecoder:
-    """Runs one request. `num_draft` caps the draft length (default and maximum: `drafter.block_size`)."""
+    """Runs one request. `num_draft` caps the draft length (default and maximum: `drafter.block_size`).
+    `conf_threshold` (a probability in (0, 1); needs drafts that carry `conf`) stops sending drafts to verify at the
+    first slot whose confidence is below it. `tuner` chooses the draft length of each round (capped by `num_draft`).
+    Neither changes the output."""
 
     def __init__(self, target: Target, drafter: Drafter, *, eos_id: int, sampler: Sampler | None = None,
-                 num_draft: int | None = None):
+                 num_draft: int | None = None, conf_threshold: float | None = None, tuner: DraftTuner | None = None):
         block = int(drafter.block_size)
         if num_draft is not None and num_draft < 1:
             raise ValueError("num_draft must be >= 1 (use plain decoding for 0)")
+        if conf_threshold is not None and not 0 < conf_threshold < 1:
+            raise ValueError("conf_threshold must be a probability in (0, 1)")
+        self.conf_cut = None if conf_threshold is None else math.log(conf_threshold / (1 - conf_threshold))
+        self.tuner = tuner
         self.target, self.drafter, self.eos_id = target, drafter, eos_id
         self.sampler = sampler or GreedySampler()
         self.num_draft = min(num_draft or block, block)
         self.stats = DSparkStats()
+
+    def _conf_len(self, draft: DraftOut, k: int) -> int:
+        """Longest prefix of the first k drafts whose confidence scores all reach the threshold."""
+        if self.conf_cut is None or draft.conf is None:
+            return k
+        for i in range(k):
+            if float(draft.conf[i]) < self.conf_cut:
+                return i
+        return k
 
     # -- one verify round --------------------------------------------------------------------------------------------
 
@@ -263,9 +377,20 @@ class DSparkDecoder:
             # no draft for the last token of the budget, nor from a one-token context (the stack needs start_pos > 0;
             # position 0 then never reaches the drafter, a hole in its window that cannot change the output)
             draft = DraftOut([]) if remaining <= 1 or pos < 2 else self.drafter.draft(tok, hidden, pos - 1)
-            k = min(len(draft.tokens), self.num_draft, remaining - 1)
+            cap = self.num_draft if self.tuner is None else min(self.num_draft, self.tuner.choose())
+            k = min(len(draft.tokens), cap, remaining - 1)
+            k_conf = self._conf_len(draft, k)
+            if k_conf < k:
+                st.conf_cut_rounds += 1
+                st.conf_dropped += k - k_conf
+                k = k_conf
             out = self.target.verify([tok, *draft.tokens[:k]], pos)
+            st.verify_calls += 1
+            st.verify_positions += k + 1
             tokens, matches = self._walk(out, draft, k, remaining)
+            if self.tuner is not None:
+                self.tuner.observe(k, min(len(tokens), k), matches)
+                st.tuner_k = self.tuner.last
             kept = len(tokens)                        # positions pos .. pos + kept - 1 stay: tok + kept-1 drafts
             if kept < k + 1:
                 self.target.truncate(pos + kept)
@@ -286,9 +411,11 @@ class DSparkDecoder:
 
 
 def decode(target: Target, drafter: Drafter, prompt: Sequence[int], max_tokens: int, eos_id: int, *,
-           sampler: Sampler | None = None, num_draft: int | None = None) -> tuple[list[int], DSparkDecoder]:
+           sampler: Sampler | None = None, num_draft: int | None = None, conf_threshold: float | None = None,
+           tuner: DraftTuner | None = None) -> tuple[list[int], DSparkDecoder]:
     """Whole completion, EOS cut off like `generate.py`. Returns (tokens, decoder); `decoder.stats` has the numbers."""
-    dec = DSparkDecoder(target, drafter, eos_id=eos_id, sampler=sampler, num_draft=num_draft)
+    dec = DSparkDecoder(target, drafter, eos_id=eos_id, sampler=sampler, num_draft=num_draft,
+                        conf_threshold=conf_threshold, tuner=tuner)
     out: list[int] = []
     for chunk in dec.stream(prompt, max_tokens):
         out.extend(chunk)

@@ -34,6 +34,8 @@ python3 tools/ds41/serve.py --model <model-folder> --loader stub --engine-opt re
 | `--loader` | `ds41_model:load_model` | `module:function` that builds the engine; `stub` = canned replies |
 | `--engine-opt KEY=VALUE` | none | extra keyword argument for the loader (JSON value or plain string), repeatable |
 | `--num-draft` | `0` (off) | DSpark speculative decoding: up to N draft tokens per round, at most the block size (5). Given to the loader as `num_draft` only when above 0 |
+| `--draft-auto` | off | Choose the draft length of each round from the running acceptance (1..4, at most `--num-draft`, which defaults to 4 here). Loader option `draft_auto=true`. Output unchanged |
+| `--draft-conf` | none | Stop drafting at the first slot whose DSpark confidence probability is below P (0 < P < 1). Loader option `draft_conf_threshold`. Output unchanged |
 | `--default-temperature` | pack file, else `1.0` | used when a request omits `temperature` |
 | `--default-top-p` | pack file, else `1.0` | used when a request omits `top_p` |
 | `--default-max-tokens` | all free context | reply budget (thinking included) when a request omits it |
@@ -129,7 +131,14 @@ An explicit thinking switch beats `reasoning_effort: "none"`. `low`, `high` and 
 * With `--num-draft N` the loader gets `num_draft=N` and the engine exposes `num_draft` (the reply budget keeps room
   for the draft window). It adds `accepted_draft_tokens`, `rejected_draft_tokens`, `draft_steps` to its job stats
   (`DSparkStats.as_engine_stats()`); the server then adds those and `accepted_per_step` to `timings` and counts the
-  rounds in `/metrics`. Without drafting these fields are absent.
+  rounds in `/metrics`. Without drafting these fields are absent. The cost fields of `as_engine_stats()`
+  (`draft_len_mean`, `verify_positions`, `conf_dropped_tokens`, `conf_cut_rounds`, `tuner_k`) go to `timings` too when the
+  engine sends them (`tuner_k` as `draft_tuner_k`). `conf_dropped_tokens` is the number of verify positions the
+  confidence stop saved (a position is cheap next to a verify call: judge the gain with calls + c * extra positions). A loader that takes `draft_auto` builds a `dspark.DraftTuner` per request (or shares one across requests so the acceptance history carries over); one that takes
+  `draft_conf_threshold` passes it as `conf_threshold` to `DSparkDecoder`.
+* Sampling: `temperature` and `top_p` of the request reach the engine; build the sampler as
+  `dspark.GumbelSampler(temperature, top_p=top_p)`. The server does not read `top_k` or `min_p` from requests (the
+  sampler supports both).
 
 `StubEngine` implements it over canned replies (`--loader stub`, or `StubEngine(replies)` in code).
 
@@ -152,7 +161,16 @@ built on what `forward_spec` defines:
 3. Sampling: the target token of each position is drawn in order with the official Gumbel-max `sample` rule and a
    draft is accepted when it equals the draw (standard speculative sampling for a one-hot draft; same output law,
    and the same tokens as the plain loop under the same seed). Drafts that carry their laws `q` use `min(1, p/q)` with
-   the `max(0, p - q)` residual instead. The model's confidence head is not used (the official code does not say how).
+   the `max(0, p - q)` residual instead. `GumbelSampler(top_p=, top_k=, min_p=)` truncates and renormalises the law
+   before the draw (top_k, then top_p, then min_p); the draw count per emitted token is unchanged, so the seeded
+   equality with the plain loop holds for truncated sampling too.
+3b. The confidence head returns one raw score per slot. The official code does not say what it means; we read it as a
+   logit of "this draft is accepted". With `conf_threshold=P`, drafts from the first slot with sigmoid(score) < P on are
+   not verified. The score of slot i does not depend on token i, only on the tokens before it, so the cut is made
+   before the draw it affects and the output (and, with draft laws, the p/q rule) stays exact. The saving is verify
+   positions (`conf_dropped_tokens`); the price is the accepted tokens the cut skips. `DraftTuner` picks the length
+   (1..4) of each round from the decayed per-position acceptance, maximising expected tokens per round over a cost of
+   1 + 0.1 k; it reads past rounds only. Both only change cost.
 4. Rollback: `truncate(n)` must leave the target cache as if only positions `0..n-1` had been run. A ring-buffer
    sliding window cannot be cut by length (a rejected position overwrites a slot an older position still needs), so
    an engine must snapshot or keep history for the verify block. The drafter needs no rollback: it is fed only
@@ -179,6 +197,9 @@ CPU only, no weights. Golden tests compare against the vendored official encoder
 `tokenizer.json`: set `DS41_REF_DIR` to a folder holding it, or run `python3 tools/ds41/fetch_reference.py <dir>`
 (downloads only config, tokenizer and encoding files, never weights). Without it those tests are skipped and
 reported as skipped.
+
+`test_ds41_dspark_sampling.py` covers top_p / top_k / min_p, the confidence stop and the tuner: seeded equality with
+the plain loop on 300 seeds, chi-square tests of the end-to-end law, and checks on the official model code.
 
 `test_ds41_dspark.py` runs the controller on a bigram table and on a tiny random-weight model built from the
 unmodified official `model.py` (vendored in `testdata/reference/inference`, MIT; CUDA kernels replaced by torch
