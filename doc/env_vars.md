@@ -787,6 +787,14 @@ The file that holds the tuned dense GEMM solution per shape class. Point it at a
 skip the autotune; the GLM lane copies `tools/lanes/assets/tune_seed.txt` to the path it sets.
 Without it the first GLM launch spends about ten minutes tuning before the port opens.
 
+#### `MIMO_IMAGE_MAX_PIXELS` (default: `2097152`)
+
+Pixel cap applied to an image the MiMo server preprocesses: the tower sees `min(cap, the pack's own
+limit)`, and the image is resized (aspect kept, multiples of 32) until it fits. The default is 2 097 152
+pixels — 8 192 patches, 2 048 text tokens — because the pack's config would allow 8 388 608 and one tower
+pass at that size needs far more attention memory than is worth it. Raise it for a pack with more
+headroom, lower it to make vision cheaper; raising it past the pack's limit changes nothing.
+
 #### `EXL3_MIMO_FP32_MLP_LAYERS` (default: `none`)
 
 Which MiMo layers build their MoE and MLP intermediates in fp32 instead of fp16. Syntax: `47`,
@@ -985,7 +993,27 @@ The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE
 | `EXL3_GLM_SLOTS` | `0` (one recurrent state slot per session) | Minimum number of recurrent state slots the GLM server allocates. The default sizes them to `--sessions`, which frees about 6 GiB of GPU memory at one session. `16` restores the earlier layout. |
 | `EXL3_GC_FREEZE` | Qwen server `1`, GLM server `0` | Moves the loaded model and tokenizer objects out of the Python garbage collector before the first generator is built. Without it, rebuilding the generator (for example after a `cache_salt` change) pays a collector pass of about 0.5 s inside the time to first token. `0` leaves them in the collector. |
 
+#### Image embedding cache (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_IMAGE_CACHE_POLICY` | `head` | Which pictures a full image-embedding cache gives up. The cache is one shared module (`tools/strix_halo/image_cache.py`, with `image_cache.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), so this switch reaches all three servers, and it is read when a server builds its cache at start-up. `head` is the plain LRU a server always had: the picture whose last use is oldest goes first, which for a client that re-sends its whole history every turn is the earliest picture of the prompt. `tail` follows the prompt instead — a picture no remembered prompt refers to goes first, then the last pictures of the remembered prompts, and the head of the prompt is the last thing given up — which lets a history that keeps being re-sent keep the start of its prompt, so its warm turns prefill less and reach the first token sooner. Decoding is unaffected. Any other value stops the server at start-up. |
+
 ### Server state
+
+#### Request log (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_REQLOG_DIR` | unset = off | Directory for the per-request lifecycle log, or `1`/`on`/`yes` for `~/.cache/kyojin`. A path that ends in a file name is read as that file's **directory** (`/var/log/kyojin/requests.log` means `/var/log/kyojin`), since that is what pointing it at a log means; the log file is always `requests-<run>.log` in that directory. Every run writes its own file, `requests-<run>.log` (so the default is `~/.cache/kyojin/requests-<run>.log`), and every line carries `run=<id>`, so one run can be read without filtering the others out; the oldest runs are removed at start-up, see `KYOJIN_REQLOG_KEEP` (`0`/`off`/`none`/`no`/`false` disable it). Numbers and event names only, never prompt or reply text; one line per event and a heartbeat (`alive`) while a job is queued, prefilling or decoding. The file is created `0600` whatever the umask is, and an existing file left wider is tightened on the next start; a directory this server has to create is `0700`, while one that already exists keeps its own mode; the shared folder `~/.cache/kyojin`, or wherever `KYOJIN_HEALTH_DIR` points, is created with the process umask instead, its missing parents included, because more than one process writes there. For a streaming reply the heartbeat also carries the **output accounting** (`out_events`, `out_chars`, `last_out_s`) and the request ends with one `sse_summary` line, which is what tells "the client was sent nothing" from "the client showed nothing"; the event tables, the shared/GLM-only split and how to read it are in [logging.md](logging.md). Served by all three servers from one module (`tools/strix_halo/serve_reqlog.py`, with `serve_reqlog.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`): the whole request lifecycle — the request table, the id on every line, the heartbeat and the route wrapper (`Lifecycle`) — is that module's, so the three servers emit one vocabulary, which `tools/test_serve_logging.py` checks against all three at once; each server's document only points back here and to [logging.md](logging.md). |
+| `KYOJIN_REQLOG_HEARTBEAT_S` | `10` | Seconds between `alive` lines; `0` disables the heartbeat (the log stays on). |
+| `KYOJIN_REQLOG_KEEP` | `20` | How many runs keep their log file. Checked once, at start-up: the run files of the oldest runs are removed, so the directory holds this many (this run included). It counts only files this module writes (`requests-<run>.log`); an archive or a file an earlier layout appended to is never deleted. `0` keeps every run. |
+
+#### SSE keep-alive (all three servers)
+
+| variable | default | what it does |
+|---|---|---|
+| `KYOJIN_SSE_PING_S` | `0` = off | Seconds a stream may go without a data event before the server writes one SSE comment line (`: waiting <n> s`), which keeps a client that only watches its socket from treating a long prefill — or a long decode nothing is being written for — as a dead server. The comment counts from the request's arrival, comes once per interval and only after that much silence: a stream that is producing text never gets one, and one that stops gets them again (a reply holding a `<tool_call>` back until its XML closes is decoded for minutes while the client hears nothing). The `role` chunk a client gets immediately does not count as output, so the whole prefill is covered. Shared by the three servers (`tools/strix_halo/serve_ping.py`, with `serve_ping.py` symlinks in `tools/glm`, `tools/qwen` and `tools/mimo`), read per request, reported on one start-up line. With the default nothing is written at all. Worth setting on any server that sees long prompts — an image conversation can prefill for minutes — together with a client-side timeout that is long enough; each comment is also an `sse_ping` line in the request log (`KYOJIN_REQLOG_DIR`) when that is on and the server's pinger is wired to it (GLM's is). See [logging.md](logging.md). |
 
 #### `KYOJIN_HEALTH_DIR` (default: `~/.cache/kyojin`)
 

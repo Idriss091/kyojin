@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import functools
 import io
 import json
 import os
@@ -28,6 +29,15 @@ import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /to
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: one line per request
+# lifecycle event (numbers and event names only, never prompt or reply text) plus a heartbeat while a job
+# is queued or prefilling, so "the client went silent" can be lined up with what the server was doing.
+# Off unless KYOJIN_REQLOG_DIR names a directory; the server prints which of the two it is at start-up.
+from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so the same silence is
+# visible to the client and not only in the log file.
+from serve_ping import ServePing
 from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
@@ -146,6 +156,110 @@ SPEED_ENV = {
     "EXL3_NC2_MLA_OPROJ_F16": "1",
     "EXL3_NC2_KDA_NPAD": "1",
 }
+
+# Host memory for the decoded image embeddings (--image-cache-mb). One entry per picture is 49.0 MiB for a
+# 1568x1568 page (3,136 tokens) and 1 MB for a 224x224 crop, so pictures, not bytes, are what a conversation
+# spends: the default holds about 20 of those pages, as upstream's 1 GiB did.
+IMAGE_CACHE_MB_DEFAULT = 1024
+# Count cap on top of the byte budget, as upstream's shared cache defaults to it (0 = no limit). For big pages
+# the byte budget binds first; for small ones this keeps the entry count bounded.
+IMAGE_CACHE_ITEMS_DEFAULT = 32
+# How the cached rows are stored (--image-cache-format). fp32 is what the vision merger emits; fp16 is exactly
+# the same values (the tower computes in fp16) and q8 rounds at one part in 254 of the row's peak. Kept here
+# rather than imported from the engine, which serve.py must not import before SPEED_ENV is applied.
+IMAGE_CACHE_FORMATS = ("fp32", "fp16", "q8")
+IMAGE_CACHE_DIR_DEFAULT = "~/.cache/kyojin/image-embeddings"
+# GiB cap on the second-level picture cache directory. 0 means the disk cache is off, which is the default: the
+# memory cache above is what a normal session needs, and the disk cache exists for conversations with more
+# pictures than that budget holds. A positive value is always a real cap, there is no "unlimited".
+IMAGE_CACHE_DIR_MAX_GB = 0.0
+# How long a conversation keeps the room its picture cache took on disk (--image-cache-dir-lock-s). The clock
+# starts when the files are written and is not refreshed by later requests, so a conversation that grabbed the
+# cache cannot keep it for ever.
+IMAGE_CACHE_DIR_LOCK_S = 300.0
+
+
+def make_image_cache(image_cache_bytes: int | None = None, image_cache_items: int = IMAGE_CACHE_ITEMS_DEFAULT,
+                     sessions: int = 1, policy: str | None = None) -> ImageEmbeddingCache:
+    """The picture cache of the process (--image-cache-mb / --image-cache-items).
+
+    One cache for the whole server, shared by every session exactly like the KV pool `-c` sizes, with the
+    eviction policy of the shared cache in tools/strix_halo/image_cache.py: the default gives up the head of a
+    prompt a client keeps re-sending (what the servers always did), and `KYOJIN_IMAGE_CACHE_POLICY=tail` gives up
+    its tail instead. The policy remembers one prompt order per concurrent request plus one, so a conversation is
+    not forgotten between two of its own turns when another session slips in between.
+    """
+    return ImageEmbeddingCache(max_items=image_cache_items, max_orders=max(2, sessions),
+                               **({} if image_cache_bytes is None else {"max_bytes": image_cache_bytes}),
+                               **({} if policy is None else {"policy": policy}))
+
+
+def env_fingerprint_source(model_dir: str | None, config) -> dict:
+    """What the rows in the picture cache on disk were computed with (see `make_env_fingerprint`).
+
+    A stored row is only worth keeping while the model and the preprocessing that produced it stay the
+    same, and the file name has to say so or a restart with another model would inject rows from the old
+    one. What goes in: the pack directory (two packs of the same architecture encode differently), the
+    vision settings that decide the resize and the canvas, and the size and mtime of the visual weight
+    shards - the cheap stand-in for hashing ~1.5 GB at every start. A pack that is converted again keeps
+    its name and its config, so its rows are caught only if its shards change size or date; the disk tier
+    is a cache, and a miss costs an encode, not correctness of the answer.
+    """
+    source: dict = {"model": Path(model_dir).name if model_dir else "?"}
+    for attr in ("vision_config", "vision_pp"):
+        part = getattr(config, attr, None)
+        if part is None:
+            continue
+        for field in ("patch_size", "merge_size", "temporal_patch_size", "min_image_tokens",
+                      "max_image_tokens", "spatial_merge_size", "hidden_size"):
+            value = getattr(part, field, None)
+            if value is not None:
+                source[f"{attr}.{field}"] = value
+    if model_dir:
+        index = Path(model_dir) / "model.safetensors.index.json"
+        try:
+            weight_map = json.loads(index.read_text())["weight_map"]
+            shards = sorted({name for key, name in weight_map.items()
+                             if "visual" in key or "vision" in key})
+            for name in shards:
+                shard = Path(model_dir) / name
+                stat = shard.stat()
+                source[f"shard.{name}"] = f"{stat.st_size}:{int(stat.st_mtime)}"
+        except (OSError, KeyError, ValueError):
+            pass
+    return source
+
+
+def make_env_fingerprint(model_dir: str | None, config) -> str:
+    """`env_fingerprint_source` reduced to a short name that can go in a file name.
+
+    Hashed rather than spelled out, so the name stays portable and fixed-length; the source dictionary is
+    written into the request log too - `image_cache_env` on the `serve_start` line and `env` inside the
+    `disk=` report of `img_cache` - which is what makes a fingerprint that changed between two runs visible
+    instead of mysterious.
+    """
+    import hashlib
+    source = env_fingerprint_source(model_dir, config)
+    blob = json.dumps(source, sort_keys=True).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def make_image_disk(image_cache_dir: str | None, image_cache_dir_max_gb: float, image_cache_dir_lock_s: float,
+                    start_token: int = 0, end_token: int = 0, env_fingerprint: str = ""):
+    """The second-level picture cache, or None when it is off (`--image-cache-dir-max-gb` 0 or less).
+
+    A cap is required: the disk cache is meant for conversations with more pictures than `--image-cache-mb`
+    holds, and an unbounded directory is not something a server should be able to create by omission.
+    """
+    if not image_cache_dir_max_gb or image_cache_dir_max_gb <= 0:
+        return None
+    from image_cache_disk import ImageEmbeddingDisk      # imports exllamav3: only once it is wanted
+    return ImageEmbeddingDisk(image_cache_dir or IMAGE_CACHE_DIR_DEFAULT,
+                              int(float(image_cache_dir_max_gb) * 2 ** 30),
+                              start_token=int(start_token or 0), end_token=int(end_token or 0),
+                              lock_s=max(0.0, float(image_cache_dir_lock_s)),
+                              env_fingerprint=env_fingerprint)
+
 
 def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
     """Pick the optional unquantized MTP eh_proj sidecar and log which source is used.
@@ -388,6 +502,7 @@ def _bad(reason: str) -> web.HTTPBadRequest:
     return web.HTTPBadRequest(reason=reason)
 
 
+
 def extract_images(messages: list[dict[str, Any]]) -> list[str]:
     """Image URLs of the messages in prompt order (OpenAI image_url parts). Video and audio parts are refused:
     this server has no such tower, and dropping them silently would let the model invent an answer."""
@@ -447,7 +562,12 @@ class ResidentEngine:
     row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True, sessions: int = 1):
+                 vision: bool = True, sessions: int = 1,
+                 image_cache_bytes: int | None = None, image_cache_items: int = 0,
+                 image_cache_format: str = "fp32",
+                 image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
+                 image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
+                 image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -511,7 +631,15 @@ class ResidentEngine:
         else:   # --num-draft 0: plain decode, no drafter
             self.draft_model = self.draft_cache = None
         self.vision = None
-        self.emb_cache = ImageEmbeddingCache()
+        self.image_cache_format = image_cache_format
+        self.emb_cache = make_image_cache(image_cache_bytes, image_cache_items, sessions)
+        # Second-level cache: the rows of the pictures the memory cache evicts. Off unless a cap is given
+        # (--image-cache-dir-max-gb > 0), because the memory budget above is what a normal session needs.
+        self.env_fingerprint = make_env_fingerprint(model_path, self.config)
+        self.emb_disk = make_image_disk(image_cache_dir, image_cache_dir_max_gb, image_cache_dir_lock_s,
+                                        getattr(self.config, "vision_start_token_id", 0),
+                                        getattr(self.config, "vision_end_token_id", 0),
+                                        env_fingerprint=self.env_fingerprint)
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
@@ -600,15 +728,64 @@ class ResidentEngine:
                                     pp.patch_size * pp.merge_size, pp.min_image_tokens, pp.max_image_tokens)
         return (th // pp.patch_size) * (tw // pp.patch_size) // (v.spatial_merge_size ** 2)
 
-    def _embed(self, images: list[tuple[Any, str]]) -> list:
+    def _embed(self, images: list[tuple[Any, str]], stats: dict[str, Any] | None = None) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
-        history turn that repeats an image still matches the paged KV cache (see image_cache.py)."""
+        history turn that repeats an image still matches the paged KV cache (see image_cache.py).
+
+        `stats`, when given, receives what the cache did for this request. A hit keeps the object and therefore
+        the pseudo ids the KV pages were keyed on; a miss re-encodes the picture and the paged prefix can only
+        match up to it, so `first_missing` (index of the first picture not held) is the number to watch. This
+        only reports: the cache policy itself is untouched."""
+        cache = self.emb_cache
+        disk = getattr(self, "emb_disk", None)
+        built: set[int] = set()
+        evicted: list = []
+        mode = getattr(self, "image_cache_format", "fp32")
+
+        def fetch(image, key):
+            """One picture back from the second-level cache, or None: its identity comes back with it."""
+            return disk.fetch(key, mode) if disk is not None else None
+
         def build(image):
             t0 = time.perf_counter()
             emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            if mode != "fp32":     # store the rows compressed; the ids and the text alias are untouched
+                # imported here, not at module level: exllamav3 reads some of the speed defaults at import
+                # time, and serve.py must not pull it in before SPEED_ENV is applied
+                from exllamav3.tokenizer.mm_embedding import quantize_rows
+                emb.embeddings = quantize_rows(emb.embeddings, mode)
+            built.add(id(emb))     # tells a hit from a miss once get_many() hands the list back in prompt order
             print(f"serve: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             return emb
-        return self.emb_cache.get_many(images, build)
+
+        mine: set = set()          # the pictures of *this* prompt: the conversation this request serves
+        out = cache.get_many(images, build, evicted, fetch, mine)
+        if disk is not None:
+            # Every picture of this request keeps its identity, so a later restore reproduces the prompt; then
+            # the ones that just left memory are written, outside the cache lock. A session that fits in
+            # --image-cache-mb writes nothing, one that does not writes each evicted picture once
+            # (see image_cache_disk.py). The cache hands over (key, embedding, position-in-this-prompt), the
+            # conversations it still remembers and the keys of this one, so the collector can give up an
+            # abandoned conversation first and never release the cache of a conversation that is being served.
+            for (_, key), emb in zip(images, out):
+                disk.remember(key, emb)
+            disk.store(evicted, mode, live=cache.live_orders, protect=mine)
+            if stats is not None:
+                stats["disk"] = disk.report()
+        if stats is not None:
+            missed = [id(emb) in built for emb in out]
+            misses = sum(missed)
+            stats.update({
+                "imgs": len(out), "hits": len(out) - misses, "misses": misses,
+                "first_missing": next((i for i, m in enumerate(missed) if m), None),
+                "entries": len(cache), "mb": round(cache.nbytes / 2 ** 20, 1),
+                "budget_mb": round(float(getattr(cache, "max_bytes", 0)) / 2 ** 20, 1),
+                "item_cap": int(getattr(cache, "max_items", 0) or 0),
+                # real evictions, not a difference of counts: a picture that came back from disk also enters
+                # the cache, so entries_before + misses - len() would miss those
+                "evicted": len(evicted),
+            })
+        return out
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
@@ -627,10 +804,13 @@ class ResidentEngine:
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None, stats: dict | None = None,
+                       images: list | None = None, stats: dict | None = None, img_stats: dict | None = None,
                        prompt_ids: list[int] | None = None, ignore_eos: bool = False) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
+
+        `img_stats` (optional) receives the image-embedding cache hit/miss counts of this request; it is kept
+        apart from `stats` because `stats` is the Generator's own end-of-job report.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
         prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
@@ -647,9 +827,9 @@ class ResidentEngine:
                 self.slot_store.note_prompt("", ids)
         elif images:
             if self.sessions > 1:   # the tower must not run next to a Generator step: run it on the driver, between steps
-                embs = await self._post(self._embed, images)
+                embs = await self._post(self._embed, images, img_stats)
             else:
-                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+                embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images, img_stats)
             for emb in embs:
                 prompt = prompt.replace(IMAGE_TRIPLE, emb.text_alias, 1)
             ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
@@ -987,6 +1167,36 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
+    # Request log: off unless KYOJIN_REQLOG_DIR names a directory, in which case every generation request gets a line
+    # per lifecycle event (numbers and event names only, never prompt or reply text) plus an 'alive' heartbeat
+    # while it is queued or running. `inflight` is what the heartbeat walks; it holds no request content.
+    reqlog = ReqLog.from_env(server="glm")
+    app.update(reqlog=reqlog)
+    inflight: dict[str, dict[str, Any]] = {}
+    background: dict[str, Any] = {}      # the heartbeat task, created at start-up (nothing when the log is off)
+
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval, in which case a stream that has
+    # nothing to send yet (queued, or prefilling a long prompt) writes a ':' comment line every N
+    # seconds. The pinger is per request; the switch and the start-up line are shared by the three servers.
+    ping = ServePing.from_env(reqlog)
+    app.update(ping=ping)
+
+    # The lifecycle a request goes through is logged by one shared implementation (tools/strix_halo/
+    # serve_reqlog.py): the request table, the id every line carries, the 'alive' heartbeat and the route
+    # wrapper. This server only says when a phase begins; the events it has and the counters it keeps are
+    # the ones its own call sites pass. `processing`/`running` are this server's two counts.
+    lifecycle = Lifecycle(reqlog, ping=ping,
+                          counters=lambda: {"processing": processing, "running": running})
+
+    def reqid() -> str | None:
+        """The log id of the request being handled (None outside a logged route)."""
+        return lifecycle.reqid()
+
+    writers = lifecycle.writers          # the streaming writer per in-flight request (the heartbeat reads it)
+
+    def track(rid: str | None, phase: str, **fields: Any) -> None:
+        lifecycle.track(rid, phase, **fields)
+
     def salt_of(body: dict[str, Any]) -> str | None:
         try:
             salt = serve_compat.cache_salt(body)
@@ -1080,15 +1290,24 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         while True:
             body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
+            rid = body.get("_reqid")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
+                lifecycle.job_skipped(rid, time.perf_counter() - (body.get("_queued_at") or time.perf_counter()))
                 out.put_nowait(None)
                 queue.task_done()
                 continue
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
+            started = time.perf_counter()
+            first_token = False             # flipped once, so the log gets exactly one job_first_token line
             try:
                 async with admit(body.get("_cache_salt")):
                     running += 1
+                    lifecycle.job_started(rid, started - (body.get("_queued_at") or started),
+                                          prompt_tokens=body.get("_prompt_tokens"),
+                                          images=len(body.get("_images") or ()),
+                                          messages=body.get("_messages"), sessions=sessions,
+                                          processing=processing, running=running)
                     if store is not None:
                         store.busy = True
                     if sessions == 1:
@@ -1098,10 +1317,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             body["_prompt"],
                             max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                             top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                            cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {}),
+                            cancel=body.get("_cancel"), img_stats=body.get("_img_stats"),
+                            **({"images": body["_images"]} if body.get("_images") else {}),
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
                             **({"stats": request_stats} if sessions > 1 else {})):
+                            if not first_token:
+                                first_token = True
+                                lifecycle.first_token(rid, started,
+                                                      prompt_tokens=body.get("_prompt_tokens"))
                             out.put_nowait(delta)
                     finally:
                         running -= 1
@@ -1111,8 +1335,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
+                    log_job_done(rid, body, request_stats, started)
                     out.put_nowait(None)
             except Exception as exc:
+                lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)
             finally:
                 processing -= 1
@@ -1120,23 +1346,52 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     store.busy = False
                 queue.task_done()
 
+    def log_job_done(rid: str | None, body: dict[str, Any], st: dict[str, Any], started: float) -> None:
+        """One line per finished job: what the prompt cache did (cache_n vs prompt tokens) and how long each
+        phase took. This is the line that turns 'the client saw nothing for 290 s' into a number."""
+        prompt_tokens = int(st.get("prompt_tokens") or body.get("_prompt_tokens") or 0)
+        cache_n = int(st.get("cached_tokens") or 0)
+        lifecycle.job_done(rid, st, started, prompt_tokens=prompt_tokens)
+        if body.get("_img_stats"):
+            reqlog.log("img_cache", req=rid, **body["_img_stats"])
+
     async def start(_: web.Application) -> None:
         app["worker_tasks"] = [asyncio.create_task(worker()) for _ in range(sessions)]
         app["worker_task"] = app["worker_tasks"][0]
+        if reqlog.enabled and reqlog.heartbeat_s > 0:
+            background["heartbeat"] = asyncio.create_task(lifecycle.heartbeat_forever())
 
     async def close(app_: web.Application) -> None:
         for t in app_["worker_tasks"]:
             t.cancel()
+        beat = background.pop("heartbeat", None)
+        if beat is not None:
+            beat.cancel()
+        reqlog.close()
 
-    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
+    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue,
+                    writer: StreamWriter | None = None, ping: ServePing | None = None,
+                    ping_at: float | None = None) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
         queued or prefilling (and never, for a non-streaming reply), so a client that hung up is noticed
-        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left."""
+        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left.
+
+        For a streaming reply (`writer`, `ping`, `ping_at` given), the keep-alive is asked before each
+        poll whether a comment is due: the client sees that the server is still working on a prompt (or
+        on a held-back tool call) it has not answered yet, which is all it can see until then."""
         while True:
             tr = request.transport
             if tr is None or tr.is_closing():
                 cancel.set()
+                if ping is not None:
+                    ping.limit()
                 raise ConnectionResetError("client left")
+            if ping is not None:
+                try:                              # before the wait, so a stall is covered from its start
+                    await ping.comment(writer, ping_at or 0.0)
+                except ConnectionResetError:
+                    cancel.set()
+                    raise
             try:
                 item = await asyncio.wait_for(out.get(), 0.5)
             except asyncio.TimeoutError:
@@ -1149,6 +1404,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     def client_left(cancel: asyncio.Event, path: str) -> web.Response:
         cancel.set()
+        lifecycle.client_left(path)
         print(f"serve: client left {path}, job cancelled", file=sys.stderr, flush=True)
         return web.Response(status=499)
 
@@ -1194,11 +1450,25 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         out: asyncio.Queue = asyncio.Queue()
         request_stats: dict[str, Any] = {}
         cancel = body["_cancel"] = asyncio.Event()
+        body["_reqid"] = reqid()
+        body["_messages"] = len(body["messages"])
+        body["_img_stats"] = {} if images else None
+        body["_queued_at"] = time.perf_counter()
+        ahead = queue.qsize()                       # requests already waiting when this one arrived
         await queue.put((body, out, request_stats))
+        lifecycle.queued(body["_reqid"], "/v1/chat/completions", queued_ahead=ahead,
+                         prompt_tokens=prompt_tokens, messages=body["_messages"], images=len(images),
+                         stream=bool(body.get("stream")))
         prefix = "<think>" if opens_thinking(prompt) else ""
+        # This request's SSE keep-alive, and the moment its wait started: every comment counts from
+        # there, which is what the client has actually been waiting for. Off (the default) this costs one
+        # comparison per empty poll. A JSON reply has no stream to write a comment to, so `deltas` takes
+        # the response per call instead of closing over one that a non-streaming request never sets.
+        ping = app["ping"].per_request() if body.get("stream", False) else None
+        ping_at = body["_queued_at"]
 
-        def deltas() -> AsyncIterator[str]:
-            return drain(request, cancel, out)
+        def deltas(writer: StreamWriter | None = None) -> AsyncIterator[str]:
+            return drain(request, cancel, out, writer, ping, ping_at)
 
         def usage(raw: str) -> dict[str, int]:
             return serve_compat.usage(prompt_tokens, engine.count_tokens(raw), int(request_stats.get("cached_tokens") or 0))
@@ -1224,10 +1494,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = lifecycle.stream_started(body["_reqid"], "/v1/chat/completions", response,
+                                              prompt_tokens=prompt_tokens)
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
             hold = max([len("</think>"), len(TOOL_OPEN)] + [len(x) for x in body["_stop"]]) - 1
+            visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
 
             async def flush(final: bool) -> None:
                 nonlocal done, mode
@@ -1237,8 +1510,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - hold))
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
+                        if not visible:
+                            visible.append(time.perf_counter())
+                            lifecycle.first_content(body["_reqid"], body["_queued_at"])
                         key = "reasoning_content" if mode == "reasoning" else "content"
-                        await response.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
                         return
@@ -1247,8 +1524,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     mode = {"</think>": "content", "<think>": "reasoning", TOOL_OPEN: "tool"}[tag]
 
             try:
-                await response.write(sse(event({"role": "assistant", "content": ""})))
-                async for delta in deltas():
+                await writer.write(sse(event({"role": "assistant", "content": ""})))
+                ping.note_output()
+                async for delta in deltas(writer):
                     text += delta
                     await flush(False)
                 text, _ = stop_text(text, body["_stop"])
@@ -1256,11 +1534,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 message = parse_completion(text)
                 if "tool_calls" in message:
                     for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
-                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
-                await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
+                        await writer.write(sse(event({"tool_calls": [dict(call, index=n)]})))
+                await writer.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                lifecycle.stream_done(body["_reqid"], int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 client_left(cancel, "stream")                        # client left: nothing to send
                 return response
@@ -1269,12 +1548,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise
             except Exception as exc:                                   # noqa: BLE001
                 cancel.set()
+                lifecycle.stream_error(body["_reqid"], exc)
                 # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
                 # "stream ended without finish_reason" and retry when the connection just drops.
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
-                    await response.write(sse(event({}, "error")))
-                    await response.write(b"data: [DONE]\n\n")
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse(event({}, "error")))
+                    await writer.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1450,7 +1730,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         out: asyncio.Queue = asyncio.Queue()
         request_stats: dict[str, Any] = {}
         cancel = job["_cancel"] = asyncio.Event()
+        job["_reqid"] = reqid()
+        job["_queued_at"] = time.perf_counter()
+        ahead = queue.qsize()
         await queue.put((job, out, request_stats))
+        lifecycle.queued(job["_reqid"], "/v1/completions", queued_ahead=ahead,
+                         prompt_tokens=prompt_tokens, images=0, stream=bool(body.get("stream")))
 
         def chunk(text: str, finish: str | None) -> dict[str, Any]:
             return {"id": request_id, "object": "text_completion", "created": created, "model": model_id,
@@ -1466,9 +1751,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = lifecycle.stream_started(job["_reqid"], "/v1/completions", response,
+                                              prompt_tokens=prompt_tokens)
+            # Same keep-alive as /v1/chat/completions, but this route writes no role chunk: the first
+            # thing the client sees is text, so a comment covers the whole wait before it.
+            ping = app["ping"].per_request()
+            ping_at = job["_queued_at"]
             try:
                 text, sent, stopped = "", 0, None
-                async for delta in drain(request, cancel, out):
+                async for delta in drain(request, cancel, out, writer, ping, ping_at):
                     text += delta
                     cut, stopped = stop_text(text, job["_stop"])
                     if stopped is not None:
@@ -1477,14 +1768,18 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         break
                     safe = max(sent, len(text) - hold)
                     if safe > sent:
-                        await response.write(sse(chunk(text[sent:safe], None)))
+                        if not sent:
+                            lifecycle.first_content(job["_reqid"], job["_queued_at"])
+                        await writer.write(sse(chunk(text[sent:safe], None)))
+                        ping.note_output()
                         sent = safe
                 if len(text) > sent:
-                    await response.write(sse(chunk(text[sent:], None)))
+                    await writer.write(sse(chunk(text[sent:], None)))
                 reason, usage = finish_and_usage(text, stopped)
-                await response.write(sse(chunk("", reason) | {"usage": usage}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                lifecycle.stream_done(job["_reqid"], int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 client_left(cancel, "stream")
             except asyncio.CancelledError:
@@ -1492,8 +1787,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise
             except Exception as exc:                                   # noqa: BLE001
                 cancel.set()
+                lifecycle.stream_error(job["_reqid"], exc)
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1560,10 +1856,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/metrics", metrics_view)
-    app.router.add_post("/v1/chat/completions", completions)
+    app.router.add_post("/v1/chat/completions", lifecycle.wrapped(completions))
     app.router.add_post("/apply-template", apply_template)
     app.router.add_post("/tokenize", tokenize)
-    app.router.add_post("/v1/completions", v1_completions)
+    app.router.add_post("/v1/completions", lifecycle.wrapped(v1_completions))
     app.router.add_post("/completion", completion)
     app.on_startup.append(start)
     app.on_cleanup.append(close)
@@ -1590,6 +1886,29 @@ def main() -> None:
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
+    parser.add_argument("--image-cache-mb", type=int, default=IMAGE_CACHE_MB_DEFAULT,
+                        help=f"host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this "
+                             f"is one pool shared by every --sessions request (default {IMAGE_CACHE_MB_DEFAULT}): "
+                             "about 49 MiB per 1568x1568 page, 1 MB per 224x224 crop")
+    parser.add_argument("--image-cache-items", type=int, default=IMAGE_CACHE_ITEMS_DEFAULT,
+                        help=f"cap on how many pictures are held at once; 0 = no limit "
+                             f"(default {IMAGE_CACHE_ITEMS_DEFAULT}, as upstream)")
+    parser.add_argument("--image-cache-dir", default=IMAGE_CACHE_DIR_DEFAULT,
+                        help=f"directory of the second-level picture cache (default {IMAGE_CACHE_DIR_DEFAULT}); "
+                             "only used when --image-cache-dir-max-gb is set")
+    parser.add_argument("--image-cache-dir-lock-s", type=float, default=IMAGE_CACHE_DIR_LOCK_S,
+                        help=f"seconds a conversation keeps its files on disk before another conversation may "
+                             f"take the room (default {IMAGE_CACHE_DIR_LOCK_S:g} = 5 min, 0 = no tenure). Tenure "
+                             "is what keeps a set of conversations taking turns from evicting each one just "
+                             "before it is served again; while it holds, a new picture that would have to push a "
+                             "recent conversation out is simply not cached")
+    parser.add_argument("--image-cache-dir-max-gb", type=float, default=IMAGE_CACHE_DIR_MAX_GB,
+                        help=f"cap on that directory, in GiB; 0 = off, which is the default "
+                             f"({IMAGE_CACHE_DIR_MAX_GB:g}). No unlimited setting: a positive value is the cap")
+    parser.add_argument("--image-cache-format", choices=IMAGE_CACHE_FORMATS, default="fp32",
+                        help="how the cached image embeddings are stored in host memory: fp32 as the vision merger "
+                             "emits them (default), fp16 (half the bytes, bit-exact on this pack) or q8 (8 bit with "
+                             "one fp16 scale per row, a quarter of the bytes, 0.86 percent error)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
     parser.add_argument("--chat-template", default=None,
@@ -1633,12 +1952,23 @@ def main() -> None:
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
+        image_cache_bytes = max(0, int(args.image_cache_mb)) * 2 ** 20
+        image_cache_size = (f"{args.image_cache_mb} MiB of host memory (--image-cache-mb)" if image_cache_bytes
+                            else "no byte limit (--image-cache-mb 0)")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision, sessions=args.sessions)
+                              vision=not args.no_vision, sessions=args.sessions,
+                              image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
+                              image_cache_format=args.image_cache_format,
+                              image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
+                              image_cache_dir_lock_s=args.image_cache_dir_lock_s)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
+        print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
+              f"{args.image_cache_format} rows, {engine.emb_cache.policy} policy, shared by {args.sessions} session(s)", flush=True)
+        if engine.emb_disk is not None:
+            print(f"serve: {engine.emb_disk.describe()}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
@@ -1675,6 +2005,29 @@ def main() -> None:
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     app = create_app(engine, args.model_id, template)
+    # Which run this is, in the log itself: ctx, sessions and the image-cache budget are what a later
+    # "why was this request slow" question turns on, and they are not visible in the client's request.
+    reqlog = app["reqlog"]
+    ping = app["ping"]
+    print(f"serve: {reqlog.describe()}", flush=True)
+    print(f"serve: {ping.describe()}", flush=True)
+    emb_cache = getattr(engine, "emb_cache", None)
+    reqlog.log("serve_start", model=Path(args.model).name, model_id=args.model_id, pid=os.getpid(),
+               ctx=args.max_ctx, cache_tokens=getattr(getattr(engine, "cache", None), "max_num_tokens", None),
+               sessions=args.sessions, num_draft=args.num_draft, row_budget=getattr(engine, "row_budget", 0),
+               max_history=args.max_history or max(args.num_draft, 1), vision=bool(engine.supports_vision),
+               conv_gemm=os.environ.get("EXL3_CONV_GEMM"), dense_tune=os.environ.get("EXL3_DENSE_GEMM_TUNE"),
+               moe_fused=os.environ.get("EXL3_MOE_FUSED", "0"),
+               image_cache_mb=round(emb_cache.max_bytes / 2 ** 20, 1) if emb_cache is not None else None,
+               image_cache_items=getattr(emb_cache, "max_items", None),
+               image_cache_format=getattr(engine, "image_cache_format", "fp32"),
+               image_cache_policy=getattr(getattr(engine, "emb_cache", None), "policy", None),
+               image_cache_dir=str(engine.emb_disk.path) if getattr(engine, "emb_disk", None) else None,
+               image_cache_dir_cap_mb=round(engine.emb_disk.max_bytes / 2 ** 20) if getattr(engine, "emb_disk", None) else None,
+               image_cache_dir_lock_s=engine.emb_disk.lock_s if getattr(engine, "emb_disk", None) else None,
+               image_cache_env=getattr(engine, "env_fingerprint", None),
+               heartbeat_s=reqlog.heartbeat_s,
+               sse_ping_s=ping.interval_s or None)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
         web.run_app(app, sock=sock)

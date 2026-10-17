@@ -101,6 +101,15 @@ The pack is tied to one set of weights: download it from the same model repo.
   when it changes, running requests finish, the prompt cache is dropped (a fresh Generator, as `cache_prompt: false` does), and the
   request starts. The same salt, or no salt at all, never drops anything, so only the first request after a change pays the rebuild.
 
+## Diagnostics: the request log
+
+The log and the stream keep-alive are shared code: switches, format, every event and how to read the
+output accounting are documented once, in [doc/logging.md](../../doc/logging.md). This server writes the
+same events as GLM except for `serve_start` and `img_cache` (GLM's image cache and its disk tier)
+and `sse_ping` (this server's pinger writes no log line); `tools/test_serve_logging.py` checks the shared
+part against all three servers at once. Turn it on with `KYOJIN_REQLOG_DIR=<directory>` (or `1`) and hold a silent
+stream open with `KYOJIN_SSE_PING_S=<seconds>`; a run writes its own log file (`requests-<run>.log`, newest 20 kept), and both switches are in [doc/env_vars.md](../../doc/env_vars.md).
+
 ## Start-up progress on `/health`
 
 The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`

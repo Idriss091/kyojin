@@ -1098,5 +1098,88 @@ class VllmCompatTests(unittest.TestCase):
         self.assertEqual(self.post(FakeEngine("x"), "/v1/completions", {"model": "m", "prompt": "hi", "cache_salt": "a"})[0], 400)
 
 
+class SSEKeepAliveTests(unittest.TestCase):
+    """KYOJIN_SSE_PING_S: a stream that has nothing to send yet writes a ':' comment (off by default)."""
+
+    def setUp(self):
+        os.environ.pop("KYOJIN_SSE_PING_S", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_SSE_PING_S", None)
+
+    def test_a_ping_reaches_the_client_before_the_first_token(self):
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                # this server polls its queue once a second, so the wait has to outlast a poll
+                await asyncio.sleep(2.3)          # a prefill the client has to sit through
+                async for piece in FakeEngine.generate(self, prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(r.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            return b"".join(chunks)
+
+        body = with_client(Slow("hello"), fn)
+        self.assertTrue([line for line in body.split(b"\n") if line.startswith(b":")], body[:400])
+        # this template opens a <think> block, so the first visible token is reasoning content ("hel")
+        self.assertLess(body.index(b": waiting"), body.index(b"hel"))   # before the first token
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
+
+    def test_a_streaming_reply_does_not_cost_the_client_its_connection(self):
+        """The streaming route logs its summary while the reply is being closed: a name that is not
+        bound there raises after the body is complete, and the client loses the connection it was
+        reusing (the next request on it dies with ServerDisconnectedError, and the server logs a
+        traceback per stream). Three streams on one client session must all succeed."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.3)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", "{{ messages[0].content }}")))
+            await client.start_server()
+            dropped = 0
+            for _ in range(3):
+                try:
+                    response = await client.post("/v1/chat/completions", json={
+                        "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                    await response.read()
+                except Exception:                                     # noqa: BLE001  the bug drops the socket
+                    dropped += 1
+            await client.close()
+            return dropped
+
+        self.assertEqual(run(check()), 0)
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(1.3)
+                async for piece in FakeEngine.generate(self, prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            return await r.read()
+
+        body = with_client(Slow("hello"), fn)
+        self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
+        self.assertIn(b"hel", body)
+
+
 if __name__ == "__main__":
     unittest.main()

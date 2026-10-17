@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import functools
 import gc
 import importlib.util
 import io
@@ -43,6 +44,13 @@ import startup_health  # noqa: E402  (GET /health with load progress while the m
 import image_cache  # noqa: E402  (shared bounded LRU of image embeddings; symlink to tools/strix_halo)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
+# not look like a hung server to a client that only watches its socket.
+from serve_ping import ServePing  # noqa: E402
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: off unless
+# KYOJIN_REQLOG_DIR names a directory. Its output accounting also feeds the end-of-stream summary here.
+from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize  # noqa: E402
 
 
 def _load_mimo():
@@ -1356,6 +1364,29 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     admit_lock = asyncio.Lock()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, defaults=defaults)
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
+    # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
+    ping = ServePing.from_env()
+    app.update(ping=ping)
+    # Request log: off unless KYOJIN_REQLOG_DIR names a directory (numbers and event names only). The name is bound
+    # here, not only stored on the app: the streaming routes log from inside their own scope, and an
+    # unbound name there raises after the reply is complete, which costs the client its connection.
+    reqlog = ReqLog.from_env(server="qwen")
+    app.update(reqlog=reqlog)
+    background: dict[str, Any] = {}      # the heartbeat task, created at start-up (nothing when the log is off)
+
+    # The request lifecycle is logged by one shared implementation (tools/strix_halo/serve_reqlog.py).
+    # This server says when a phase begins and which counters it keeps; everything else — the request
+    # table, the id on every line, the 'alive' heartbeat, the route wrapper and the summary line — is
+    # the same code the other two servers run. `running` is this server's only live count.
+    lifecycle = Lifecycle(reqlog, ping=ping, counters=lambda: {"running": running})
+
+    def reqid() -> str | None:
+        """The log id of the request being handled (None outside a logged route)."""
+        return lifecycle.reqid()
+
+    def track(rid: str | None, phase: str, **fields: Any) -> None:
+        lifecycle.track(rid, phase, **fields)
 
     def err(status: int, message: str) -> web.Response:
         return web.json_response({"error": {"message": message, "type": "invalid_request_error", "code": status}},
@@ -1405,11 +1436,27 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             job, out = await queue.get()
             store = getattr(engine, "slot_store", None)
             stats: dict[str, Any] = {}
+            rid = job.get("_reqid")
+            # `started` is when generation begins (what job_done reports as elapsed_s); the queue wait is
+            # the difference, and it is logged on its own as wait_s.
+            wait = time.perf_counter() - (job.get("_queued_at") or time.perf_counter())
+            started = time.perf_counter() - wait
+            if job.get("cancel") is not None and job["cancel"].is_set():
+                # the client left while the job was queued: no prefill, no decode, one line
+                lifecycle.job_skipped(rid, wait)
+                out.put_nowait(("done", {}))
+                queue.task_done()
+                continue
             try:
                 async with admit(job.get("cache_salt")):
                     running += 1
                     if store is not None:
                         store.busy = True
+                    track(rid, "prefill", prompt_tokens=job.get("prompt_tokens"))
+                    lifecycle.job_started(rid, wait, prompt_tokens=job.get("prompt_tokens"),
+                                          images=len(job.get("images") or ()),
+                                          messages=job.get("messages"), sessions=sessions, running=running)
+                    first_token = False       # flipped once, so the log gets exactly one job_first_token line
                     try:
                         async for delta in engine.generate(
                                 job["prompt"], stats=stats, max_tokens=job["max_tokens"], sampling=job["sampling"],
@@ -1420,6 +1467,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                                 seed=job.get("seed"), reasoning_first=job.get("reasoning_first", False),
                                 thinking_budget=job.get("thinking_budget"), loop_guard=job.get("loop_guard"),
                                 loop_final=job.get("loop_final"), logprobs=job.get("logprobs")):
+                            if not first_token:
+                                first_token = True
+                                lifecycle.first_token(rid, started, prompt_tokens=job.get("prompt_tokens"))
                             out.put_nowait(delta)
                     finally:
                         running -= 1
@@ -1431,18 +1481,26 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                           f"new={int(done.get('new_tokens') or 0)} prefill_s={float(done.get('time_prefill') or 0):.3f} "
                           f"generate_s={float(done.get('time_generate') or 0):.3f} stop={done.get('eos_reason')}",
                           file=sys.stderr, flush=True)
+                    lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
             except Exception as exc:                                  # noqa: BLE001
+                lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)
             finally:
                 queue.task_done()
 
     async def start(_: web.Application) -> None:
         app["worker_tasks"] = [asyncio.create_task(worker()) for _ in range(sessions)]
+        if reqlog.enabled and reqlog.heartbeat_s > 0:
+            background["heartbeat"] = asyncio.create_task(lifecycle.heartbeat_forever())
 
     async def close(app_: web.Application) -> None:
         for t in app_["worker_tasks"]:
             t.cancel()
+        beat = background.pop("heartbeat", None)
+        if beat is not None:
+            beat.cancel()
+        reqlog.close()
 
     def check_sessions(job: dict[str, Any]) -> None:
         # both rebuild the Generator, which would drop the jobs of the other sessions (without a drafter there is
@@ -1508,7 +1566,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         lp = logprobs_arg(body.get("logprobs"), body.get("top_logprobs"), chat=True)
         if lp is not None and body.get("stream"):
             raise BadRequest("logprobs are returned on non-streaming requests only")
-        job = {"logprobs": lp, "seed": seed, "thinking_budget": budget, "loop_guard": body.get("loop_guard"), "loop_final": body.get("loop_final"), "prompt": prompt, "prompt_tokens": prompt_tokens, "max_tokens": max_tokens,
+        job = {"logprobs": lp, "seed": seed, "thinking_budget": budget, "loop_guard": body.get("loop_guard"), "loop_final": body.get("loop_final"), "prompt": prompt, "prompt_tokens": prompt_tokens, "max_tokens": max_tokens, "messages": len(messages),
                "sampling": sampling_from(body, defaults), "stop": stops, "images": images,
                "speculative": body.get("speculative", True) is not False,
                "cache_prompt": body.get("cache_prompt", True) is not False,
@@ -1516,6 +1574,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                "return_token_ids": bool(body.get("return_token_ids")), "cancel": asyncio.Event()}
         check_sessions(job)
         job["cache_salt"] = salt_of(body)
+        job["_reqid"] = None            # set by the route, which knows the request's log id
+        job["_queued_at"] = None
         return job
 
     async def completions(request: web.Request) -> web.StreamResponse:
@@ -1533,7 +1593,13 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return base | {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         out: asyncio.Queue = asyncio.Queue()
+        job["_reqid"] = reqid()
+        job["_queued_at"] = queued_at = time.perf_counter()   # the wait a streaming client's comments count from
+        ahead = queue.qsize()                     # requests already waiting when this one arrived
         await queue.put((job, out))
+        lifecycle.queued(job["_reqid"], "/v1/chat/completions", queued_ahead=ahead,
+                         prompt_tokens=job.get("prompt_tokens"), messages=len(body.get("messages") or ()),
+                         images=len(job.get("images") or ()), stream=bool(body.get("stream")))
 
         def finish_and_stats(stats: dict[str, Any], text: str, has_calls: bool):
             n_new = int(stats.get("new_tokens") or engine.count_tokens(text))
@@ -1560,13 +1626,23 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 timings["rejected_draft_tokens"] = int(stats["rejected_draft_tokens"])
             return reason, usage, timings
 
-        async def pieces() -> AsyncIterator[str | dict]:
+        async def pieces(writer: StreamWriter | None = None, ping: ServePing | None = None,
+                         ping_at: float = 0.0) -> AsyncIterator[str | dict]:
             while True:
                 # a non-streaming client that hung up is only noticed here (nothing is written until the end)
                 tr = request.transport
                 if tr is None or tr.is_closing():
                     job["cancel"].set()
                     raise ConnectionResetError("client left")
+                if ping is not None:
+                    # A ':' comment while the engine works, checked before every poll: the only thing a
+                    # streaming client can see until the prompt (or a held-back tool call) is done. It is
+                    # None for a JSON reply.
+                    try:
+                        await ping.comment(writer, ping_at)
+                    except ConnectionResetError:
+                        job["cancel"].set()
+                        raise
                 try:
                     item = await asyncio.wait_for(out.get(), 1.0)
                 except asyncio.TimeoutError:
@@ -1582,10 +1658,15 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            ping, ping_at = app["ping"].per_request(), queued_at
+            writer = lifecycle.stream_started(job["_reqid"], "/v1/chat/completions", response,
+                                              prompt_tokens=job.get("prompt_tokens"))
             try:
-                await response.write(sse(event({"role": "assistant", "content": ""})))
+                await writer.write(sse(event({"role": "assistant", "content": ""})))
+                ping.note_output()
                 stats, full = {}, ""
-                async for item in pieces():
+                visible = False   # flipped at the first frame with text: the client's first sign of life
+                async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
                         continue
@@ -1599,33 +1680,40 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     full += item
                     for kind, piece in sp.feed(item):
                         key = "reasoning_content" if kind == "reasoning" else "content"
-                        await response.write(sse(event({key: piece})))
+                        if not visible:
+                            visible = True
+                            lifecycle.first_content(job["_reqid"], queued_at)
+                        await writer.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                 for kind, piece in sp.finish():
                     key = "reasoning_content" if kind == "reasoning" else "content"
-                    await response.write(sse(event({key: piece})))
+                    await writer.write(sse(event({key: piece})))
                 calls = parse_tool_calls(sp.tool_text, job["tools"])
                 if calls:
                     for i, c in enumerate(calls):   # one stream message per call: some clients read only the first call of a message
-                        await response.write(sse(event({"tool_calls": [dict(c, index=i)]})))
+                        await writer.write(sse(event({"tool_calls": [dict(c, index=i)]})))
                 reason, usage, timings = finish_and_stats(stats, full, bool(calls))
                 final = event({}, reason) | {"usage": usage, "timings": timings}
                 if job["return_token_ids"]:
                     final["token_ids"] = stats.get("token_ids", [])
-                await response.write(sse(final))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(final))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                lifecycle.stream_done(job["_reqid"], int(stats.get("new_tokens") or 0))
             except ConnectionResetError:  # client left: stop the job, no traceback
                 job["cancel"].set()
+                lifecycle.client_left("/v1/chat/completions", "stream", rid=job["_reqid"])
             except asyncio.CancelledError:
                 job["cancel"].set()
                 raise
             except Exception as exc:                                  # noqa: BLE001
                 job["cancel"].set()
+                lifecycle.stream_error(job["_reqid"], exc)
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     # End the stream the OpenAI way: a bare drop makes clients report "stream ended without finish_reason".
-                    await response.write(sse(event({}, "error")))
-                    await response.write(b"data: [DONE]\n\n")
+                    await writer.write(sse(event({}, "error")))
+                    await writer.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1658,6 +1746,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         if job["logprobs"] is not None:
             payload["choices"][0]["logprobs"] = format_logprobs(
                 stats.get("logprobs", []), stats.get("logprob_token_ids", stats.get("token_ids", [])), engine.token_str, chat=True)
+        # The worker logs job_done for this job as well (a JSON reply takes the same path as a stream).
         return web.json_response(payload)
 
     async def apply_template(request: web.Request) -> web.Response:
@@ -1732,7 +1821,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 if room < 1:
                     raise BadRequest(f"context length exceeded: prompt is longer than the server context ({ctx})")
                 n_predict = min(n_predict, room)
-            job = {"prompt": prompt, "max_tokens": n_predict,
+            job = {"_reqid": reqid(), "_queued_at": time.perf_counter(), "messages": 0,
+                   "prompt": prompt, "max_tokens": n_predict,
                    "sampling": sampling_from({k: body.get(k) for k in ("temperature", "top_p", "top_k", "min_p")}, defaults),
                    "stop": stops, "images": [], "speculative": True,
                    "seed": body.get("seed") if isinstance(body.get("seed"), int) and not isinstance(body.get("seed"), bool) else None,
@@ -1743,7 +1833,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except (BadRequest, TypeError, ValueError) as exc:
             return err(400, str(exc))
         out: asyncio.Queue = asyncio.Queue()
+        ahead = queue.qsize()
         await queue.put((job, out))
+        lifecycle.queued(job["_reqid"], "/completion", queued_ahead=ahead, messages=0, images=0,
+                         stream=False)
         text, stats = "", {}
         while True:
             item = await out.get()
@@ -1811,7 +1904,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 if room < 1:
                     raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
                 max_tokens = min(max_tokens, room)
-            job = {"cache_salt": salt_of(body), "prompt_ids": prompt_ids, "ignore_eos": body.get("ignore_eos") is True,
+            job = {"_reqid": reqid(), "_queued_at": time.perf_counter(), "messages": 0,
+                   "cache_salt": salt_of(body), "prompt_ids": prompt_ids, "ignore_eos": body.get("ignore_eos") is True,
                    "logprobs": lp, "prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
                    "sampling": sampling_from(body, defaults), "cache_prompt": body.get("cache_prompt", True) is not False,
                    "loop_guard": body.get("loop_guard"), "cancel": asyncio.Event()}
@@ -1833,14 +1927,30 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return reason, serve_compat.usage(n_prompt, n_new, int(stats.get("cached_tokens") or 0))
 
         out: asyncio.Queue = asyncio.Queue()
+        job["_reqid"] = reqid()
+        job["_queued_at"] = queued_at = time.perf_counter()   # the wait a streaming client's comments count from
+        ahead = queue.qsize()
         await queue.put((job, out))
+        lifecycle.queued(job["_reqid"], "/v1/completions", queued_ahead=ahead,
+                         prompt_tokens=job.get("prompt_tokens"), messages=0, images=0,
+                         stream=bool(body.get("stream")))
 
-        async def pieces() -> AsyncIterator[str | dict]:
+        async def pieces(writer: StreamWriter | None = None, ping: ServePing | None = None,
+                         ping_at: float = 0.0) -> AsyncIterator[str | dict]:
             while True:
                 tr = request.transport
                 if tr is None or tr.is_closing():
                     job["cancel"].set()
+                    lifecycle.client_left("/v1/completions", "waiting", rid=job.get("_reqid"))
                     raise ConnectionResetError("client left")
+                if ping is not None:
+                    # A ':' comment while the engine works, checked before every poll: the only thing a
+                    # streaming client can see until the prompt (or a held-back tool call) is done.
+                    try:
+                        await ping.comment(writer, ping_at)
+                    except ConnectionResetError:
+                        job["cancel"].set()
+                        raise
                 try:
                     item = await asyncio.wait_for(out.get(), 1.0)
                 except asyncio.TimeoutError:
@@ -1855,27 +1965,36 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await response.prepare(request)
+            ping, ping_at = app["ping"].per_request(), queued_at
+            writer = lifecycle.stream_started(job["_reqid"], "/v1/completions", response,
+                                              prompt_tokens=job.get("prompt_tokens"))
             try:
-                stats, full = {}, ""
-                async for item in pieces():
+                stats, full, visible = {}, "", False
+                async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
                     elif not isinstance(item, Retract):
                         full += item
-                        await response.write(sse(chunk(item, None)))
+                        if not visible:
+                            visible = True
+                            lifecycle.first_content(job["_reqid"], queued_at)
+                        await writer.write(sse(chunk(item, None)))
                 reason, usage = reason_usage(stats, full)
-                await response.write(sse(chunk("", reason) | {"usage": usage}))
-                await response.write(b"data: [DONE]\n\n")
+                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                lifecycle.stream_done(job["_reqid"], int(stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 job["cancel"].set()
+                lifecycle.client_left("/v1/completions", "stream", rid=job["_reqid"])
             except asyncio.CancelledError:
                 job["cancel"].set()
                 raise
             except Exception as exc:                                  # noqa: BLE001
                 job["cancel"].set()
+                lifecycle.stream_error(job["_reqid"], exc)
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -1935,11 +2054,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
-    app.router.add_post("/v1/chat/completions", completions)
+    app.router.add_post("/v1/chat/completions", lifecycle.wrapped(completions))
     app.router.add_post("/apply-template", apply_template)
     app.router.add_post("/tokenize", tokenize)
-    app.router.add_post("/completion", completion)
-    app.router.add_post("/v1/completions", v1_completions)
+    app.router.add_post("/completion", lifecycle.wrapped(completion))
+    app.router.add_post("/v1/completions", lifecycle.wrapped(v1_completions))
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
@@ -2034,6 +2153,8 @@ def main() -> None:
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens)
+    print(f"qserve: {app['ping'].describe()}", flush=True)
+    print(f"qserve: {app['reqlog'].describe()}", flush=True)
 
     async def serve() -> None:
         runner = web.AppRunner(app)
