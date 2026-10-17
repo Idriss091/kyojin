@@ -37,6 +37,16 @@ MAX_DECODE_QLEN = 16
 _score_tile = int(os.environ.get("EXL3_DSA_SCORE_TILE", 32768))
 _kpool_eager_rows = int(os.environ.get("EXL3_DSA_KPOOL_EAGER_ROWS", 1024))  # 0 = one shot (old path)
 assert _score_tile % 256 == 0 and _score_tile > 0
+# Query rows per indexer slab in the k-pool prefill path (one score matrix + top-k per slab). Default 256.
+_score_slab = None      # None: read EXL3_DSA_PF_SLAB (default 256) per call
+# "running" (default): per-tile running top-k merge. "defer": keep each tile's candidates and take ONE top-k at the end
+# (same candidate set, a third of the glue launches at 4 tiles; ties among equal fp16 scores may order differently).
+_merge_mode = None      # None: read EXL3_DSA_PF_MERGE per call (a harness may set "running" / "defer")
+# EXL3_DSA_PF_SORT=1: the tiled selection (context > one score tile = 131072 tokens) hands the sparse attention its pools in
+# score-descending order, the single-tile one (dsa_topk output) in ascending order. 1 sorts the tiled result ascending too
+# (-1 padding last, default): same key set per row, gathers walk memory forward. The attention sums in list order, so results
+# differ from the unsorted order at fp rounding level, not in the key set.
+_sort_tiled = None      # None: read EXL3_DSA_PF_SORT per call (a harness may set True / False)
 
 # Decode/verify has few query rows.  When enabled, score the whole visible slab in one
 # call instead of running the per-tile top-k merge below.  Prefill remains tiled.
@@ -816,6 +826,43 @@ class MLAttention(Module):
         return indices
 
 
+    def warm_indexer_strides(self, cache, max_seq):
+        """
+        Compile, ahead of the first long request, the indexer-scoring kernels at every score-row
+        stride a decode/verify call can use beyond one tile. Decode (<= 8 rows) scores the whole
+        visible slab in one call once it outgrows the score tile, and that call rounds the row
+        stride up to a power of two, a kernel constexpr: the first decode at a new power of two
+        (131072 tokens for a 4-token pool, 262144, ...) paid a Triton compile (0.4-4 s, twice: the
+        few-row kernel and the query-tiled one a lookup round with > 4 rows takes) inside the
+        user's first round. Pure compile: the dummy scores are discarded, no model state is touched.
+        Returns the number of strides warmed.
+        """
+        if self.indexer_mode != "full":
+            return 0
+        from .attention_fn.dsa_triton import dsa_indexer_scores
+        layer = cache.layers[self.layer_idx, 0]
+        P = self.index_kpool or 1
+        plane = layer.get_pool() if self.index_kpool else layer.get_idx()
+        epp = plane.shape[1]
+        H_i, D_i = self.index_n_heads, self.index_head_dim
+        t_tile = max(epp, _score_tile // epp * epp)
+        max_entries = max_seq // P
+        dev = plane.device
+        flat = plane.view(-1, D_i)
+        n = 0
+        stride = 1 << (t_tile).bit_length()     # smallest power of two above one tile
+        while stride // 2 < max_entries:
+            bt = torch.zeros(stride // epp + 1, dtype = torch.int32, device = dev)
+            for R in (1, 5):
+                q = torch.zeros((R, H_i, D_i), dtype = torch.half, device = dev)
+                w = torch.zeros((R, H_i), dtype = torch.half, device = dev)
+                dsa_indexer_scores(q, w, flat, 0, P, stride, block_table = bt, epp = epp)
+            n += 1
+            stride *= 2
+        torch.cuda.synchronize(dev)
+        return n
+
+
     def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen):
         """
         Incrementally extend the pooled-key plane with the pools completed by this chunk's
@@ -898,8 +945,10 @@ class MLAttention(Module):
             # exactly the visible-complete-pool count
             wf = w  # raw head weights, scales folded in-kernel
             epp = pool_plane.shape[1]
-            slab = 256
-            t_tile = max(epp, _score_tile // epp * epp)
+            slab = _score_slab or int(os.environ.get("EXL3_DSA_PF_SLAB", "256"))
+            t_tile = max(epp, int(os.environ.get("EXL3_DSA_SCORE_TILE", _score_tile)) // epp * epp)
+            merge_defer = (_merge_mode or os.environ.get("EXL3_DSA_PF_MERGE", "running")) == "defer"
+            sort_tiled = _sort_tiled if _sort_tiled is not None else os.environ.get("EXL3_DSA_PF_SORT", "1") == "1"
             for b in range(bsz):
                 pools_b = (host_seqlens[b] + seqlen) // P
                 base_cols = 0
@@ -950,8 +999,10 @@ class MLAttention(Module):
                         pool_idx = pool_idx.gather(1, o)
                     else:
                         i_backing = g_tensor_cache.get(dev, (slab * kp_sel,), torch.int32, "dsa_itile")
+                        defer = merge_defer
                         run_scr = torch.full((rows, k_sel), -float("inf"), dtype = torch.half, device = dev)
                         run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
+                        cands_s, cands_i = ([run_scr], [run_idx]) if defer else (None, None)
                         for t0 in range(0, pools_slab, t_tile):
                             t1 = min(t0 + t_tile, pools_slab)
                             sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
@@ -962,12 +1013,23 @@ class MLAttention(Module):
                             t_scr = sc.gather(1, ti.clamp_min(0).long())
                             t_scr = t_scr.masked_fill(ti < 0, -float("inf"))
                             t_idx = torch.where(ti >= 0, ti + t0, ti)
+                            if defer:
+                                cands_s.append(t_scr)
+                                cands_i.append(t_idx)
+                                continue
                             cand_scr = torch.cat((run_scr, t_scr), dim = 1)
                             cand_idx = torch.cat((run_idx, t_idx), dim = 1)
                             run_scr, sel = cand_scr.topk(k_sel, dim = 1)
                             run_idx = cand_idx.gather(1, sel)
+                        if defer:
+                            run_scr, sel = torch.cat(cands_s, dim = 1).topk(k_sel, dim = 1)
+                            run_idx = torch.cat(cands_i, dim = 1).gather(1, sel)
                         pool_idx = torch.where(
                             run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
+                        if sort_tiled:
+                            big = torch.iinfo(torch.int32).max
+                            pool_idx = torch.where(pool_idx < 0, pool_idx.new_full((), big), pool_idx).sort(dim = 1).values
+                            pool_idx = torch.where(pool_idx == big, pool_idx.new_full((), -1), pool_idx)
 
                     # Expand pools to raw token indices (one kernel when set;
                     # single-slab only so the tail offset is this slab's expand width)

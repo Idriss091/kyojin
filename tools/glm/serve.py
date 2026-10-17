@@ -704,6 +704,10 @@ class ResidentEngine:
             import spec_policy
             spec_policy.install_lookup(g, lookup, self.lookup_stats)
             g.num_draft_tokens = self.num_draft     # the drafter's own depth; lookup rounds bring their K tokens
+        if os.environ.get("EXL3_ROUND_LOG"):   # opt-in per-round decode log (tools/glm/round_probe.py), off by default
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import round_probe
+            round_probe.install(g, os.environ["EXL3_ROUND_LOG"], self.lookup_stats)
         return g
 
     def _rebuild_generator(self) -> None:
@@ -1071,6 +1075,25 @@ def warmup(engine: Any, template: str, prompt_tokens: int = 4608, decode_tokens:
     t0 = time.perf_counter()
     asyncio.run(run())
     return time.perf_counter() - t0
+
+
+def warm_indexer(engine) -> int:
+    """Compile the DSA indexer scorer at the power-of-two score strides a decode round reaches beyond one 32K tile
+    (first decode past 131072 tokens paid two Triton compiles in the user's first round). See
+    MLAttention.warm_indexer_strides. One representative attention per distinct (heads, dim, pool, page) config."""
+    import torch
+    seen, n = set(), 0
+    for m in engine.model.modules:
+        attn = getattr(m, "attn", None)
+        if attn is None or not hasattr(attn, "warm_indexer_strides") or getattr(attn, "indexer_mode", None) != "full":
+            continue
+        key = (attn.index_n_heads, attn.index_head_dim, attn.index_kpool)
+        if key in seen:
+            continue
+        seen.add(key)
+        n += attn.warm_indexer_strides(engine.cache, engine.cache.max_num_tokens)
+    torch.cuda.synchronize()
+    return n
 
 
 def mem_line(stage: str) -> str:
@@ -2004,6 +2027,14 @@ def main() -> None:
             startup_health.stage("warm-up")
             print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
             print(mem_line("warm"), flush=True)
+            if os.environ.get("EXL3_WARM_INDEXER", "1") != "0":
+                t0 = time.perf_counter()
+                try:
+                    warmed = warm_indexer(engine)
+                except Exception as e:   # a warm-up is an optimisation: never keep the server from starting
+                    import traceback; traceback.print_exc()
+                    warmed = f"FAILED ({e!r})"
+                print(f"serve: indexer stride warm-up {warmed} stride(s) {time.perf_counter() - t0:.1f} s", flush=True)
             if engine.supports_vision:   # first tower pass pays kernel setup and allocator growth: not on the first user image
                 from PIL import Image
                 t0 = time.perf_counter()

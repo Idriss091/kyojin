@@ -870,8 +870,6 @@ class QSAIndexer(Module):
         bsz, seq = q.shape[:2]
         if indices is None:
             indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
-        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
-            .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):
             # Packed pages, dequantized online by the gather kernel
             qk, sk, qv, sv, kb, vb = layer.get_qkv()
@@ -897,6 +895,10 @@ class QSAIndexer(Module):
             n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
             o = qsa_prefill_q8(q_rows, qk, sk, qv, sv, indices, attn.sm_scale, block_table[0], n_used, page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        # Built only for the Triton fallback: the HIP paths above read block_table[0], and this copy is
+        # rows x pages x 4 B (33 MB per layer per 4096-row chunk at -c 524288) written for nothing
+        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
+            .reshape(bsz * seq, -1).contiguous()
         o = qsa_sparse_attend_rows(
             q_rows,
             k_arg, v_arg, indices, attn.sm_scale,

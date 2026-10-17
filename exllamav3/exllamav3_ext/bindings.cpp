@@ -459,6 +459,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scores"), py::arg("indices"), py::arg("k") = 512);
     m.def("dsa_topk_par", &dsa_topk_par, "dsa_topk_par",
           py::arg("scores"), py::arg("indices"), py::arg("k") = 512, py::arg("nb") = 0);
+    m.def("dsa_topk_gfx12_v2", &dsa_topk_gfx12_v2, "dsa_topk_gfx12_v2",
+          py::arg("scores"), py::arg("indices"), py::arg("k") = 512, py::arg("threads") = 512);
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
