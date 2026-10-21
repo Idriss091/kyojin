@@ -53,6 +53,8 @@ class FusedMoEHalf:
         if not hasattr(ext, "exl3_moe_fused_half"):
             return "extension has no exl3_moe_fused_half"
         gr, mlp = block.mlp_hc, block.mlp
+        if getattr(mlp, "tier", None) is not None:
+            return "tiered experts (expert store): the half-layer kernel bakes the expert pointers"
         if gr is None or mlp is None or block.mlp_norm is not None:
             return "needs mlp_hc, mlp and no mlp_norm"
         if not getattr(gr, "use_q8", False) or gr.hc_mult != 4:

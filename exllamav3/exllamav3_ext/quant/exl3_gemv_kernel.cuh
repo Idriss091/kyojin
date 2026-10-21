@@ -186,6 +186,23 @@ __device__ __forceinline__ void dq8_regs_2bits(uint32_t a, uint32_t b, int t_off
     decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+// Register form of dq8_aligned_1bit: a = predecessor word, b = own word of the 8-lane tile, t_offset = 8 * (group of 8 weights in the tile)
+template <int cb>
+__device__ __forceinline__ void dq8_regs_1bit(uint32_t a, uint32_t b, int t_offset, FragB& f0, FragB& f1)
+{
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    b = fshift(b, a, ((~t_offset) & 24));
+    w7 = b & 0xffff;
+    BFE16_IMM(w6, b, 1);
+    BFE16_IMM(w5, b, 2);
+    BFE16_IMM(w4, b, 3);
+    BFE16_IMM(w3, b, 4);
+    BFE16_IMM(w2, b, 5);
+    BFE16_IMM(w1, b, 6);
+    BFE16_IMM(w0, b, 7);
+    decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
 // Register form of dq8<3, cb, 4> with the per-lane funnel alignment precomputed
 template <int cb>
 __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, FragB& f0, FragB& f1)
@@ -216,8 +233,8 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
 #if defined(USE_ROCM) || defined(__HIPCC__)
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) :
-                  (bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6),
-                  "HIP GEMV supports integer 2..6 bpw and half-integer 1.5..3.5 bpw with MUL1");
+                  (bits >= 1 && bits <= 6),
+                  "HIP GEMV supports integer 1..6 bpw and half-integer 1.5..3.5 bpw with MUL1");
 #else
     static_assert(!HALF && (bits == 2 || bits == 3 || bits == 4),
                   "CUDA GEMV supports integer 2, 3 and 4 bpw only");
@@ -295,6 +312,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     const size_t slice_stride = (size_t) ntiles * TWORDS;   // uint32 per k-slice row
     const half2* A2 = (const half2*) A;
     const half2 hzero = __half2half2(__ushort_as_half(0));
+    // m == 1 reads its A operand with 128-bit loads (see assemble_a_frag_gfx115_m1); test the
+    // alignment once here so the k loop does not re-test a per-slice address.
+    const bool a_vec_ok = (MMODE == 0) && ((reinterpret_cast<uintptr_t>(A2) & 15) == 0);
 
     // A fragment row indices for this lane
     const int r0 = lane >> 2;
@@ -490,7 +510,15 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             // operand before the B tiles reuse the warp-private staging buffer.
             HipFp16x8 a_frag = assemble_a_frag_gfx12(a01, a23);
 #elif defined(EXL3_HIP_WMMA_GFX115)
-            HipFp16x16 a_frag = assemble_a_frag_gfx115(a01, a23);
+            // m == 1 (MMODE 0) has exactly one live A row and, in the gfx11.5 operand layout,
+            // one lane owns it whole, so the operand is read straight out of A instead of
+            // being gathered out of the warp-private staging buffer. Same bits, same WMMA,
+            // bit-identical result, and a quarter less LDS traffic on the decode path.
+            HipFp16x16 a_frag;
+            if constexpr (MMODE == 0)
+                a_frag = assemble_a_frag_gfx115_m1(A2, ks0 + i, a_vec_ok);
+            else
+                a_frag = assemble_a_frag_gfx115(a01, a23);
 #endif
 
             #pragma unroll
@@ -499,7 +527,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
                 const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                if constexpr (HALF || bits == 5 || bits == 6)
+                if constexpr (HALF || bits == 1 || bits == 5 || bits == 6)
                     dq_dispatch<bits, cb, HALF>(tp, lane * 8, f0, f1);
                 else if constexpr (bits == 4)
                     exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);

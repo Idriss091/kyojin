@@ -445,7 +445,11 @@ class Linear(Module):
         mcg = opt(".mcg", "cpu")
         mul1 = opt(".mul1", "cpu")
         bias = opt(".bias", self.device)
-        self.inner = LinearEXL3(
+        cls = LinearEXL3
+        if torch.device(self.device).type == "cpu":      # no CUDA kernels: dense reconstruction (quant/exl3_cpu.py)
+            from .quant.exl3_cpu import CpuLinearEXL3
+            cls = CpuLinearEXL3
+        self.inner = cls(
             self.config,
             self.in_features,
             self.out_features,

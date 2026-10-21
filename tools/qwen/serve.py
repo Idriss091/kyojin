@@ -852,7 +852,7 @@ class QwenEngine:
             kw.update(draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=self.ndt)
         elif pl:
             kw.update(ngram_match_min=pl[0], num_draft_tokens=pl[1])
-        # night1 1.6 hand-off port fix: the drafter-free plain lookup answers the Generator's n-gram slot itself
+        # the drafter-free plain lookup answers the Generator's n-gram slot itself
         # (install_plain_lookup replaces iterate_ngram_gen), so the built-in n-gram path and its BC_SAM binding are never
         # used. On a build without BC_SAM (this ROCm ext returns None for ext.BC_SAM(); the built-in path raises at
         # construction) that check must not block the plain lookup. Restore the exact descriptor afterwards.
@@ -919,9 +919,38 @@ class QwenEngine:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
 
+    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). Both run on the driver, generator idle.
+    async def disk_restore(self, ids) -> None:
+        """Before the request is enqueued: put a deeper resume point from the disk (an earlier run, an evicted prefix) back."""
+        pd = self.prefix_disk
+        try:
+            r = await self._post(lambda: None if self.generator.num_remaining_jobs() else pd.restore(ids))
+        except Exception as exc:                                        # noqa: BLE001 the disk never fails a request
+            print(f"qserve: prefix disk restore failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+        if r:
+            print(f"qserve: prefix disk restore resume_at={r['resume_at']} (ram {r['ram_at']}) pages={r['pages']} {r['ms']:.0f} ms",
+                  file=sys.stderr, flush=True)
+
+    async def disk_save(self) -> None:
+        """After a request: persist its prompt (new pages, checkpoints) with a background write."""
+        pd = getattr(self, "prefix_disk", None)
+        ids = getattr(self, "_disk_ids", None)
+        if pd is None or ids is None:
+            return
+        try:
+            r = await self._post(lambda: None if self.generator.num_remaining_jobs() else pd.save(ids))
+        except Exception as exc:                                        # noqa: BLE001
+            print(f"qserve: prefix disk save failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+        if r is not None:
+            self._disk_ids = None
+
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (page table, recurrent checkpoints, n-gram index): a fresh Generator, the path
         cache_prompt=false takes. The caller has drained the requests (cache_salt namespace change)."""
+        if getattr(self, "prefix_disk", None) is not None:
+            self.prefix_disk.clear()
         await self._post(self._build, self.spec_on)
         if self.slot_store is not None:
             self.slot_store.erase()
@@ -1158,6 +1187,9 @@ class QwenEngine:
             max_tokens = min(max_tokens, room)
         if self.slot_store is not None:
             self.slot_store.note_prompt(prompt, ids)
+        if getattr(self, "prefix_disk", None) is not None and cache_prompt and not embs:
+            await self.disk_restore(ids)
+            self._disk_ids = ids
         guard_on = loop_guard_default() if loop_guard is None else bool(loop_guard)
         budget = thinking_budget if reasoning_first else None
         close_id, close_seq = self._close_ids()
@@ -1524,6 +1556,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                           file=sys.stderr, flush=True)
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
+                    if getattr(engine, "prefix_disk", None) is not None:
+                        await engine.disk_save()    # the reply is out: the host copy of the new pages holds the lock, the write does not
             except Exception as exc:                                  # noqa: BLE001
                 lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)
@@ -2126,6 +2160,12 @@ def load_all(args: argparse.Namespace):
     from exllamav3.generator.slot_store import SlotStore
     engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                   args.slot_save_path, args.model_id)
+    from exllamav3.util.disk_store import env_dir
+    if env_dir():
+        from exllamav3.generator.prefix_disk import PagedPrefixDisk, weights_identity
+        engine.prefix_disk = PagedPrefixDisk(engine.slot_store, model_id=args.model_id, extra=weights_identity(args.model))
+        print(f"qserve: prefix disk {engine.prefix_disk.disk.dir} ({len(engine.prefix_disk.pages)} pages, "
+              f"{len(engine.prefix_disk.stashes)} checkpoints, cap {engine.prefix_disk.disk.cap >> 30} GiB)", flush=True)
     startup_health.stage("warm-up")
     with Heartbeat("warm-up (first decode steps)"):
         engine.warmup()

@@ -369,6 +369,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv_wmma_family", &exl3_gemv_wmma_family, "exl3_gemv_wmma_family");
     m.def("exl3_moe_fused_half", &exl3_moe_fused_half, "exl3_moe_fused_half");
     m.def("exl3_moe_valu_override", &exl3_moe_valu_override, "exl3_moe_valu_override");
+    m.def("exl3_moe_silu_mul_limit", &exl3_moe_silu_mul_limit, "exl3_moe_silu_mul_limit");
     m.def("exl3_moe_fused_supported", &exl3_moe_fused_supported, "exl3_moe_fused_supported");
     m.def("exl3_moe_fused_ws_offsets", &exl3_moe_fused_ws_offsets, "exl3_moe_fused_ws_offsets");
     m.def("exl3_moe_fused_grid", &exl3_moe_fused_grid, "exl3_moe_fused_grid");
@@ -381,6 +382,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_dec_gemv_multi", &exl3_dec_gemv_multi, "exl3_dec_gemv_multi",
           py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
           py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
+    m.def("exl3_dec_gemv_x", &exl3_dec_gemv_x, "exl3_dec_gemv_x",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false,
+          py::arg("x_job_stride") = 0, py::arg("strips_hint") = 0);
     m.def("exl3_dec_moe", &exl3_dec_moe, "exl3_dec_moe",
           py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
           py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
@@ -451,6 +456,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("down_out"), py::arg("expert_offsets"), py::arg("inverse_order"),
           py::arg("tiles"), py::arg("tile_count"),
           py::arg("act_limit") = 0.0, py::arg("mcg") = false, py::arg("addend") = py::none());
+    m.def("exl3_moe_prefill_wmma_mixed", &exl3_moe_prefill_wmma_mixed, "exl3_moe_prefill_wmma_mixed");
     m.def("exl3_moe_prefill_gemm_test", &exl3_moe_prefill_gemm_test, "exl3_moe_prefill_gemm_test");
     m.def("exl3_dense_mpw2", &exl3_dense_mpw2, "exl3_dense_mpw2");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,

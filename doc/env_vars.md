@@ -7,6 +7,24 @@ Boolean-ish variables treat `0` as off and any other value as on unless noted. C
 variables are read once (on first use) and cached; Python-side variables are read at import
 time. Either way, set them before loading a model.
 
+## Persistent prompt cache (GLM, Qwen, DS4.1 servers)
+
+Prompt-cache pages are written to the NVMe in the background, so a restarted server (or a session resumed the next day)
+only prefills the new tokens. Off unless a directory is set.
+
+### `EXL3_PREFIX_DISK_DIR` (default: empty = off)
+Root directory of the cache. One namespace per model and build; a page is reused only when its token hash and the
+model fingerprint match.
+
+### `EXL3_PREFIX_DISK_GB` (default: `30`)
+LRU byte cap for the whole root, all models together. The checkpoints of the first 8K tokens of each prompt are kept.
+
+### `EXL3_PREFIX_DISK_FLOOR_GB` (default: `60`)
+Free space that must remain on the volume after a write; writes are skipped below it.
+
+### `EXL3_PREFIX_DISK_MB_MIN` (default: `8000`)
+Write budget per minute, so long agent sessions do not hit the sustained-write slowdown of QLC drives.
+
 ## Attention
 
 ### `EXL3_BC_ATTN` (default: `1`)
@@ -913,7 +931,7 @@ latch the value at import.
 | `EXL3_HOST_LEAN` | `1` | Host-side decode trims: batched verify readback and reused staging buffers. Launches, draw order and numerics are unchanged. |
 | `EXL3_HOST_CUTS` | `1` | The rest of the host trims: cached staging buffers and early-outs on no-op work. Only active together with `EXL3_HOST_LEAN=1`. |
 | `EXL3_MOE_FUSED` | `1` | The fused MoE kernel. Ignored on a non-ROCm build. |
-| `EXL3_MOE_VALU` | `1` | Folds the gate-and-up GEMV into the grouped-MoE decode kernel. |
+| `EXL3_MOE_VALU` | `1` | The FDOT2 VALU decode matvec for K2/K4 experts instead of the WMMA body (bitwise-identical outputs). K=2 also defaults on without it; `0` forces the WMMA body everywhere. |
 | `EXL3_VERIFY_ATTN_LOOP` | `1` | Runs an R-row verify attention as the exact R single-row loop, which is what keeps a verify forward bit-identical. |
 | `EXL3_VERIFY_GEMV_R` | `1` | Runs the decode projections of an R-row verify as one multi-row GEMV instead of R single-row calls. |
 | `EXL3_GEMV_R_DEC1` | `1` | Decodes each weight pair once per verify forward and shares it across rows, instead of decoding it again per row. Bit-identical, and it needs `EXL3_GEMV_R_RM6`. |

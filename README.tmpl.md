@@ -35,6 +35,10 @@ One prompt each, written by the model running on Kyojin and published as it came
 
 These are first versions. Speed, context length and model support keep improving.
 
+## DeepSeek-V4.1-Flash
+
+DeepSeek-V4.1-Flash-1017 (763B parameters, about 16B active) runs on one 128 GB machine with an NVMe: the 172 GiB EXL3 pack is larger than memory, so the engine keeps a pool of experts in RAM and reads the others from the SSD, exactly. It uses the model's own DSpark draft stages and the original Engram tables (about 190 GB, downloaded from the DeepSeek repository). Pack: [yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz). Setup, SSD tier, Engram and speeds: [doc/DS41.md](doc/DS41.md).
+
 ## Contributors
 
 Thank you to everyone who tests Kyojin on their own machine and writes precise reports.

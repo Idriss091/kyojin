@@ -96,7 +96,7 @@ SPEED_ENV = {
     "EXL3_DSA_GLUE_FUSE": "1",
     # sparse (> index_topk 2048) DSA decode fast path: bsz >= 3 takes one batched call, bsz 1/2 stay
     # byte-identical; long-context decode +4.34 % (3/3 paired reps, N=8 homogeneous ~3.6K-token batch).
-    # Staged default: inert until the DSA rowloop knob reads it (mu1/dsa port). 0 = per-job calls.
+    # Staged default: inert until the DSA rowloop knob reads it. 0 = per-job calls.
     "EXL3_MU_DSA_ATTN_ROWLOOP_OFF_BSZ": "3",
     # 27/09: prefill mHC apply + next mix_norm fused; 16K 574.3 -> 579.8
     # (+0.95 +- 0.07 %), 4K +1.46 +- 0.48 % (n=10). Decode neutral. Needs the rebuilt ext.
@@ -730,8 +730,46 @@ class ResidentEngine:
             self._reply_first_fut = None
             await fut
 
+    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). Both run with the generator idle.
+    async def disk_restore(self, ids) -> None:
+        """Before the request is enqueued: put a deeper resume point from the disk (an earlier run, an evicted prefix) back."""
+        pd = self.prefix_disk
+        gen = self.greedy_generator
+        try:
+            if self.sessions > 1:
+                r = await self._post(lambda: None if gen.num_remaining_jobs() else pd.restore(ids))
+            else:
+                r = await asyncio.get_running_loop().run_in_executor(None, pd.restore, ids)
+        except Exception as exc:                                        # noqa: BLE001 the disk never fails a request
+            print(f"serve: prefix disk restore failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+        if r:
+            print(f"serve: prefix disk restore resume_at={r['resume_at']} (ram {r['ram_at']}) pages={r['pages']} {r['ms']:.0f} ms",
+                  flush=True)
+
+    async def disk_save(self) -> None:
+        """After a request: persist its prompt (new pages, checkpoints) with a background write."""
+        pd = getattr(self, "prefix_disk", None)
+        ids = getattr(self, "_disk_ids", None)
+        if pd is None or ids is None:
+            return
+        await self.settle_reply()                                      # the deferred release writes the prompt-end checkpoint
+        gen = self.greedy_generator
+        try:
+            if self.sessions > 1:
+                r = await self._post(lambda: None if gen.num_remaining_jobs() else pd.save(ids))
+            else:
+                r = await asyncio.get_running_loop().run_in_executor(None, pd.save, ids)
+        except Exception as exc:                                        # noqa: BLE001
+            print(f"serve: prefix disk save failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+        if r is not None:
+            self._disk_ids = None
+
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (cache_salt namespace change). The caller has drained the requests."""
+        if getattr(self, "prefix_disk", None) is not None:
+            self.prefix_disk.clear()
         await self.settle_reply()
         if self.sessions > 1:
             await self._post(self._rebuild_generator)    # on the driver, between two steps
@@ -877,6 +915,9 @@ class ResidentEngine:
         self.last_stats = {}
         if cancel is not None and cancel.is_set():
             return                          # the client left while the request was queued: no prefill
+        if getattr(self, "prefix_disk", None) is not None and not embs:
+            await self.disk_restore(ids)
+            self._disk_ids = ids
         kw = dict(sampler_kw if sampler_kw is not None else DEFAULT_SAMPLER_KW)  # rep_p / pres_p / dry_* (loop2)
         if temperature == 0:
             sampler = ComboSampler(temperature=0.0, **kw) if kw else GreedySampler()
@@ -1389,6 +1430,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     log_job_done(rid, body, request_stats, started)
                     out.put_nowait(None)
+                    if getattr(engine, "prefix_disk", None) is not None:
+                        await engine.disk_save()      # the reply is out: the host copy of the new pages holds the lock, the write does not
             except Exception as exc:
                 lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)
@@ -2056,6 +2099,12 @@ def main() -> None:
         from exllamav3.generator.slot_store import SlotStore
         engine.slot_store = SlotStore(engine.greedy_generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                       args.slot_save_path, args.model_id)
+        from exllamav3.util.disk_store import env_dir
+        if env_dir():
+            from exllamav3.generator.prefix_disk import PagedPrefixDisk, weights_identity
+            engine.prefix_disk = PagedPrefixDisk(engine.slot_store, model_id=args.model_id, extra=weights_identity(args.model))
+            print(f"serve: prefix disk {engine.prefix_disk.disk.dir} ({len(engine.prefix_disk.pages)} pages, "
+                  f"{len(engine.prefix_disk.stashes)} checkpoints, cap {engine.prefix_disk.disk.cap >> 30} GiB)", flush=True)
         if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             from rss_probe import install

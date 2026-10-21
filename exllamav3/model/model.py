@@ -493,6 +493,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Release all global shared tensors (refs still held by modules until model is unloaded)
         g_tensor_cache.drop_all()
 
+        # Tiered experts (EXL3_EXPERT_BUDGET_GIB): the layers only registered their experts while loading; allocate
+        # the slot pools now, after the cache and every other allocation of the load
+        _st = getattr(self.config, "_expert_store", None)
+        if _st is not None:
+            _st.finalize()
+
         # Mark every attached cache usable.
         for ref in self.cache_weakrefs.values():
             cache = ref()
