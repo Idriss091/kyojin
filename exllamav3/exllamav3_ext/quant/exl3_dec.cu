@@ -638,11 +638,14 @@ struct Job
     int block_base; // first block of this job
     int part_base;  // float offset into scratch
     int ctr_base;   // int offset into counters
+    int x_off;      // half offset of this job's input inside x (0: all jobs share x[0..K))
 };
+
+constexpr int MAXJ = 8;   // matrices per dense GEMV launch
 
 struct Jobs
 {
-    Job j[4];
+    Job j[MAXJ];
     int count;
     int K;
     int kbs;        // k blocks
@@ -669,7 +672,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
 
     int ji = 0;
     #pragma unroll
-    for (int i = 1; i < 4; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
+    for (int i = 1; i < MAXJ; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
     const Job& job = jobs.j[ji];
     const int local = blockIdx.x - job.block_base;
     const int strip = local / jobs.kbs;
@@ -679,7 +682,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
     k_split(jobs.K / 128, kb, jobs.kbs, k0, ktw);
 
     // Input rotation for this block's ktw * 128 input values
-    prologue_x(x, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
+    prologue_x(x + job.x_off, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
     __syncthreads();
     float xsum = 0.0f;
     for (int c = 0; c < ktw; ++c) xsum += s_xsum[c];
@@ -2128,23 +2131,31 @@ static void dec_gemv_impl
     const std::vector<double>& K,
     int64_t Kdim_strided,
     int64_t x_gstride,
-    bool mcg
+    bool mcg,
+    int64_t x_job_stride = 0,   // > 0: job i reads its own input x[i * x_job_stride ..), K = x_job_stride (x is [n, K])
+    int64_t strips_hint = 0     // > 0: pick ktw as if the launch had this many strips (the strips of ONE equivalent single call)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int n = trellis.size();
-    TORCH_CHECK(n >= 1 && n <= 4, "exl3_dec_gemv: 1..4 matrices");
+    TORCH_CHECK(n >= 1 && n <= MAXJ, "exl3_dec_gemv: 1..", MAXJ, " matrices");
+    TORCH_CHECK(n <= 4 || x_job_stride > 0 || strips_hint > 0, "exl3_dec_gemv: more than 4 matrices need x_job_stride or strips_hint");
     TORCH_CHECK(x.dtype() == at::kHalf && x.is_contiguous(), "exl3_dec_gemv: x must be contiguous fp16");
-    const int Kdim = x_gstride ? (int) Kdim_strided : (int) x.size(-1);
-    TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
-                          : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    const int Kdim = x_job_stride ? (int) x_job_stride : x_gstride ? (int) Kdim_strided : (int) x.size(-1);
+    if (x_job_stride) {
+        TORCH_CHECK(!x_gstride && x.numel() == (int64_t) n * x_job_stride, "exl3_dec_gemv: x must be fp16 [n, K] for per-job inputs");
+    } else {
+        TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
+                              : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    }
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv: K must be a multiple of 512");
     const int kb2 = kb2_of(K[0]);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += (out[i].size(-1) + STRIP - 1) / STRIP;
     const int min_blocks = env_int("EXL3_DEC_MIN_BLOCKS", 32);
     const int forced = env_int("EXL3_DEC_KTW", 0);
+    if (strips_hint > 0) strips_total = (int) strips_hint;
     const int ktw = pick_ktw(Kdim / 16, strips_total, ring_of_kb2(kb2), min_blocks, forced);
     Jobs jobs;
     jobs.count = n;
@@ -2173,6 +2184,7 @@ static void dec_gemv_impl
         j.block_base = blocks;
         j.part_base = part;
         j.ctr_base = ctr;
+        j.x_off = x_job_stride ? (int) (i * x_job_stride) : 0;
         blocks += j.strips * jobs.kbs;
         part += jobs.kbs * N;
         ctr += j.strips;
@@ -2200,6 +2212,24 @@ void exl3_dec_gemv_multi
 )
 {
     dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg);
+}
+
+void exl3_dec_gemv_x
+(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh,
+    const std::vector<at::Tensor>& svh,
+    const std::vector<at::Tensor>& out,
+    at::Tensor& scratch,
+    at::Tensor& counters,
+    const std::vector<double>& K,
+    bool mcg,
+    int64_t x_job_stride,
+    int64_t strips_hint
+)
+{
+    dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg, x_job_stride, strips_hint);
 }
 
 void exl3_dec_gemv
