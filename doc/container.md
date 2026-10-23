@@ -44,13 +44,13 @@ docker run --rm --name kyojin-qwen \
 
 The image has no `video` or `render` group by name, so docker needs the numeric ids of the host. With no `-e` at all the server starts with 131072 tokens of context, the sampling of the model card and the port 8731. The port opens when the model is loaded and warmed up; then `curl http://localhost:8731/v1/models` and `python tools/bench.py --base http://localhost:8731/v1` work from the host.
 
-Time to ready, measured on a Strix Halo machine with nothing else on the GPU, 131072 tokens of context:
+Time to ready, measured on a Strix Halo machine with nothing else on the GPU, 147456 tokens of context, Qwen without vision:
 
 | Start | 1.6 | 1.7 |
 |---|---|---|
 | Qwen pack, first start, empty cache | 493 s (kernels compiled, dense GEMM table tuned, both cached) | 67 s |
 | Qwen pack, second start, same cache | 84 s | 68 s |
-| GLM pack, first start, empty cache | 77 s, plus 28 s of kernel compiles inside the first request | 69 s, plus about 5 s of kernel compiles in the first requests |
+| GLM pack, first start, empty cache | 77 s, plus 28 s of kernel compiles inside the first request | 69 s, first requests without compiles (1.7.1; 1.7.0 still compiled about 5 s) |
 | GLM pack, second start, same cache | 70 s | 67 s |
 
 The Triton kernels and the dense GEMM tune table now ship with the code (see `EXL3_KERNEL_SEED`), so an empty cache no longer costs a compile or a tuning run. A restart with warm caches still reads the whole pack from the disk, so it is bound by the disk speed (about 2 GB/s: 45 to 65 s for a 72 to 89 GB pack). The MiMo image is not part of these figures: first start 130 s (1.5).
