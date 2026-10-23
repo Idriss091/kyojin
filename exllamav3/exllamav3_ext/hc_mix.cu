@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include "hc_mix.cuh"
+#include "port.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -2093,7 +2094,7 @@ __device__ __forceinline__ void unpack_s8x4(uint32_t v, float& f0, float& f1, fl
 // The product must be rounded to fp32 BEFORE the half rounding (the fp16 twin sees half(fp32(q * sc))); without the barrier the compiler
 // fuses mul + convert into one v_fma_mix and rounds once (differs on exact half ties).
 #ifndef GS_NOFUSE
-#define GS_NOFUSE(p) asm volatile("" : "+v"(p))
+#define GS_NOFUSE(p) asm volatile("" : "+" PORT_ASM_F32(p))
 #endif
 __device__ __forceinline__ float gs_dq(float q, float sc) { float p = q * sc; GS_NOFUSE(p); return __half2float(__float2half_rn(p)); }
 __device__ __forceinline__ void gs_unpack_s8x4(uint32_t v, float sc, float& f0, float& f1, float& f2, float& f3)

@@ -892,6 +892,17 @@ class VllmCompatTests(unittest.TestCase):
             self.assertEqual(body["usage"]["prompt_tokens_details"], {"cached_tokens": 4})   # engine said 99: clamped
             self.assertEqual((body["choices"][0]["text"], body["choices"][0]["finish_reason"]), ("abc", "length"))
 
+    def test_loop_guard_opt_out_reaches_the_engine(self):
+        # per-request loop_guard=false (as on the Qwen server): passed to generate(); absent when the request says nothing
+        eng = self.Eng()
+        for path, payload in (("/v1/completions", {"model": "m", "prompt": [1, 2], "max_tokens": 4}),
+                              ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4})):
+            self.assertEqual(self.one(eng, path, payload)[0], 200, path)
+            self.assertNotIn("loop_guard", eng.calls[-1][1])
+            self.assertEqual(self.one(eng, path, payload | {"loop_guard": False})[0], 200, path)
+            self.assertIs(eng.calls[-1][1]["loop_guard"], False)
+            self.assertEqual(self.one(eng, path, payload | {"loop_guard": "no"})[0], 400, path)
+
     def test_stream_ends_with_usage_and_done(self):
         eng = self.Eng()
         st, raw = self.one(eng, "/v1/completions", {"model": "m", "prompt": [1, 2, 3], "max_tokens": 8, "stream": True,

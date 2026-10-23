@@ -18,7 +18,10 @@ DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # (mlp.py). Rows stay bit-exact vs R batch-1 dec_gemv calls (the R=1 plain-decode math). R=1 untouched.
 # Mutable at run time for one-load A/B: set VERIFY_FUSE["on"] (the harness also calls block_graph.purge()).
 VERIFY_FUSE = {"on": os.environ.get("EXL3_VERIFY_FUSE", "0") != "0"}
-AUTO_RECONSTRUCT_THRESHOLD = 144
+# With the 32-row GEMM tile (EXL3_GEMM_SHAPE_5) the GEMM path beats reconstruct + hgemm up to ~192-256
+# rows on Ampere (Qwen3.8-27B TTFT 160 / 192 tokens 278 -> 238 / 320 -> 279 ms; at 256 reconstruct wins 344 vs 362 ms).
+# Without that patch 144 is right (16-row passes: threshold 512 is slower at every T > 144).
+AUTO_RECONSTRUCT_THRESHOLD = 192 if not torch.version.hip else 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
@@ -355,7 +358,10 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] / 16
+        # Integral K stays an int (the CUDA BC objects and kernels take int K); half-integer K stays a float.
+        # Same rule as upstream exllamav3 1.6.0 (MIT, modules/quant/exl3.py:68).
+        K = trellis.shape[-1] / 16
+        self.K = int(K) if float(K).is_integer() else K
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -372,6 +378,7 @@ class LinearEXL3:
         self.dec_ok = dec_supported(self)
         self.dec_ok_moe = dec_moe_supported(self)
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        # The CUDA BC object takes an integer K; half-integer K tensors keep the Python path
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
@@ -381,7 +388,7 @@ class LinearEXL3:
             self.mcg,
             self.mul1,
             g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        ) if isinstance(self.K, int) else None
 
 
     def unload(self):

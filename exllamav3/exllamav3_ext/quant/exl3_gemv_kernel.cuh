@@ -373,6 +373,25 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+#if !defined(USE_ROCM) && !defined(__HIPCC__) && !defined(EXL3_HIP_A_RING)
+        // Running pointers instead of per-slice 64-bit index math (same addresses, same loads):
+        // bq = next B slice row to prefetch, aq0 / aq1 = A fragment rows of the slice being consumed
+        const uint32_t* bq = bp;
+        // m = 1: every lane reads row 0 (rows 1..7 of the A fragment become copies of row 0; their C rows are never stored,
+        // HMMA rows are independent, so row 0 is unchanged and no select / predicate is needed)
+        const half2* aq0 = A2 + (MMODE == 0 ? 0 : a_row0) + (size_t) ks0 * 8 + (lane & 3);
+        const half2* aq1 = A2 + a_row1 + (size_t) ks0 * 8 + (lane & 3);
+        auto ld_bq = [&] (int l) -> uint32_t
+        {
+            if constexpr (bits == 3)
+                return lane < 24 ? __ldcs(bq + l * LSTRIDE) : 0;
+            else
+                return __ldcs(bq + l * LSTRIDE);
+        };
+        #define EXL3_GEMV_RUNPTR 1
+#else
+        #define EXL3_GEMV_RUNPTR 0
+#endif
 
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
@@ -395,9 +414,18 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         #pragma unroll
         for (int d = 0; d < PF; ++d)
             if (d < myn)
+            {
+#if EXL3_GEMV_RUNPTR
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_bq(l);
+                bq += slice_stride;
+#else
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(d, l);
+#endif
+            }
 
 #if defined(EXL3_HIP_A_RING)
         // A fragment prefetch ring, same depth as B. Without it every k-slice issues its A loads
@@ -448,9 +476,16 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #if !defined(EXL3_HIP_PF_AFTER_STAGE)
             if (i + PF < myn)
             {
+#if EXL3_GEMV_RUNPTR
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_bq(l);
+                bq += slice_stride;
+#else
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(i + PF, l);
+#endif
 #if defined(EXL3_HIP_A_RING)
                 ld_a(i + PF, pa01[d], pa23[d]);
 #endif
@@ -497,12 +532,28 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
 #if !defined(EXL3_HIP_A_RING)
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
-            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             FragB a01, a23;
+#if EXL3_GEMV_RUNPTR
+            if constexpr (MMODE == 0)
+            {
+                a01[0] = __ldg(aq0);
+                a23[0] = __ldg(aq0 + 4);
+            }
+            else
+            {
+                a01[0] = r0_ok ? aq0[0] : hzero;
+                a23[0] = r0_ok ? aq0[4] : hzero;
+            }
+            a01[1] = r1_ok ? aq1[0] : hzero;
+            a23[1] = r1_ok ? aq1[4] : hzero;
+            aq0 += 8; aq1 += 8;
+#else
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
             a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
             a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
+#endif
 #endif
 
 #if defined(EXL3_HIP_WMMA_GFX12)
@@ -600,6 +651,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         }
         }
 
+        #undef EXL3_GEMV_RUNPTR
 #if defined(USE_ROCM) || defined(__HIPCC__)
         // Cross-warp reduction over the k splits, HIP C-fragment layout (oracle-verified):
         //   C(lane, reg) = C[row = (lane>>4)*8 + reg][col = lane & 15]

@@ -25,6 +25,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
@@ -115,6 +116,16 @@ SPEED_ENV = {
     # side-writes the state where those pages end, so the next one resumes there: first token after a shared 9K / 12.1K prefix
     # 2.41 -> 1.94 s, 3.84 -> 2.06 s; the writing prompt is bitwise unchanged, KLD vs a cold prefill at the resumed-turn level.
     "EXL3_BRANCH_CKPT": "1",
+    # prompt-tail recurrent checkpoints on the last 7 page boundaries before the prompt end: a re-sent prefix whose last page
+    # checkpoint lies after the divergence resumes within one page of it. 89.6K prompt, new question at the end: 6.0 -> 1.7 s,
+    # 1539 -> 259 rows replayed (one forward pass); about +0.4 GiB host memory, flat over 20 turns. A resume replays a different
+    # number of rows than a cold prefill and the GEMM path depends on the row count, so the output is not yet bit-identical to a
+    # cold prefill; the fix is in progress. Off on GLM until then (the Qwen preset has it on).
+    "EXL3_TAIL_DENSE": "0",
+    # sub-page prompt-tail checkpoints on the last 4 multiples of 64 rows: a prompt that diverges in its final tokens replays
+    # about 65 rows instead of up to a page (89.6K prompt, new question at the end: 1.7 -> 0.8 s first token); at most
+    # EXL3_TAIL_SUB_MAX (8) entries of 142 MiB host memory. Same numerics caveat as the dense checkpoints; off.
+    "EXL3_TAIL_SUB": "0",
     # such a resume (page-aligned, off the 2048 chunk grid) with a short remainder keeps the tail in its one chunk (prompt-end tail
     # checkpoint) instead of a separate last-page forward: 2.00 -> 1.42 s, 2.44 -> 1.51 s; KLD vs a cold prefill unchanged in class.
     "EXL3_TAIL_OFFGRID": "1",
@@ -474,6 +485,24 @@ def parse_completion(text: str) -> dict[str, Any]:
     return message
 
 
+def token_count(event: dict) -> int:
+    t = event.get("token_ids")
+    return int(t.numel()) if t is not None else 0
+
+
+def guard_hit(tap, event: dict) -> dict | None:
+    """Feed one generator event to the answer-phase guard; the hit dict when the answer loops."""
+    if tap is None or event.get("eos"):
+        return None
+    t = event.get("token_ids")
+    return tap.feed(t.flatten().tolist() if t is not None and t.numel() else [], event.get("text") or "")
+
+
+def guard_stats(hit: dict, n_new: int) -> dict:
+    """The end-of-job report of a request the guard stopped (the job was cancelled, so it has no eos event)."""
+    return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
+
+
 def opens_thinking(prompt: str) -> bool:
     """The GLM generation prompt ends in <think>, so the model output starts inside the block."""
     return prompt.rstrip().endswith("<think>")
@@ -649,6 +678,9 @@ class ResidentEngine:
         self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history, max_batch_size=slots)
+        from exllamav3.util import jit_log, kernel_seed
+        kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
+        jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
         self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
@@ -876,7 +908,8 @@ class ResidentEngine:
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
                        cancel: asyncio.Event | None = None,
                        images: list | None = None, stats: dict | None = None, img_stats: dict | None = None,
-                       prompt_ids: list[int] | None = None, ignore_eos: bool = False) -> AsyncIterator[str]:
+                       prompt_ids: list[int] | None = None, ignore_eos: bool = False,
+                       loop_guard: bool | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. With sessions == 1 the caller serializes access to this method; with
         sessions > 1 several calls may run at once and the final stats of a request land in `stats`.
 
@@ -928,10 +961,13 @@ class ResidentEngine:
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
                        stop_conditions=conditions, embeddings=embs or None)
         if self.sessions > 1:
-            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe):
+            async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe, prompt, ignore_eos, loop_guard):
                 yield piece
             return
         loop = asyncio.get_running_loop()
+        guard_on = loop_guard_default() if loop_guard is None else bool(loop_guard)   # loop_guard=False in the request turns it off
+        tap = AnswerTap(opens_thinking(prompt)) if guard_on and not ignore_eos else None
+        seen = 0                            # tokens streamed so far, for the guard stop report
         generator.enqueue(job)
         try:
             while generator.num_remaining_jobs():
@@ -945,6 +981,13 @@ class ResidentEngine:
                     text = event.get("text", "")
                     if text:
                         yield text
+                    hit = guard_hit(tap, event)
+                    if hit is not None and not event.get("eos"):
+                        generator.cancel(job)
+                        seen += token_count(event)
+                        self.last_stats = guard_stats(hit, seen)
+                        return
+                    seen += token_count(event)
                     if event.get("eos"):
                         self.last_stats = event
                         if probe is not None:
@@ -1054,11 +1097,15 @@ class ResidentEngine:
                 if q is not None:      # None: cancelled after the step started
                     q.put_nowait(evs)
 
-    async def _run_shared(self, job, ids, cancel, stats: dict, t0: float, probe) -> AsyncIterator[str]:
+    async def _run_shared(self, job, ids, cancel, stats: dict, t0: float, probe, prompt: str = "", ignore_eos: bool = False,
+                          loop_guard: bool | None = None) -> AsyncIterator[str]:
         """One request's job in the shared Generator: enqueue on the driver, stream its events, and (whatever way this
         ends) remove the job, so no leftover job runs inside another request."""
         q: asyncio.Queue = asyncio.Queue()
         generator = self.greedy_generator
+        guard_on = loop_guard_default() if loop_guard is None else bool(loop_guard)
+        tap = AnswerTap(opens_thinking(prompt)) if guard_on and not ignore_eos else None
+        seen = 0
 
         def enqueue():
             self._routes[generator.enqueue(job)] = q   # on the driver: no step can emit before the route exists
@@ -1079,6 +1126,12 @@ class ResidentEngine:
                     text = event.get("text", "")
                     if text:
                         yield text
+                    hit = guard_hit(tap, event)
+                    if hit is not None and not event.get("eos"):
+                        stats.update(guard_stats(hit, seen + token_count(event)))
+                        self.last_stats = stats
+                        return                  # the finally block cancels the job
+                    seen += token_count(event)
                     if event.get("eos"):
                         stats.update(event)
                         self.last_stats = stats
@@ -1414,6 +1467,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                             **({"images": body["_images"]} if body.get("_images") else {}),
                             **({"prompt_ids": body["_prompt_ids"]} if body.get("_prompt_ids") is not None else {}),
                             **({"ignore_eos": True} if body.get("_ignore_eos") else {}),
+                            **({"loop_guard": body["_loop_guard"]} if body.get("_loop_guard") is not None else {}),
                             **({"stats": request_stats} if sessions > 1 else {})):
                             if not first_token:
                                 first_token = True
@@ -1512,6 +1566,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise web.HTTPBadRequest(reason="messages must be a non-empty array")
             if "stream" in body and not isinstance(body["stream"], bool):
                 raise web.HTTPBadRequest(reason="stream must be boolean")
+            if body.get("loop_guard") is not None and not isinstance(body["loop_guard"], bool):
+                raise web.HTTPBadRequest(reason="loop_guard must be boolean")
+            body["_loop_guard"] = body.get("loop_guard")   # False: this request runs without the answer-phase loop guard
             stops = body.get("stop", [])
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             urls = extract_images(body["messages"])
@@ -1571,7 +1628,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
             finish = message.pop("finish_reason", "stop")
-            if finish == "stop" and engine.count_tokens(raw) >= token_limit(body):
+            if finish == "stop" and (request_stats.get("eos_reason") == "loop_guard"
+                                     or engine.count_tokens(raw) >= token_limit(body)):
                 finish = "length"
             return finish
 
@@ -1584,7 +1642,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
                     "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
                     "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                    "predicted_per_second": n / gen if gen else 0.0}
+                    "predicted_per_second": n / gen if gen else 0.0,
+                    **({"loop_guard": st["loop_guard"]} if st.get("loop_guard") else {})}
 
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -1630,8 +1689,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 if "tool_calls" in message:
                     for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
                         await writer.write(sse(event({"tool_calls": [dict(call, index=n)]})))
-                await writer.write(sse(event({}, finish_for(message, text[len(prefix):])) |
-                                         {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
+                final = event({}, finish_for(message, text[len(prefix):])) | {"usage": usage(text[len(prefix):]), "timings": timings(text)}
+                if request_stats.get("eos_reason") == "loop_guard":
+                    final["choices"][0]["stop_reason"] = "loop_guard"
+                await writer.write(sse(final))
                 await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
                 lifecycle.stream_done(body["_reqid"], int(request_stats.get("new_tokens") or 0))
@@ -1668,10 +1729,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         text, _ = stop_text(prefix + raw, body["_stop"])
         message = parse_completion(text)
         finish = finish_for(message, text[len(prefix):])
-        return web.json_response({
+        payload = {
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": usage(text[len(prefix):]), "timings": timings(text)})
+            "usage": usage(text[len(prefix):]), "timings": timings(text)}
+        if request_stats.get("eos_reason") == "loop_guard":
+            payload["choices"][0]["stop_reason"] = "loop_guard"
+        return web.json_response(payload)
 
     async def apply_template(request: web.Request) -> web.Response:
         """llama.cpp's POST /apply-template: render the chat template, generate nothing.
@@ -1801,7 +1865,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     raise web.HTTPBadRequest(reason="prompt must be a non-empty string or a list of token ids (one prompt per request)")
             if body.get("n") not in (None, 1) or body.get("echo") or body.get("best_of") not in (None, 1):
                 raise web.HTTPBadRequest(reason="n, best_of and echo are not supported")
-            for key in ("stream", "ignore_eos"):
+            for key in ("stream", "ignore_eos", "loop_guard"):
                 if body.get(key) is not None and not isinstance(body[key], bool):
                     raise web.HTTPBadRequest(reason=f"{key} must be boolean")
             max_tokens = 16 if body.get("max_tokens") is None else body["max_tokens"]
@@ -1813,6 +1877,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise web.HTTPBadRequest(reason="stop must be a string or a list of strings")
             prompt_tokens = len(prompt_ids) if prompt_ids is not None else engine.count_tokens(prompt)
             job = {"_prompt": prompt, "_prompt_ids": prompt_ids, "_ignore_eos": body.get("ignore_eos") is True,
+                   "_loop_guard": body.get("loop_guard"),
                    "max_tokens": max_tokens, "_room": reply_room(engine, prompt_tokens), "_stop": list(stops),
                    "temperature": float(SERVE_DEFAULTS["temperature"] if body.get("temperature") is None else body["temperature"]),
                    "top_p": float(SERVE_DEFAULTS["top_p"] if body.get("top_p") is None else body["top_p"]),
@@ -1838,7 +1903,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         def finish_and_usage(text: str, stopped: str | None) -> tuple[str, dict[str, Any]]:
             n_new = int(request_stats.get("new_tokens") or engine.count_tokens(text))
-            reason = "length" if stopped is None and (request_stats.get("eos_reason") == "max_new_tokens" or n_new >= limit) else "stop"
+            reason = "length" if stopped is None and (request_stats.get("eos_reason") in ("max_new_tokens", "loop_guard") or n_new >= limit) else "stop"
             return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0))
 
         hold = max((len(x) for x in job["_stop"]), default=1) - 1
@@ -1871,7 +1936,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 if len(text) > sent:
                     await writer.write(sse(chunk(text[sent:], None)))
                 reason, usage = finish_and_usage(text, stopped)
-                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                last = chunk("", reason) | {"usage": usage}
+                if request_stats.get("eos_reason") == "loop_guard":
+                    last["choices"][0]["stop_reason"] = "loop_guard"
+                    last["timings"] = {"loop_guard": request_stats.get("loop_guard")}
+                await writer.write(sse(last))
                 await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
                 lifecycle.stream_done(job["_reqid"], int(request_stats.get("new_tokens") or 0))
@@ -1904,7 +1973,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             raise
         text, stopped = stop_text(raw, job["_stop"])
         reason, usage = finish_and_usage(text, stopped)
-        return web.json_response(chunk(text, reason) | {"usage": usage})
+        out_ = chunk(text, reason) | {"usage": usage}
+        if request_stats.get("eos_reason") == "loop_guard":
+            out_["choices"][0]["stop_reason"] = "loop_guard"
+            out_["timings"] = {"loop_guard": request_stats.get("loop_guard")}
+        return web.json_response(out_)
 
     async def slots(_: web.Request) -> web.Response:
         return web.json_response(engine.slot_store.slots())
@@ -2025,6 +2098,9 @@ def main() -> None:
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
               file=sys.stderr, flush=True)
+    if os.environ.get("EXL3_SCHED_CHUNK_IL", "0") == "1":
+        # chunked-prefill interleave (exllamav3/generator/chunk_il.py): needs another request running beside the big prefill
+        print("serve: chunk_il ON " + ("" if args.sessions > 1 else "(no effect: needs --sessions >= 2)"), file=sys.stderr, flush=True)
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))

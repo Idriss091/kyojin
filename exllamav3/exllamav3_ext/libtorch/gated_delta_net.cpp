@@ -348,7 +348,7 @@ void BC_GatedDeltaNetSplit::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->disabled || graph_outer_capture(stream) || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, recurrent_base, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
@@ -580,7 +580,7 @@ void BC_Mamba2::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_Mamba2::run_bszN: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->disabled || graph_outer_capture(stream) || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;

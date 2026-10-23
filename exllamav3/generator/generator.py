@@ -19,6 +19,7 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from . import chunk_il
 from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 # EXL3_REPLY_FIRST=1 (default off): a job that finishes inside iterate() is released (deallocate_pages: reply-end tail
 # stash, draft flush, page / slot release) by flush_deferred() AFTER its last results are returned, not before. The server calls it
@@ -27,6 +28,8 @@ from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 _REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
 from . import spec_sample
 from .filter import Filter
+from .row_groups import plan_groups, group_rows_cap, GROUPS as ROW_GROUPS
+from ..util.row_inv import ROW_INV
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
@@ -260,6 +263,9 @@ class Generator:
         if max_chunk_size > 65535:
             raise ValueError(f"prefill chunk of {max_chunk_size} rows is not supported: a forward is limited to 65535 rows (mixer kernel grid.y); lower EXL3_PREFILL_CHUNK / max_chunk_size")
         self.max_chunk_size = max_chunk_size
+        # Constructed chunk size: a caller that lowers max_chunk_size at runtime (decode-priority prefill while other
+        # jobs decode, e.g. a serving loop) gets exactly that chunk; adaptive big chunks apply only at this size
+        self.base_chunk_size = max_chunk_size
 
         # Job queues
         self.job_serial = 0
@@ -309,6 +315,11 @@ class Generator:
         # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
         self.tail_ckpts = []
         self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8")) if tail_ckpt is None else int(tail_ckpt)
+        # Sub-page prompt-tail checkpoints (EXL3_TAIL_SUB, see Job.sub_ckpt_rows): same entry format as tail_ckpts, kept in
+        # their own list so a long prompt's several entries never push the exact prompt-end checkpoints out. Host memory
+        # bound = sub_ckpt_max x one checkpoint (142 MiB on the KDA model, 75 MiB on the GDN one), oldest dropped first
+        self.sub_ckpts = []
+        self.sub_ckpt_max = max(0, int(os.environ.get("EXL3_TAIL_SUB_MAX", "8")))   # 0 = keep no sub-page entry
         # prompts shorter than this never stash (the stash is 20-40 ms of host copy and 142 MiB per entry)
         self.tail_ckpt_min = int(os.environ.get("EXL3_TAIL_MIN", "512"))
 
@@ -355,6 +366,23 @@ class Generator:
         self.lazy_dkv = os.environ.get("EXL3_LAZY_DKV", "1") == "1"
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+
+    def wide_prefill_chunks(self) -> tuple[bool, bool]:
+        """(attention-only state, fused MoE). attention-only: the recurrent layers are all sliding-window attention rings
+        (no GDN / KDA state, whose checkpoint cadence the chunk plan protects). fused MoE: CUDA block-sparse MoE layers
+        with the fused prefill kernel, which gets more rows per expert from wider chunks."""
+        v = getattr(self, "_wide_prefill_chunks", None)
+        if v is None:
+            from ..modules.block_sparse_mlp import BlockSparseMLP
+            from ..modules.sliding_attn import SlidingAttention
+            swa_only = all(isinstance(m, SlidingAttention) for m in self.model.get_recurrent_layers())
+            moe = not torch.version.hip and any(
+                isinstance(m, BlockSparseMLP) and getattr(m, "fused_mode_buffers", None) is not None
+                for m in self.model
+            )
+            v = self._wide_prefill_chunks = (swa_only, moe)
+        return v
 
 
     def num_remaining_jobs(self):
@@ -557,6 +585,79 @@ class Generator:
             _moe_fused_check(self.model)
         return results
 
+    def _cil_views(self) -> list:
+        views = []
+        for job in self.active_jobs:
+            seq = job.sequences[0]
+            done = job.is_prefill_done()
+            cur = max(seq.kv_position, job.cached_pages * PAGE_SIZE)
+            if not done and job.time_first_prefill is None:
+                # no step has run yet: the first one may jump to a tail checkpoint (Job._tail_restore), so a follow-up turn on a
+                # long cached conversation is SHORT, not "big". Peeked once per job (read-only), else it would be parked for good.
+                peek = getattr(job, "_cil_peek", None)
+                if peek is None:
+                    try:
+                        peek = job._tail_peek(seq)
+                    except Exception:                                    # noqa: BLE001
+                        peek = 0
+                    job._cil_peek = peek
+                cur = max(cur, peek)
+            left = 0 if done else max(len(seq.sequence_ids) - 1 - cur, 0)
+            views.append(chunk_il.View(id(job), job.serial_number, left, done,
+                                       0 if done else min(left, self.max_chunk_size), seq.kv_position))
+        return views
+
+    def _cil_parked(self) -> list:
+        """
+        EXL3_SCHED_CHUNK_IL=1: chunked-prefill interleave (chunk_il.ChunkPlanner). Returns the jobs that skip their prefill chunk
+        this step (sets job._cil_skip for the speculation policy, which counts only unparked jobs). Any planner
+        error switches the interleave off for the process (one warning) and serves as without the flag.
+        """
+        for job in self.active_jobs:
+            job._cil_skip = False
+            job._cil_hold = False
+        if getattr(self, "_cil_broken", False) or len(self.active_jobs) < 2:
+            self._cil_plan = None
+            if getattr(self, "_cil", None) is not None:
+                self._cil.solo()                                         # these steps are not interleave time
+            return []
+        try:
+            if getattr(self, "_cil", None) is None:
+                self._cil = chunk_il.ChunkPlanner()
+            views = self._cil_views()
+            self._cil_plan = self._cil.plan_prefill(views)
+            parked = [j for j in self.active_jobs if id(j) in self._cil_plan.parked and not j.is_prefill_done()]
+        except Exception as e:                                           # noqa: BLE001
+            logging.warning("EXL3_SCHED_CHUNK_IL disabled (%r); serving without it", e)
+            self._cil_broken, self._cil_plan = True, None
+            return []
+        for job in parked:
+            job._cil_skip = True
+        return parked
+
+    def _cil_hold(self) -> None:
+        """Generation round: decode-ready jobs the plan holds this step read as not prefill-done (Job._cil_hold), which every
+        draft/verify/sample loop already skips. Undone by _cil_release() at the end of iterate()."""
+        plan = getattr(self, "_cil_plan", None)
+        if plan is None or plan.mode is None or not chunk_il.chunk_il_enabled():
+            return
+        try:
+            held = self._cil.plan_decode(self._cil_views(), plan)
+        except Exception as e:                                           # noqa: BLE001
+            logging.warning("EXL3_SCHED_CHUNK_IL disabled (%r); serving without it", e)
+            self._cil_broken, self._cil_plan = True, None
+            return
+        for job in self.active_jobs:
+            if id(job) in held:
+                job._cil_hold = True
+                job._cil_skip = True
+
+    def _cil_release(self) -> None:
+        if getattr(self, "_cil_plan", None) is None:
+            return
+        for job in self.active_jobs:
+            job._cil_hold = False
+
     def _iterate_inner(self) -> list[dict]:
         """
         Performs inference on available jobs.
@@ -644,7 +745,10 @@ class Generator:
 
         # Perform one round of prefill
         _t0 = _ttrace_begin()
+        parked = self._cil_parked() if chunk_il.chunk_il_enabled() else ()
         for job in list(self.active_jobs):
+            if job in parked:
+                continue
             try:
                 job.prefill(results)
             except Exception as e:
@@ -658,6 +762,7 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
         _ttrace_end("recurrent_checkpoint", _t0)
+        self._cil_hold()
         _t0 = _ttrace_begin()
 
         # Generation with draft model
@@ -691,6 +796,7 @@ class Generator:
             self.update_visualizer()
 
         # Finished iteration
+        self._cil_release()
         return results
 
 
@@ -830,6 +936,7 @@ class Generator:
     def clear_prompt_ckpts(self):
         """Drop every prompt-end recurrent checkpoint (host memory, ~142 MiB each)."""
         self.tail_ckpts.clear()
+        self.sub_ckpts.clear()
 
 
     def _flush_mtp_defer(self, job, with_tail: bool):
@@ -1267,6 +1374,47 @@ class Generator:
         return buf[:rows]
 
 
+    def _row_groups(self, batch_jobs: list, width: int) -> list[tuple[int, int]]:
+        """Job ranges of the forwards that carry one multi-job decode step (see row_groups.py). Every range holds at
+        most the exact-path row count, so each row gets the bits it would get decoded alone."""
+        return plan_groups([len(job.sequences) for job in batch_jobs], width, group_rows_cap())
+
+    def _forward_groups(self, batch_ids: torch.Tensor, params: dict, batch_jobs: list,
+                        groups: list[tuple[int, int]], own_pages: list | None) -> torch.Tensor:
+        """One model forward per job group, concatenated in batch order. A group of several rows runs the verify
+        kernels (params["dflash_verify"]) also when nothing is drafted: the R-row exact paths give each row the bits
+        of the one-row launch. params["export_states"] of the whole step is rebuilt from the groups' lists."""
+        logits = []
+        exports = []
+        r0 = 0
+        for j0, j1 in groups:
+            r1 = r0 + sum(len(job.sequences) for job in batch_jobs[j0:j1])
+            p = dict(params)
+            p["block_table"] = params["block_table"][r0:r1]
+            p["cache_seqlens"] = params["cache_seqlens"][r0:r1]
+            if params.get("positions") is not None:
+                p["positions"] = params["positions"][r0:r1]
+            if params.get("recurrent_states") is not None:
+                p["recurrent_states"] = params["recurrent_states"][j0:j1]
+            if own_pages is not None:
+                p["dflash_table_pages"] = own_pages[r0:r1]
+            if (r1 - r0) * batch_ids.shape[-1] > 1:
+                p["dflash_verify"] = True
+            if r1 - r0 > 1:
+                p["row_inv_per_seq"] = True      # the attention layers run each sequence on its own (Attention.forward)
+            if len(groups) > 1:
+                # The reused pinned staging of the embedding upload (modules/embedding.py) is only safe with a sync point
+                # between two forwards; the forwards of one step follow each other with none, and the next group would
+                # overwrite the rows the previous one has not copied yet
+                p["pinned_staging"] = False
+            logits.append(self.model.forward(input_ids = batch_ids[r0:r1], params = p))
+            if "export_states" in p:
+                exports.append(p["export_states"])
+            r0 = r1
+        if exports:
+            params["export_states"] = [torch.cat(parts, dim = 0) for parts in zip(*exports)]
+        return torch.cat(logits, dim = 0)
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1385,10 +1533,16 @@ class Generator:
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         _tv0 = _pt()
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        groups = None
+        if len(batch_jobs) > 1 and ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups") and not active_embeddings:
+            groups = self._row_groups(batch_jobs, batch_ids.shape[-1])
+        if groups is None:
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
+        else:
+            batch_logits = self._forward_groups(batch_ids, params, batch_jobs, groups, own_pages)
         _tv1 = _pt()
         if SPEC_PROF:
             _PROF_CUR["t_verify"] = _tv1 - _tv0

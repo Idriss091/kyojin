@@ -184,7 +184,7 @@ class GDNState:
         return 0
 
 
-    def stash(self, async_: bool = False, pin_pool: dict = None):
+    def stash(self, async_: bool = False, pin_pool: dict = None, pinned: bool = False):
         """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
         current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
         (RecurrentCache._finish, worker thread) before any reader sees the entry."""
@@ -202,7 +202,7 @@ class GDNState:
                 stashed["_ev"] = ev
                 return stashed
             for k, l in layers.items():
-                stashed[k] = l.stash(self.slot)
+                stashed[k] = l.stash(self.slot, pinned = pinned) if pinned else l.stash(self.slot)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -365,9 +365,18 @@ class GDNLayerState:
         )
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, pinned: bool = False):
         cdim = self.module.conv_kernel_size
         b = _base_value.get((self.cache_id, slot), 0)
+        if pinned:
+            # CUDA prompt-end tail checkpoint (job._tail_stash): async copy into page-locked buffers from torch's
+            # caching host allocator (reused across stashes, bounded by the tail LRU) instead of a synchronous .cpu()
+            # into fresh pageable memory; stream order keeps the copy ahead of the next write and of unstash
+            src = (self.recurrent_state[slot, b:b + 1], self.conv_state[slot, :, :cdim])
+            out = tuple(torch.empty(s.shape, dtype = s.dtype, pin_memory = True) for s in src)
+            for d, s in zip(out, src):
+                d.copy_(s, non_blocking = True)
+            return out
         return (
             self.recurrent_state[slot, b:b + 1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
@@ -422,6 +431,12 @@ class GatedDeltaNet(Module):
         rms_norm_eps: float,
         conv_kernel_size: int,
         beta_scale: float = 1.0,
+        # Blocked GQA pairing (MiniCPM GGUF): the file stores v-heads even/odd
+        # grouped while q/k heads are sequential, and pairs v[j] with q[j % nk]
+        # (llama blocked style). Repeat pairing (v[2m]/v[2m+1] with q[m]) then
+        # mis-pairs 30/32 heads. When set, q/k are duplicated blocked AFTER
+        # the (depthwise, order-agnostic) conv and the rule runs plain 32/32.
+        blocked_gqa: bool = False,
         key_a_log: str | None = None,
         key_dt_bias: str | None = None,
         key_conv1d: str | None = None,
@@ -472,6 +487,7 @@ class GatedDeltaNet(Module):
         self.k_dim = self.k_head_dim * self.num_k_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
         self.beta_scale = beta_scale
+        self.blocked_gqa = blocked_gqa or os.environ.get("EXL3_GDN_BLOCKED", "0") == "1"
 
         self.out_dtype = out_dtype
 
@@ -1369,8 +1385,14 @@ class GatedDeltaNet(Module):
         max_rows = 2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1
         if self.kda and os.environ.get("EXL3_NC2_CKPT4", "0") == "1":
             max_rows = 4  # CK4 kernel build (vendor/fla/hip/kda_fused_h_hip.py): 8192-row chunks
-        if len(rows) > max_rows or any(r % 64 or not cdim <= r < seqlen for r in rows):
+        if (not self.kda and os.environ.get("EXL3_GDN_HF", "0") == "1") or \
+                (self.kda and (int(os.environ.get("EXL3_TAIL_DENSE", "0")) > 0 or int(os.environ.get("EXL3_TAIL_SUB", "0")) > 0)):
+            max_rows = 8  # gdn_hf.hip / the CK8 kda_fused_h build side-write up to 8 rows (dense prompt-tail checkpoints, see Job.tail_ckpt_rows)
+        if any(r % 64 or not cdim <= r < seqlen for r in rows):
             return None
+        # more rows than the kernel has slots: the deepest ones are written (the model-wide stash needs every layer to
+        # hold a row, so a row some layer drops is simply not stashed, see Job.stash_midchunk)
+        rows = rows[-max_rows:]
         cks = [{
             "row": r,
             "chunk": r // 64,
@@ -1737,8 +1759,20 @@ class GatedDeltaNet(Module):
             )
 
             # Delta rule
+            _nk, _kd, _mq = self.num_k_heads, self.k_dim, mixed_qkv
+            if self.blocked_gqa and not self.kda:
+                # Blocked pairing for grouped-v files: duplicate q/k heads
+                # blocked ([q,q] not interleaved) AFTER the depthwise conv and
+                # run the rule plain (nk == nv, no repeat). Bitwise vs repeat
+                # on sequential weights; correct on grouped ones.
+                # mixed_qkv is [B, T, C] here (conv output transposed back).
+                _kd2 = 2 * self.k_dim
+                _q = _mq[..., :self.k_dim]
+                _k = _mq[..., self.k_dim:_kd2]
+                _mq = torch.cat([_q, _q, _k, _k, _mq[..., _kd2:]], dim=-1)
+                _nk, _kd = self.num_v_heads, self.v_dim
             core_attn_out = gated_delta_rule_fn(
-                mixed_qkv = mixed_qkv,
+                mixed_qkv = _mq,
                 beta = beta,
                 g = g,
                 recurrent_state = recurrent_state,
@@ -1746,9 +1780,9 @@ class GatedDeltaNet(Module):
                 recurrent_base = recurrent_base,
                 history = save_history,
                 save_state = save_state,
-                num_k_heads = self.num_k_heads,
+                num_k_heads = _nk,
                 num_v_heads = self.num_v_heads,
-                k_dim = self.k_dim,
+                k_dim = _kd,
                 v_dim = self.v_dim,
                 k_head_dim = self.k_head_dim,
                 v_head_dim = self.v_head_dim,
