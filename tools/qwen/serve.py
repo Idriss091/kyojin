@@ -445,93 +445,14 @@ class Heartbeat:
 
 # ---------------------------------------------------------------------------- loop guard
 
-# Same family as the GLM guard (tools/glm/serve.py LoopGuard): an n-gram period detector, plus a text rule for loops
-# that drift (no exact period): the release-gate rule of tools/evalgate/loops.py (zlib ratio of the last 1000 chars
-# < 30 % AND a 50-char span seen >= 3 times in the last 3000 chars) that must hold for a sustained stretch. Greedy
-# thinking on a near-tie (the Qwen3.8 trait, ifeval-0015/0114/0195) is the target: the guard closes the think block.
-GUARD_MAX_N = 64
-GUARD_THINK = {"k": 4, "min_span": 48, "sustain": 320}    # tokens; GLM thresholds for the period rule
-GUARD_ANSWER = {"k": 6, "min_span": 96, "sustain": 640}   # stricter: an answer may repeat items legitimately
-GUARD_CHECK_EVERY = 16                                    # tokens between two evaluations of the text rule
-TEXT_WINDOW, TEXT_RATIO, TEXT_MIN_CHARS = 1000, 0.30, 200
-SPAN_TAIL, SPAN_LEN, SPAN_MIN = 3000, 50, 3
+# The detectors live in tools/loopguard.py (shared with the GLM server).
+from loopguard import (GUARD_ANSWER, loop_guard_default, GUARD_CHECK_EVERY, GUARD_MAX_N, GUARD_THINK, SPAN_LEN, SPAN_MIN, SPAN_TAIL,  # noqa: E402,F401
+                       TEXT_MIN_CHARS, TEXT_RATIO, TEXT_WINDOW, LoopMonitor, answer_text_loop, counter_drift,
+                       max_span_repeat, repeated_units, shingle_repeat, text_loop)
+
 THINK_CLOSE_TEXT = "\n</think>\n\n"
 THINK_CLOSE_TAG = "</think>"
 FINAL_TRIES = 2
-
-
-def loop_guard_default() -> bool:
-    return os.environ.get("EXL3_LOOP_GUARD", "1") != "0"
-
-
-def text_loop(text: str) -> bool:
-    """tools/evalgate/loops.is_loop (kept identical; test_serve checks both agree)."""
-    import zlib
-    from collections import Counter
-    w = text[-TEXT_WINDOW:]
-    if len(w) < TEXT_MIN_CHARS or len(zlib.compress(w.encode())) / max(len(w.encode()), 1) >= TEXT_RATIO:
-        return False
-    t = text[-SPAN_TAIL:]
-    return max(Counter(t[i:i + SPAN_LEN] for i in range(len(t) - SPAN_LEN + 1)).values(), default=0) >= SPAN_MIN
-
-
-class LoopMonitor:
-    """Watches the tokens of one generation. feed() returns None, or a dict
-    {phase, kind ("period"|"text"|"budget"), cut (tokens of the current phase to keep), at, period}.
-    Phases: "think" (until the </think> token) then "answer"; a request without a think block starts in "answer".
-    With detect=False only the thinking budget is enforced."""
-
-    def __init__(self, phase: str, close_id: int | None, budget: int | None = None, detect: bool = True):
-        self.close_id, self.budget, self.detect = close_id, budget, detect
-        self.start_phase(phase)
-
-    def start_phase(self, phase: str) -> None:
-        self.phase = phase
-        self.cfg = GUARD_THINK if phase == "think" else GUARD_ANSWER
-        self.ids: list[int] = []
-        self.run = [0] * (GUARD_MAX_N + 1)
-        self.text = ""
-        self.last_check = 0
-        self.flag_from: int | None = None
-
-    def feed(self, tokens, text: str = "") -> dict[str, Any] | None:
-        tokens = [int(t) for t in tokens]
-        if self.phase == "think" and self.close_id is not None and self.close_id in tokens:
-            k = tokens.index(self.close_id)
-            hit = self._feed(tokens[:k], text)
-            if hit:
-                return hit
-            self.start_phase("answer")
-            return self._feed(tokens[k + 1:], "")
-        return self._feed(tokens, text)
-
-    def _feed(self, tokens, text: str) -> dict[str, Any] | None:
-        ids, run, cfg = self.ids, self.run, self.cfg
-        self.text += text
-        for t in tokens:
-            i = len(ids)
-            ids.append(t)
-            if self.phase == "think" and self.budget is not None and i + 1 >= self.budget:
-                return {"phase": "think", "kind": "budget", "cut": self.budget, "at": i + 1, "period": 0}
-            if not self.detect:
-                continue
-            for n in range(1, GUARD_MAX_N + 1):
-                r = run[n] + 1 if i >= n and t == ids[i - n] else 0
-                run[n] = r
-                if r >= max(n * (cfg["k"] - 1), cfg["min_span"] - n):
-                    return {"phase": self.phase, "kind": "period", "cut": max(i - r + 1, 1), "at": i + 1, "period": n}
-        if self.detect and len(ids) - self.last_check >= GUARD_CHECK_EVERY:
-            prev, self.last_check = self.last_check, len(ids)
-            if text_loop(self.text[-(SPAN_TAIL + 200):]):
-                if self.flag_from is None:
-                    self.flag_from = prev
-                if len(ids) - self.flag_from >= cfg["sustain"]:
-                    return {"phase": self.phase, "kind": "text", "cut": max(self.flag_from, 1), "at": len(ids), "period": 0}
-            else:
-                self.flag_from = None
-        if len(self.text) > 4 * SPAN_TAIL:
-            self.text = self.text[-SPAN_TAIL * 2:]
-        return None
 
 
 def gate_text(vis: str) -> str:
@@ -540,17 +461,12 @@ def gate_text(vis: str) -> str:
     return think.strip() + tag + ans.strip()
 
 
-def max_span_repeat(text: str) -> int:
-    t = text[-SPAN_TAIL:]
-    from collections import Counter
-    return max(Counter(t[i:i + SPAN_LEN] for i in range(len(t) - SPAN_LEN + 1)).values(), default=0)
 
-
-def final_cut(vis: str) -> int:
+def final_cut(vis: str) -> int | None:
     """The gate rule holds on the visible text (thinking [+ </think> + answer]). Return the character index at which to cut
     the thinking: the longest prefix (line starts first, then 64-character steps) that (a) holds no 50-character span twice
     in its last 3000 characters, so that the answer, which repeats the last draft once more, cannot bring any span to the
-    count of 3 whatever it says, and (b) with </think> and the answer already written does not trip the rule. 0 if none."""
+    count of 3 whatever it says, and (b) with </think> and the answer already written does not trip the rule. None if no cut does (the answer trips the rule on its own)."""
     think, _, ans = vis.partition(THINK_CLOSE_TAG)
     think = think.rstrip()
     lines = sorted({m.end() for m in re.finditer("\n", think)}, reverse=True)
@@ -559,7 +475,7 @@ def final_cut(vis: str) -> int:
         pre = think[:c].rstrip()
         if max_span_repeat(pre) <= 1 and not text_loop(pre + THINK_CLOSE_TAG + ans.strip()):
             return c
-    return 0
+    return None
 
 
 class Retract(int):
@@ -612,6 +528,15 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # shared 9K / 11K / 12.1K / 14K prefix 1.04 -> 0.60, 2.25 -> 0.80, 2.92 -> 0.63, 1.62 -> 0.74 s; the writing prompt is
              # bitwise unchanged, KLD vs a cold prefill at the level of any resumed turn. 0 = off.
              ("EXL3_BRANCH_CKPT", "1"),
+             # dense prompt-tail checkpoints: the recurrent state is also written at each of the 7 page boundaries below the last full
+             # page, so a prompt that shares the cached prefix up to anywhere in its last 2K tokens (same document, another question)
+             # resumes within one page of the divergence instead of at the previous 4096-row chunk start. 0 = off. A resume replays
+             # a different number of rows than a cold prefill and the GEMM path depends on the row count, so the output is not yet
+             # bit-identical to a cold prefill; the fix is in progress.
+             ("EXL3_TAIL_DENSE", "7"),
+             # sub-page prompt-tail checkpoints (EXL3_TAIL_SUB = number of 64-row steps below the prompt end): a prompt that diverges in
+             # its final tokens resumes within 64 rows of the divergence. Same numerics caveat as the dense checkpoints. 0 = off.
+             ("EXL3_TAIL_SUB", "0"),
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),
@@ -642,6 +567,21 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"),
              # 17/10: multi-block exact decode top-k (bitwise on 24+ cases, decode R<=1 T>=32768 only; saves 0.13/0.42/0.91 ms per token at 128K/256K/500K). 0 = one-block.
              ("EXL3_TOPK_PAR", "1"))
+
+# NVIDIA only (RTX 3090; the AMD values above stay as they are). The verify of 2..8 rows costs
+# 25-29 ms against 22 ms for one row, while a draft step costs ~1.5 ms, 0.93 ms of it the 248K-row K5 head: deeper drafts pay
+# (tier thresholds 0.3/0.1 up to 3 rows, 0.6/0.4 beyond instead of 0.6/0.3 and 0.95/0.85), and the 1-row draft steps read only the
+# first 98304 head rows (EXL3_DRAFT_VOCAB, self-disabling when the language needs ids above that, see qwen3_5_mtp.py). Verified
+# tokens do not change. No depth cap on the draft rule: the many-row qdec kernel (cu/qdec_rows.cu) serves the hd 256 verify attention
+# of 2..8 rows at 64K-246K (3090: mix decode at 241K tokens, capped rule -> uncapped, chat 73.3 -> 82.6, code 73.2 -> 80.7, prose 53.4 -> 52.9;
+# 144K: 84.0/92.2/57.7 -> 82.4/99.5/58.5); with EXL3_QDEC=0 or EXL3_QDEC_ROWS=0 the Triton verify is back and QWSPEC_DEPTHRULE=
+# "96000:0.45,0.2,4,0.8,0.6" (spec_policy.py) is the matching cap. EXL3_DRAFT_VOCAB=0 and QWSPEC_* set in the environment win.
+# SERVE_ENV entries tuned on gfx1151 for conversation resume and HIP kernels, not validated on NVIDIA (the 3090 numbers were
+# measured without them): CUDA starts without them, the environment still wins.
+HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
+                                "EXL3_NC2_ATTN_F16", "EXL3_REPLY_FIRST", "EXL3_STATE_REBASE", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
+                                "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
+CUDA_SERVE_ENV = (("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
@@ -744,15 +684,22 @@ class QwenEngine:
     """Target model + MTP drafter + (optional) vision tower + one Generator."""
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
-                 vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1):
+                 vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
+                 k_bits: int = 0, v_bits: int = 0):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
+        import torch
+        on_cuda = bool(torch.version.cuda and not torch.version.hip)
         for k, v in SERVE_ENV:
+            if on_cuda and k in HIP_ONLY_SERVE_ENV:
+                continue
             os.environ.setdefault(k, v)
         check_latched_env()
         print("qserve:", configure_hc_sidecar(model_path), flush=True)
         print("qserve:", configure_draft2s(model_path), flush=True)
-        import torch
+        if on_cuda:
+            for k, v in CUDA_SERVE_ENV:
+                os.environ.setdefault(k, v)
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
@@ -771,15 +718,23 @@ class QwenEngine:
         self.eos = list(self.config.eos_token_id_list)
         self.model = Model.from_config(self.config)
         # cache_bits 0 (default) = the fp16 K/V pages; 8 (--cache-bits 8) = packed int8 K/V pages (2.6 GiB less at 256K), indexer
-        # planes stay fp16. The int8 pages are not row-invariant when several rows decode together, so they are opt-in.
+        # planes stay fp16. Parallel sessions give equal output only with EXL3_ROW_INV_GROUPS=1 (see main()); the int8 pages stay opt-in.
+        # k_bits / v_bits (--k-bits / --v-bits, 2..8) set the two sides separately and win over cache_bits; 0 = take cache_bits
+        k_bits, v_bits = k_bits or cache_bits, v_bits or cache_bits
+        if not (k_bits or v_bits) and torch.version.cuda and not torch.version.hip:
+            k_bits = v_bits = 4   # NVIDIA preset: K4V4 pages (256K fits 24 GB, decode read 4x less); --cache-bits / --k-bits override
         self.cache_bits = cache_bits
         from exllamav3 import CacheLayer_quant
-        qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
+        qkw = dict(layer_type=CacheLayer_quant, k_bits=k_bits, v_bits=v_bits) if (k_bits and v_bits) else {}
+        assert bool(k_bits) == bool(v_bits), "set both --k-bits and --v-bits (or --cache-bits)"
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
         self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
+        from exllamav3.util import jit_log, kernel_seed
+        kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
+        jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
         with Heartbeat("loading target model"):
             self.model.load(max_chunk_size=max_chunk_size, progressbar=False, callback=startup_health.load_callback())
@@ -1159,12 +1114,14 @@ class QwenEngine:
         """Yield decoded text pieces. Final stats land in `stats`. Every job enqueued is appended to `_mine`.
 
         Final check (on with the guard, loop_final=False turns it off): when the turn ends normally and the visible text
-        (thinking + answer) trips the release-gate loop rule, the thinking is cut back (final_cut), the close is forced and
+        (thinking + answer) trips the release-gate loop rule and some cut of the thinking cures it (a long valid code answer
+        trips the rule on its own: no cut helps, nothing is redone), the thinking is cut back (final_cut), the close is forced and
         the answer is generated again, at most FINAL_TRIES times. Discarded tokens do not count against max_tokens.
 
         Loop guard (default on, EXL3_LOOP_GUARD=0 or loop_guard=False turns it off): when the think block loops (or
         thinking_budget tokens are used) the job is cancelled and restarted from prompt + the thinking kept so far +
-        "\n</think>\n\n", so the answer proceeds. A loop inside the answer ends the turn (finish_reason stop).
+        "\n</think>\n\n", so the answer proceeds. A loop inside the answer ends the turn: finish_reason "length" and choices[0].stop_reason "loop_guard"
+        (plus timings.loop_guard with the detail), so a client can tell a guard stop from a natural end.
         Nothing is changed while no loop is detected.
 
         logprobs (None = off, k = 0..20): per generated token the log-probability of the token and of the k most likely tokens,
@@ -1254,7 +1211,8 @@ class QwenEngine:
                             break
                     if ev.get("eos") and final_on and final_tries < FINAL_TRIES and text_loop(gate_text(vis)) \
                             and (THINK_CLOSE_TAG in vis or ev.get("eos_reason") == "max_new_tokens"
-                                 or generated - discount >= max_tokens):
+                                 or generated - discount >= max_tokens) \
+                            and (final_c := final_cut(vis)) is not None:   # no cut of the thinking cures it: the answer is the loop, or valid
                         redo = True
                         break
                     if ev.get("eos"):
@@ -1278,7 +1236,7 @@ class QwenEngine:
                     break
             if redo:
                 self._routes.pop(job.serial_number, None)   # it sent its eos
-                cut_chars = final_cut(vis)
+                cut_chars = final_c
                 final_tries += 1
                 keep_tokens, keep_chars = max(m for m in gmarks if m[1] <= cut_chars)
                 fired = {"phase": "think", "kind": "final", "cut": keep_tokens, "at": len(token_ids), "period": 0,
@@ -1683,8 +1641,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             pre, gen = stats.get("time_prefill") or 0.0, stats.get("time_generate") or 0.0
             if has_calls:
                 reason = "tool_calls"
-            elif stats.get("eos_reason") in ("max_new_tokens",):
-                reason = "length"
+            elif stats.get("eos_reason") in ("max_new_tokens", "loop_guard"):
+                reason = "length"       # a guard stop cut the answer short: clients must not read it as a natural end
             else:
                 reason = "stop"
             usage = {"prompt_tokens": prompt_tokens, "completion_tokens": n_new,
@@ -1769,6 +1727,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                         await writer.write(sse(event({"tool_calls": [dict(c, index=i)]})))
                 reason, usage, timings = finish_and_stats(stats, full, bool(calls))
                 final = event({}, reason) | {"usage": usage, "timings": timings}
+                if stats.get("eos_reason") == "loop_guard":
+                    final["choices"][0]["stop_reason"] = "loop_guard"
                 if job["return_token_ids"]:
                     final["token_ids"] = stats.get("token_ids", [])
                 await writer.write(sse(final))
@@ -1816,6 +1776,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         payload = {"id": request_id, "object": "chat.completion", "created": created, "model": model_id,
                    "choices": [{"index": 0, "message": message, "finish_reason": reason}],
                    "usage": usage, "timings": timings}
+        if stats.get("eos_reason") == "loop_guard":
+            payload["choices"][0]["stop_reason"] = "loop_guard"
         if job["return_token_ids"]:
             payload["token_ids"] = stats.get("token_ids", [])
         if job["logprobs"] is not None:
@@ -1998,7 +1960,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         def reason_usage(stats: dict[str, Any], text: str):
             n_new = int(stats.get("new_tokens") or engine.count_tokens(text))
             n_prompt = prompt_tokens if prompt_ids is not None else int(stats.get("prompt_tokens") or prompt_tokens)
-            reason = "length" if stats.get("eos_reason") == "max_new_tokens" else "stop"
+            reason = "length" if stats.get("eos_reason") in ("max_new_tokens", "loop_guard") else "stop"
             return reason, serve_compat.usage(n_prompt, n_new, int(stats.get("cached_tokens") or 0))
 
         out: asyncio.Queue = asyncio.Queue()
@@ -2055,7 +2017,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                             lifecycle.first_content(job["_reqid"], queued_at)
                         await writer.write(sse(chunk(item, None)))
                 reason, usage = reason_usage(stats, full)
-                await writer.write(sse(chunk("", reason) | {"usage": usage}))
+                last = chunk("", reason) | {"usage": usage}
+                if stats.get("eos_reason") == "loop_guard":
+                    last["choices"][0]["stop_reason"] = "loop_guard"
+                await writer.write(sse(last))
                 await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
                 lifecycle.stream_done(job["_reqid"], int(stats.get("new_tokens") or 0))
@@ -2093,6 +2058,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         text, _ = stop_text(full, job["stop"])
         reason, usage = reason_usage(stats, text)
         out_ = chunk(text, reason) | {"object": "text_completion", "usage": usage}
+        if stats.get("eos_reason") == "loop_guard":
+            out_["choices"][0]["stop_reason"] = "loop_guard"
         if job["logprobs"] is not None:
             out_["choices"][0]["logprobs"] = format_logprobs(
                 stats.get("logprobs", []), stats.get("logprob_token_ids", stats.get("token_ids", [])), engine.token_str, chat=False)
@@ -2154,7 +2121,8 @@ def load_all(args: argparse.Namespace):
     print(f"qserve: starting, model={model_dir} ctx={args.ctx} sessions={args.sessions} draft_policy={args.draft_policy} "
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
-                        cache_bits=args.cache_bits, sessions=args.sessions)
+                        cache_bits=args.cache_bits, sessions=args.sessions,
+                        k_bits=args.k_bits, v_bits=args.v_bits)
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2184,7 +2152,9 @@ def main() -> None:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
-                        help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, output not row-invariant for several rows)")
+                        help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
+    parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
+    parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
@@ -2209,16 +2179,25 @@ def main() -> None:
     args = parser.parse_args()
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
-    # measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
-    # 4 sessions, and not at 2 sessions with the 8-bit cache. Equality at N > 1 is not guaranteed for either cache width:
-    # the split layout of the decode attention kernel depends on the batch
-    if args.draft_policy != "off" and args.sessions * (args.ndt + 1) > 8:
-        print(f"qserve: WARNING --sessions {args.sessions} x (--ndt {args.ndt} + 1) = {args.sessions * (args.ndt + 1)} verify rows "
-              "is past 8: greedy output may differ from the same request run alone", flush=True)
-    if args.sessions > 1:
+    # Measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
+    # 4 sessions, and not at 2 sessions with the 8-bit cache. Equality at N > 1 is not guaranteed by default: the split layout of
+    # the decode attention kernel depends on the batch. EXL3_ROW_INV_GROUPS=1 (opt-in, generator/row_groups.py) packs the decode
+    # step into forwards of at most 8 token rows with one attention call per sequence: four cold 8K prompts, --ndt 7, --sessions 4
+    # gave 16 of 16 answers equal to the solo run (16-bit and 8-bit cache), at about 3 % more wall time on that load and 8 to 10 %
+    # less aggregate decode throughput on short prompts
+    exact = all(os.environ.get(k, d) not in ("", "0") for k, d in (("EXL3_ROW_INV_GROUPS", "0"), ("EXL3_ROW_INV", "1")))
+    if args.sessions > 1 and not exact:
+        if args.draft_policy != "off" and args.sessions * (args.ndt + 1) > 8:
+            print(f"qserve: WARNING --sessions {args.sessions} x (--ndt {args.ndt} + 1) = {args.sessions * (args.ndt + 1)} verify rows "
+                  "is past 8: greedy output may differ from the same request run alone", flush=True)
         print(f"qserve: WARNING --sessions {args.sessions}: greedy output is not guaranteed equal to the same request run alone, "
-              "with either cache width (the 16-bit cache stayed equal on two short prompts; the attention kernel splits its "
-              "work by batch)", flush=True)
+              "with either cache width (the attention kernel splits its work by batch; EXL3_ROW_INV_GROUPS=1 makes it exact, a "
+              "little slower)", flush=True)
+    if os.environ.get("EXL3_SCHED_CHUNK_IL", "0") == "1":
+        # chunked-prefill interleave (exllamav3/generator/chunk_il.py): needs another request running beside the big prefill
+        print("qserve: chunk_il ON " + ("" if args.sessions > 1 else "(no effect: needs --sessions >= 2) ") +
+              f"max_defer={os.environ.get('EXL3_CIL_MAX_DEFER_S', '8')}s frac={os.environ.get('EXL3_CIL_DEFER_FRAC', '0.18')} "
+              f"slice={os.environ.get('EXL3_CIL_SLICE_S', '0.6')}s short_tok={os.environ.get('EXL3_CIL_SHORT_TOK', '4096')}", flush=True)
 
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"

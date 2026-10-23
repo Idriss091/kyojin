@@ -6,6 +6,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <map>
+#include <tuple>
+#include <utility>
 #include <cmath>
 
 #include "../util.h"
@@ -57,6 +59,42 @@ static int moe_coop_pick_ksplit(int max_split)
         forced = env ? atoi(env) : 0;
     }
     return forced > 0 ? std::min(forced, max_split) : 1;
+}
+
+// Stream-K for the gate/up stage (exl3_moe_coop_kernel.cuh, SkGeom), grid = resident blocks x SMs:
+// EXL3_MOE_COOP_SK = 0 off, 1 hybrid (whole units on SMs blocks, the remainder shared; CUDA default),
+// 2 pure stream-K. The down stage's short units gain nothing from it. Not measured on
+// ROCm: off there unless set
+static int moe_coop_sk_mode()
+{
+    static int mode = -2;
+    if (mode == -2)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_SK");
+#ifdef USE_ROCM
+        mode = env ? atoi(env) : 0;
+#else
+        mode = env ? atoi(env) : 1;
+#endif
+    }
+    return mode;
+}
+
+// Grid (resident blocks x SMs) and SM count, per (kernel, smem, device), queried once
+static int moe_coop_sk_grid(const MoeCoopKernel& k, int device, int& sms)
+{
+    static std::map<std::tuple<void*, int, int>, std::pair<int, int>> grid;
+    const auto key = std::make_tuple(k.kernel, k.smem, device);
+    auto it = grid.find(key);
+    if (it == grid.end())
+    {
+        int per_sm = 0, n = 0;
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.kernel, MOE_COOP_THREADS, k.smem));
+        cuda_check(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device));
+        it = grid.emplace(key, std::make_pair(std::max(1, per_sm) * n, n)).first;
+    }
+    sms = it->second.second;
+    return it->second.first;
 }
 
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
@@ -111,8 +149,18 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int max_split = std::max(1, p.slots_max / slots);
     p.ksplit_a = moe_coop_pick_ksplit(max_split);
     p.ksplit_b = moe_coop_pick_ksplit(max_split);
-    const int grid_a = base_a * p.ksplit_a;
+    int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
+    // Stream-K gate/up stage (wide tile; bsz <= 2 at MAX_BSZN 8, i.e. max_split >= 4: slower at 4
+    // rows; room for >= 2 fp32 partial rows per projection in d_out): ksplit = -(whole-unit blocks + 1).
+    // The hybrid needs a second resident block per SM for the shared remainder, else pure stream-K
+    const int sk = moe_coop_sk_mode();
+    if (sk > 0 && wide_a && max_split >= 4 && exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) >= 2)
+    {
+        int sms;
+        grid_a = moe_coop_sk_grid(ka, device, sms);
+        p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+    }
 
     void* args[] = { (void*) &p };
     if (p.a_global)

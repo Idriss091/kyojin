@@ -355,6 +355,12 @@ def ngram_from_env(default=(2, 7, 16, 3)):
     if not (3 <= len(f) <= 4 and 1 <= g <= LMAX and k >= 1 and m >= g and min(f) >= 0): raise ValueError(f"QWSPEC_NGRAM={v}")
     return tuple(f)
 
+def _unparked(g):
+    """Active jobs minus those EXL3_SCHED_CHUNK_IL skips this step (Generator._cil_parked): a short job decoding next to a parked
+    big prefill still counts as alone, so its lookup/draft policy is the solo one."""
+    return [j for j in g.active_jobs if not getattr(j, "_cil_skip", False)]
+
+
 def install_lookup(g, ngram, stats=None):
     """The n-gram lookup alone, for a Generator whose drafter keeps its own fixed depth (GLM): no depth rule, no read of the
     draft probabilities. ngram = (nmin, K, lmin[, cmin]) as in install(). When the context suffix (>= lmin tokens) occurred
@@ -392,8 +398,9 @@ def install_lookup(g, ngram, stats=None):
         return False
     def wrapped(results):
         cont = None; sid = None
-        if len(g.active_jobs) == 1 and g.active_jobs[0].is_prefill_done() and len(g.active_jobs[0].sequences) == 1:
-            sid = g.active_jobs[0].sequences[0].sequence_ids
+        act = _unparked(g)
+        if len(act) == 1 and act[0].is_prefill_done() and len(act[0].sequences) == 1:
+            sid = act[0].sequences[0].sequence_ids
             idx = fol.sync(sid)
             L, c = idx.match(K)
             if L >= lmin and c:
@@ -468,7 +475,7 @@ def install_plain_lookup(g, pl, stats=None):
                 c = c[:w]
         return c
     def rnd(results):
-        job = g.active_jobs[0] if len(g.active_jobs) == 1 else None
+        job = _unparked(g)[0] if len(_unparked(g)) == 1 else None
         if job is None or not job.is_prefill_done() or len(job.sequences) != 1: return None
         c = draft(fol, job.sequences[0].sequence_ids, K)
         if not c: return None
@@ -582,21 +589,34 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
                 st["stop"] = True; st["keep"] = st["i"]
         return ids
     win = log_depth if log is not None else (fixed if fixed is not None else maxd)
+    # QWSPEC_DEPTHRULE="N:thf,thv,maxd,thfd,thvd": above N context tokens the tier rule switches to these values. Measured on the
+    # RTX 3090: the full-attention verify kernel for hd 256 (qdec) serves 1-2 rows only and Triton runs 3..5
+    # rows at +6 ms (128K), and 6..8 rows cost another +6 ms at 64K and +12 ms at 128K, so the deep drafts that pay at 4K-32K stop
+    # paying; a shallower, stricter rule from ~48K keeps the gain on repetitive text and never loses to the former rule on prose.
+    # Unset = one rule at every depth. QWSPEC_CAP_NG=1 also caps the n-gram copy length at the deep maxd.
+    cap_n = None
+    _c = os.environ.get("QWSPEC_DEPTHRULE", "").strip()
+    if _c and fixed is None and log is None and isinstance(rule, TierRule):
+        _n, _v = _c.split(":"); f = _v.split(",")
+        cap_n, deep = int(_n), (float(f[0]), float(f[1]), int(f[2]), float(f[3]), float(f[4]))
+        base = (rule.thf, rule.thv, rule.maxd, rule.thfd, rule.thvd); cap_ng = os.environ.get("QWSPEC_CAP_NG", "0") != "0"
     def wrapped(results):
         st.update(i=0, stop=False, keep=None, mode="mtp", ps=[])
         job = next((j for j in g.active_jobs if j.is_prefill_done()), None)
         cont = None
         n = None
-        if job is not None and len(g.active_jobs) == 1:
+        if job is not None and len(_unparked(g)) == 1:
             seq = job.sequences[0]; n = len(seq.sequence_ids)
             if st["job"] is job and st["n"] is not None and n > st["n"]:
                 rule.end_round(st["drafted"], max(0, min(st["drafted"], n - st["n"] - 1)))
             elif st["job"] is not job and hasattr(rule, "new_request"):
                 rule.new_request()
             st["job"] = job; st["n"] = n; st["drafted"] = 0
+        if cap_n is not None and n is not None:
+            rule.thf, rule.thv, rule.maxd, rule.thfd, rule.thvd = deep if n > cap_n else base
         rule.begin()                      # after end_round above: the online rule reads last round's prediction there
-        if ngram is not None and job is not None and len(g.active_jobs) == 1:
-            K = min(ngram[1], maxd)
+        if ngram is not None and job is not None and len(_unparked(g)) == 1:
+            K = min(ngram[1], rule.maxd if cap_n is not None and cap_ng else maxd)
             if os.environ.get("QWSPEC_NGRAM_IDX", "1") == "0":
                 L, c = ngram_match(seq.sequence_ids.torch_slice(0, n).flatten().tolist(), ngram[0], K)
             else:

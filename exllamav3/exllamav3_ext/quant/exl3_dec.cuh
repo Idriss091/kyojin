@@ -13,7 +13,7 @@
 // The two templates decode bit-identically to their codebook's reference decode; only the
 // summation order differs from the reconstruct+hgemm path.
 
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(EXL3_PORT_DEC)
 
 // y[N] = x[K] @ W, x fp16 [1, K], out fp16 or fp32 [1, N]. `scratch` is a float32 workspace and
 // `counters` an int32 workspace (zeroed once, left zeroed by every call), see exl3_dec_workspace.

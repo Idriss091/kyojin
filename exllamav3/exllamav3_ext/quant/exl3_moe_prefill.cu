@@ -25,6 +25,8 @@
 #include "hadamard_inner.cuh"
 #if defined(USE_ROCM)
 #include "../hip/hip_mma.cuh"
+#else
+#include "../ptx.cuh"
 #endif
 #include "exl3_dq.cuh"
 #include "exl3_moe_prefill.cuh"

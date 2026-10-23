@@ -111,6 +111,8 @@ Honored:
   `top_p` (default: the pack's `generation_config.json`, 1.0 and 0.95), `stop` (string or array; also fed to EXL3 as stop conditions).
 - `model` — must equal `--model-id` if present, else 400.
 - `clear_thinking` — forwarded to the template as a Jinja variable.
+- `loop_guard` (bool, chat and `/v1/completions`) — `false` turns the answer-phase loop guard off for this request; absent or `true`
+  follows `EXL3_LOOP_GUARD` (default on). See "Loop guard" below.
 
 Ignored (accepted, no effect): `n`, `seed`, `logprobs`, `top_k`, `presence_penalty`,
 `frequency_penalty`, `response_format`, `stream_options`, `user`, `parallel_tool_calls`,
@@ -219,6 +221,15 @@ is the count of ids sent, an id outside the vocabulary answers 400, `ignore_eos:
 one salt namespace at a time (requests without a salt are one namespace): when it changes, running requests finish, the whole
 prompt cache is dropped (a fresh Generator over the same cache) and the request starts. The same salt, or no salt at all,
 never drops anything. `chat_template_kwargs` (`reasoning_effort`, `clear_thinking`) is read like the top-level fields and wins.
+
+### Loop guard
+The server watches the answer (the text after `</think>`, or the whole reply when the prompt opens no think block) and ends a reply
+that fell into a loop: a repeated token period, or a tail that replays itself. The thinking block itself is not watched. The guard
+cancels the job and the turn reports `finish_reason` `length`, `choices[0].stop_reason` `loop_guard` and the detail in
+`timings.loop_guard` (`phase`, `kind`, `at`, `cut`), so a client can tell a guard stop from a natural end. Valid repetitive output
+(dense code, tables, JSON records) is not cut, and neither is repetitive data (a grid of zeros, identical JSON lines, a zero-padded
+hex dump) until it has repeated for 16384 tokens. `EXL3_LOOP_GUARD=0` turns the guard off for the server; `"loop_guard": false` in a
+request body turns it off for that request (a non-boolean value answers 400). It is not applied with `ignore_eos: true`.
 
 ### Thinking
 GLM's generation prompt ends with `<think>`, so the model *starts inside* the block.
