@@ -34,7 +34,13 @@ namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
-constexpr int PF = 4;                           // prefetch ring depth
+// Prefetch ring depth. On Ampere (64 registers per thread at 2 blocks per SM) a deeper ring spills and measured slower at every
+// width (RTX 3090); other architectures keep the original depth
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890
+constexpr int PF = 1;
+#else
+constexpr int PF = 4;
+#endif
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
@@ -495,7 +501,7 @@ __device__ __forceinline__ void gemv_tile
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
             }
 
-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
+            if ((i + 1) % FOLD == 0 || i + 1 == myn)
             {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
@@ -867,9 +873,9 @@ __device__ __forceinline__ void a_unit
         const int slots = p.bsz * p.topk;
         void* C;
         bool c_f32 = p.gu_f32;
-        if (p.ksplit_a < 0 && seg[is_gate ? SEG_NPG : SEG_NPU] > 1)
+        if ((p.ksplit_a < 0 && seg[is_gate ? SEG_NPG : SEG_NPU] > 1) || p.ksplit_a > 1)
         {
-            // Stream-K segment of a shared unit: fp32 partial row in the d_out scratch
+            // Stream-K segment of a shared unit, or a split-k block: fp32 partial row in the d_out scratch
             const int nproj = p.gated ? 2 : 1;
             const int pi = is_gate ? 0 : nproj - 1;
             C = (void*) (p.d_out + (size_t) (pi * sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) + seg[SEG_Q]) * slots * p.I);
@@ -902,7 +908,7 @@ __device__ __forceinline__ void a_unit
             auto load_sum = [&] (const void* buf, int np, int pi, float& v0, float& v1, float& v2, float& v3)
             {
                 v0 = v1 = v2 = v3 = 0.0f;
-                if (p.ksplit_a < 0 && np > 1)
+                if ((p.ksplit_a < 0 || p.ksplit_a > 1) && np > 1)
                 {
                     const int nproj = p.gated ? 2 : 1;
                     const int slots = p.bsz * p.topk;

@@ -432,6 +432,18 @@ Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `
 disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
 on every GPU here, so the default is no split. Testing knob only.
 
+### `EXL3_MOE_COOP_KSPLIT_A` (default: unset, no split; Ampere only)
+
+Gate/up stage of the fused decode MoE kernels at batch sizes whose (token, expert, projection,
+128-column) units fit one per SM (Flint at batch 1: 48 units on 82 SMs): every unit's k loop
+is one block's serial chain. `n` >= 2 (`3` is the measured choice) shares it over up to `n`
+blocks (while the grid stays resident); the last-arriving block of a chunk adds the fp32 partial
+rows in fixed order. The pre-activation is then no longer rounded to fp16 before the output
+rotation, so results differ from the unsplit unit in that rounding (teacher-forced NLL on Flint
+is lower at 4K, 32K and 64K; greedy text flips at near-ties). Unset, `0` or `1` keep the unsplit
+unit, which is bit-identical to the previous kernel. Other architectures and larger batches are
+not affected.
+
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 
 Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces

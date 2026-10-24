@@ -80,6 +80,22 @@ static int moe_coop_sk_mode()
     return mode;
 }
 
+// Gate/up k-split for batches whose units already fit one per SM (decode: 48 units for 82 SMs on Flint): every
+// unit's k-slice loop is a latency chain of one block, so with EXL3_MOE_COOP_KSPLIT_A = n it is shared by up to n
+// blocks (as long as the grid stays resident), the last arrival summing the fp32 partial rows (d_out scratch) in
+// fixed order. The sum is not rounded to fp16 before the output rotation as the unsplit unit's output is, so results
+// differ from it by that rounding. Off by default (unset, 0 or 1): the unsplit unit, bit-identical to the previous kernel
+static int moe_coop_ksplit_a_mode()
+{
+    static int mode = -2;
+    if (mode == -2)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT_A");
+        mode = env ? atoi(env) : 1;
+    }
+    return mode;
+}
+
 // Grid (resident blocks x SMs) and SM count, per (kernel, smem, device), queried once
 static int moe_coop_sk_grid(const MoeCoopKernel& k, int device, int& sms)
 {
@@ -158,8 +174,24 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     if (sk > 0 && wide_a && max_split >= 4 && exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) >= 2)
     {
         int sms;
-        grid_a = moe_coop_sk_grid(ka, device, sms);
-        p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+        const int grid_sk = moe_coop_sk_grid(ka, device, sms);
+        if (sk == 2 || base_a > sms || DevCtx::instance().get_cc(device) != CC_AMPERE)
+        {
+            grid_a = grid_sk;
+            p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+        }
+        else if (p.ksplit_a == 1 && p.Hi / 16 >= 96)
+        {
+            // Units fit one per SM, so the hybrid would run whole units anyway (and launch a grid of resident
+            // blocks that mostly exit at once): per-unit grid, k-split while the grid stays resident
+            const int ks = std::min({ moe_coop_ksplit_a_mode(), max_split, grid_sk / std::max(base_a, 1),
+                                     exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) });
+            if (ks > 1)
+            {
+                p.ksplit_a = ks;
+                grid_a = base_a * ks;
+            }
+        }
     }
 
     void* args[] = { (void*) &p };
