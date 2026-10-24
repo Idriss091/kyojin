@@ -1168,9 +1168,12 @@ class QwenEngine:
         job_ids = ids
 
         while True:
-            job = self.Job(input_ids=job_ids, max_new_tokens=max(max_tokens - generated + discount, 1),
+            max_new = max(max_tokens - generated + discount, 1)
+            rq = serve_compat.rq_budget(ctx, self.sessions, int(job_ids.numel()), max_new, int(getattr(self.generator, "num_draft_tokens", 0)), PAGE_TOKENS)
+            job = self.Job(input_ids=job_ids, max_new_tokens=max_new,
                            sampler=self._sampler(sampling), stop_conditions=([] if ignore_eos else self.eos) + list(stop),
                            embeddings=embs or None, decode_special_tokens=True, seed=seed,
+                           **({} if rq is None else {"max_rq_tokens": rq}),
                            **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
             _mine.append(job)
             q = await self._submit(job)
@@ -2175,7 +2178,8 @@ def main() -> None:
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots")
     parser.add_argument("--sessions", type=int, default=1,
                         help="requests decoded together (default 1: one at a time, in order). Every session reserves the "
-                             "pages for prompt + max_tokens when it starts, so a request that does not fit waits")
+                             "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
+                             "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")

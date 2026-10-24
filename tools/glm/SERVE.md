@@ -36,7 +36,7 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--image-cache-dir-max-gb` | `0` | GiB cap on that directory; `0` = disabled. There is no unlimited setting |
 | `--image-cache-dir-lock-s` | `300` | seconds a conversation keeps the room its files took before another may take it; `0` = no tenure |
 | `--image-cache-format` | `fp32` | row storage: `fp32` as the vision merger emits them, `fp16` (half the bytes, bit-exact on this pack) or `q8` (8 bit with one fp16 scale per row, a quarter, 0.86 % error) |
-| `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
+| `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait. With N > 1 a request without `max_tokens` holds only its share of the context (`-c` / N, at least 2048 tokens of reply) and is requeued when the reply goes on, so it does not block the other sessions |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
 | `--exact-prefix-cache` | off | a request resumed from the prompt cache gives the same greedy text as its cold prefill. Costs about 5-12 % of cold prefill speed at 7-14K tokens |

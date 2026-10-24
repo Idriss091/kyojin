@@ -958,8 +958,10 @@ class ResidentEngine:
             sampler = ComboSampler(temperature=max(temperature, 1e-6), top_p=top_p, min_p=0.0, **kw)
         generator = self.greedy_generator
         conditions = ([] if ignore_eos else list(self.config.eos_token_id_list)) + stop
+        rq = serve_compat.rq_budget(getattr(self, "ctx", None), self.sessions, int(ids.numel()), max_tokens, getattr(self, "num_draft", 0))
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
-                       stop_conditions=conditions, embeddings=embs or None)
+                       stop_conditions=conditions, embeddings=embs or None,
+                       **({} if rq is None else {"max_rq_tokens": rq}))
         if self.sessions > 1:
             async for piece in self._run_shared(job, ids, cancel, stats if stats is not None else {}, t0, probe, prompt, ignore_eos, loop_guard):
                 yield piece
