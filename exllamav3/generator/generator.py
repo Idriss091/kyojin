@@ -44,7 +44,7 @@ from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 _REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
 from . import spec_sample
 from .filter import Filter
-from .row_groups import plan_groups, group_rows_cap, GROUPS as ROW_GROUPS
+from .row_groups import plan_groups, group_rows_cap, plain_rows_verify, GROUPS as ROW_GROUPS
 from ..util.row_inv import ROW_INV
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -1655,7 +1655,7 @@ class Generator:
             # sliding_attn.py's qkv gemv_r_multi branch) all require this marker in addition to
             # the row-count bound, so they only ever fire on the one call they were verified
             # bit-exact against.
-            "dflash_verify": draft_tokens is not None,
+            "dflash_verify": draft_tokens is not None or plain_rows_verify(batch_ids.shape[0] * batch_ids.shape[1], False),
         }
         if own_pages is not None:
             params["dflash_table_pages"] = own_pages
