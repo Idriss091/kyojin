@@ -175,7 +175,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     {
         int sms;
         const int grid_sk = moe_coop_sk_grid(ka, device, sms);
-        if (sk == 2 || base_a > sms)
+        if (sk == 2 || base_a > sms || DevCtx::instance().get_cc(device) != CC_AMPERE)
         {
             grid_a = grid_sk;
             p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);

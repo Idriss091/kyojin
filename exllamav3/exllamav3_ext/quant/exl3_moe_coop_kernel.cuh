@@ -34,7 +34,13 @@ namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
-constexpr int PF = 1;                           // prefetch ring depth: deeper rings spilled at 64 registers and measured slower at every width
+// Prefetch ring depth. On Ampere (64 registers per thread at 2 blocks per SM) a deeper ring spills and measured slower at every
+// width (RTX 3090); other architectures keep the original depth
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890
+constexpr int PF = 1;
+#else
+constexpr int PF = 4;
+#endif
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
