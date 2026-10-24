@@ -76,9 +76,10 @@ void BC_BlockSparseMLP::run_bszN
     // the weighted per-token reduction, with expert biases, padded dims (x zero-padded to the
     // quantized input width in the kernel, output trimmed to H) and expert-range masking
     // (out-of-range picks contribute exact zeros to the partial sum) handled inside. Nothing is
-    // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs
+    // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs.
+    // The row capacity is out_bszn's (python: up to 32 rows / 256 slots)
     int num_tokens = (int) y.size(0);
-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= out_bszn.size(0), "run_bszN: bsz out of supported range");
 
     c10::cuda::CUDAGuard device_guard(y.device());
 
@@ -87,9 +88,16 @@ void BC_BlockSparseMLP::run_bszN
     c10::optional<at::Tensor> sh_o;
     if (shared_experts)
     {
-        at::Tensor x_dense = y.unsqueeze(0);
+        // The shared-expert graphs cover MAX_BSZN rows each: larger batches run as consecutive slices
+        // (rows are independent), the first one included so that <= MAX_BSZN rows are unchanged
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        shared_experts->run_bszN(x_dense, out_d_sh_n);
+        for (int a = 0; a < num_tokens; a += MAX_BSZN)
+        {
+            int n = std::min(MAX_BSZN, num_tokens - a);
+            at::Tensor x_dense = y.slice(0, a, a + n).unsqueeze(0);
+            at::Tensor d_n = out_d_sh_n.slice(1, a, a + n);
+            shared_experts->run_bszN(x_dense, d_n);
+        }
         sh_o = out_d_sh_n;
     }
     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
@@ -249,6 +257,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         );
         coop_p.min_expert = min_expert;
         coop_p.max_expert = max_expert;
+        coop_p.rows_ref = MAX_BSZN;
     }
 
     for (int i = 0; i < max_tokens_per_expert; ++i)

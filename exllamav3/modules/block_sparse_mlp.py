@@ -56,6 +56,10 @@ MOEG_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 1 << 20))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
+# them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
+# slots by expert, so each picked expert is decoded once for all of its rows. CUDA only; EXL3_MOE_COOP_ROWS=8 restores the old cap
+COOP_ROWS = max(MAX_BSZN, int(os.environ.get("EXL3_MOE_COOP_ROWS", "32"))) if torch.version.hip is None else MAX_BSZN
 # Row chunking: 9..EXL3_MOE_ROW_CHUNK_MAX rows of a pack without a fused MoE kernel run as <= MAX_BSZN-row slices through
 # the bszN decode kernels instead of the per-expert tier (host readback of the expert counts + one launch group per expert,
 # per layer); rows are independent in an MoE block. 0 disables. Measured on an RTX 3090 (Qwen3-30B-A3B 3INST)
@@ -632,6 +636,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.routing_cfg = None
         self.experts_cfg = None
+        self.coop_rows = MAX_BSZN   # raised to the fused kernels' row capacity when the buffers are built
 
         # Persistent broadcast targets for TP ranks without the router (see forward)
         self.bcast_sel_bsz1 = None
@@ -1064,7 +1069,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
         # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
         # second entry under the same name would silently double memory forever)
-        bszn_rows = MAX_BSZN * numex
+        self.coop_rows = max(MAX_BSZN, min(COOP_ROWS, 256 // numex))
+        bszn_rows = self.coop_rows * numex
 
         temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
@@ -1084,7 +1090,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
         # call, so they only need zeroing once
-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + self.coop_rows * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
         had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
@@ -1096,7 +1102,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
+        out_bszn = g_tensor_cache.get(device, (self.coop_rows, H), torch.float, "moe1_out_bszn")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -1160,7 +1166,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, self.coop_rows, self.hidden_size), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -2019,7 +2025,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        if _ROW_CHUNK_MAX and MAX_BSZN < x.numel() // x.shape[-1] <= \
+        if _ROW_CHUNK_MAX and self.coop_rows < x.numel() // x.shape[-1] <= \
                 (min(_ROW_CHUNK_MAX, _FUSED_3INST_MIN) if self.support_fused else _ROW_CHUNK_MAX) and self._row_chunk_ok() and \
                 not params.get("autosplit_measure"):
             return self._forward_row_chunks(x, params, out_dtype)
@@ -2052,7 +2058,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= self.coop_rows
 
         # Routing
         if self.router_pre_norm:
@@ -2962,11 +2968,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         y = x.reshape(-1, x.shape[-1])
         routed = params.pop("dec_routed", None)
         outs = []
-        for a in range(0, y.shape[0], MAX_BSZN):
+        for a in range(0, y.shape[0], self.coop_rows):
             sub = {k: v for k, v in params.items() if k != "mlp_residual_out"}
             if routed is not None:
-                sub["dec_routed"] = (routed[0][a:a + MAX_BSZN], routed[1][a:a + MAX_BSZN])
-            o = self.forward(y[a:a + MAX_BSZN].unsqueeze(0), sub, out_dtype)
+                sub["dec_routed"] = (routed[0][a:a + self.coop_rows], routed[1][a:a + self.coop_rows])
+            o = self.forward(y[a:a + self.coop_rows].unsqueeze(0), sub, out_dtype)
             outs.append(o.reshape(-1, o.shape[-1]).clone())   # the bszN output buffer is reused by the next slice
         return torch.cat(outs).view(x.shape[:-1] + (outs[0].shape[-1],))
 
