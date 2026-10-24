@@ -1217,7 +1217,7 @@ noise of the quantization), which is why each has an off switch for A/B work.
 #### `EXL3_CUDA_GRAPH` (default `0`; `tools/qwen/serve.py` and `tools/flint/serve.py` set it to `1` on NVIDIA)
 
 Whole-forward CUDA graph for decode steps (Qwen GDN, Flint sliding-window ring, MTP verify). `EXL3_CUDA_GRAPH_MULTI=1`
-(default off) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache.
+(default off; `tools/flint/serve.py --max-batch N` and `tools/qwen/serve.py --sessions N` set it to `1` on NVIDIA when N > 1) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache (16 with MULTI, 32 from the Qwen server with `--sessions` > 1).
 
 #### `EXL3_QDEC` (default `1`), `EXL3_QDEC_GRAPH` (default `1`), `EXL3_QDEC_ROWS` (default `1`)
 

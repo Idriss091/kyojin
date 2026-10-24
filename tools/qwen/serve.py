@@ -700,6 +700,9 @@ class QwenEngine:
         if on_cuda:
             for k, v in CUDA_SERVE_ENV:
                 os.environ.setdefault(k, v)
+            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 4 x 8 shapes
+                os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")
+                os.environ.setdefault("EXL3_CUDA_GRAPH_MAX", "32")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
