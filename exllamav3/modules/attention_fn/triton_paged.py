@@ -1089,6 +1089,39 @@ def _paged_attn_decode_combine_kernel(
 
 _decode_sm_count = {}
 
+# ROCm: HIP tensor-core split kernel for quantized-KV decode (qdec.hip), EXL3_QDEC_HIP=0 keeps the Triton kernels
+from . import qdec_hip as _qh
+_QDEC_HIP = _qh.ENABLED
+
+
+def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap, sinks, out,
+                     num_splits, max_kv_len, qc, kv_append_len, n_kv_heads):
+    """The qdec.hip path of paged_attn_triton_decode, or None when the call is outside its shapes (the Triton kernels then run it)"""
+    k_scales, v_scales, qck, qcv = qc
+    if (q.dtype != torch.float16 or q.ndim != 4 or not q.is_contiguous() or num_splits is not None
+            or not all(t.is_contiguous() for t in (k_cache, v_cache, k_scales, v_scales, block_table, cache_seqlens))
+            or block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32 or k_cache.dtype != torch.int32
+            or v_cache.dtype != torch.int32 or k_scales.dtype != torch.float16 or v_scales.dtype != torch.float16):
+        return None
+    bsz, q_len, n_q_heads, head_dim = q.shape
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    window_left, window_right = _normalize_window(window_size)
+    sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
+    if has_sinks and (sinks.dtype != torch.float32 or not sinks.is_contiguous()):
+        return None
+    cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
+                       window_left, window_right, softcap, kv_append_len, has_sinks)
+    if cfg is None:
+        return None
+    max_k_len = block_table.shape[1] * k_cache.shape[1] + kv_append_len
+    if max_kv_len is not None:
+        max_k_len = min(max_k_len, max_kv_len + kv_append_len)
+    if out is None:
+        out = torch.empty_like(q)
+    with torch.cuda.device(q.device):
+        return _qh.decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_scales, _get_h32(q.device), sinks, out, max_k_len)
+
 # A/B switch, read once at import: CUDA decode runs the upstream exllamav3 1.6.0 (MIT) kernels in triton_paged_cu.py;
 # EXL3_ATTN16=0 keeps the kernels in this file. ROCm always keeps them
 ATTN16 = (not torch.version.hip) and os.environ.get("EXL3_ATTN16", "1") != "0"
@@ -1136,6 +1169,11 @@ def paged_attn_triton_decode(
         _k = (tuple(q.shape), tuple(k_cache.shape), str(window_size), qc is not None, split_batch)
         if _k not in _ATTN16_SEEN:
             _ATTN16_SEEN.add(_k); print(" -- attn16 eager decode", _k, "new" if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0) else "old", flush = True)
+    if qc is not None and _QDEC_HIP and k is None:
+        out_hip = _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap,
+                                   sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override)
+        if out_hip is not None:
+            return out_hip
     if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0):
         from .triton_paged_cu import paged_attn_triton_decode_cu, NoFittingConfig
         try:
