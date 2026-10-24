@@ -237,7 +237,8 @@ EXL3_DEC = os.environ.get("EXL3_DEC", "1") != "0"
 _DEC_KB2 = (4, 5, 6, 8, 10, 12)
 # dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs); the routed-MoE kernels stop at K6
 _DEC_KB2_DENSE = _DEC_KB2 + (14,)
-DEC_SCRATCH_FLOATS = 2 << 20
+# ROCm carries 9..32 rows per exl3_dec_gemv_r call: R * kbs * N partial sums of a wide dense projection (GDN qkvz at 28+ rows) outgrow 2M floats
+DEC_SCRATCH_FLOATS = (8 << 20) if torch.version.hip else (2 << 20)
 # arrival counters: the 8-row kernels fit 4096; a 32-row GEMV of a wide N (lm_head: 32 * ceil(N / 512)) needs up to ~16k
 DEC_COUNTERS = 16384
 _dec_workspaces: dict = {}
