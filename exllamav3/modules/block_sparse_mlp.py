@@ -2862,9 +2862,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
+            # Shared experts: merged in the kernel from their 8-row graph, or above MAX_BSZN rows by the regular tail below
+            # (their R-row kernels; measured 1.2-2 ms/step faster at 10-32 rows than 8-row slices of the graph)
+            sh_in_bc = self.bc_sh_exp and bsz <= MAX_BSZN
+            self.bc.run_bszN(y, selected_experts, routing_weights, sh_in_bc)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
-            bc_sh_exp = self.bc_sh_exp
+            bc_sh_exp = sh_in_bc
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)

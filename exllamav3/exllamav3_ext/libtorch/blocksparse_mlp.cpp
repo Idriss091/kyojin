@@ -68,7 +68,8 @@ void BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
-    at::Tensor& routing_weights
+    at::Tensor& routing_weights,
+    bool with_shared
 )
 {
     // Two fused launches per layer cover every (token, expert) slot of the batch (see
@@ -86,18 +87,13 @@ void BC_BlockSparseMLP::run_bszN
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
-    if (shared_experts)
+    if (shared_experts && with_shared)
     {
-        // The shared-expert graphs cover MAX_BSZN rows each: larger batches run as consecutive slices
-        // (rows are independent), the first one included so that <= MAX_BSZN rows are unchanged
+        // The shared-expert graphs cover MAX_BSZN rows: larger batches take their shared experts from the caller
+        TORCH_CHECK(num_tokens <= MAX_BSZN, "run_bszN: shared experts above MAX_BSZN rows are the caller's");
+        at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
-        for (int a = 0; a < num_tokens; a += MAX_BSZN)
-        {
-            int n = std::min(MAX_BSZN, num_tokens - a);
-            at::Tensor x_dense = y.slice(0, a, a + n).unsqueeze(0);
-            at::Tensor d_n = out_d_sh_n.slice(1, a, a + n);
-            shared_experts->run_bszN(x_dense, d_n);
-        }
+        shared_experts->run_bszN(x_dense, out_d_sh_n);
         sh_o = out_d_sh_n;
     }
     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
