@@ -982,7 +982,7 @@ on the box (v1.7.2), 4 sessions, 4 greedy prompts: 26.1 to 40.7 tok/s aggregate.
 not change there. The text of 4 concurrent plain streams still differs from the solo run at a near-tie word (the solo step
 uses the one-row kernels), as it did before the flag.
 
-#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server, else `0`)
+#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server on ROCm; on NVIDIA `16` for a dense model and `0` for a model with MoE layers; `0` elsewhere)
 
 Qwen speculative decoding: with N requests decoding together the draft depth is capped at `R // N - 1`, so the verify rows
 of the step, `N * (depth + 1)`, stay within `R` rows (no draft when that is below 1). `0` turns the cap off.
