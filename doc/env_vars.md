@@ -1226,6 +1226,23 @@ build step) that reads the packed pages directly. `EXL3_QDEC=0` falls back to th
 disables its CUDA-graph capture path, `EXL3_QDEC_ROWS` selects the many-row kernel for verify steps (q_len 2..8 at
 head dim 256): `0` off, `1` only where the single-row kernel cannot serve, `2` always.
 
+#### `EXL3_QWRITE_TRITON` (default `1`; ROCm)
+
+Native Triton writer for the quantized paged cache (K/V bits 2..8, `attention_fn/qwrite_triton.py`): one launch appends the new
+rows of K and V with the same arithmetic and packed plane layout as the PyTorch fallback (bit-identical words and scales,
+`tests/test_qwrite.py`). The fallback needs ~70 launches per layer (decode append 402 us, 4096-row prefill chunk 5.2 ms at
+K/V 6,6 per layer; native 17 us / 89 us). `0` restores the fallback.
+
+#### `EXL3_QDEC_HIP` (default `0`; ROCm gfx11.5)
+
+HIP counterpart of `EXL3_QDEC` for AMD (Strix Halo): a wave32 WMMA kernel (`attention_fn/qdec.hip`, compiled with hipcc at first
+use and cached under `~/.cache/exllamav3`) that dequantizes the packed K/V pages straight into the WMMA operands, plus a small
+combine kernel. Used for quantized-KV decode (K/V bits 2..8, head dim 128 or 256, q_len up to 6 at head dim 128 / 3 at 256) with
+full attention, no softcap; windowed layers, 1-bit planes and bigger shapes keep the Triton kernels. `0` keeps the Triton kernels.
+Tuning knobs for A/B work: `EXL3_QDEC_HIP_NW` (waves per CTA, default 4), `EXL3_QDEC_HIP_DW` (waves splitting the head dim),
+`EXL3_QDEC_HIP_WAVES` (target resident waves for the split count), `EXL3_QDEC_HIP_SPL` (fixed split count),
+`EXL3_QDEC_HIP_MAXO` (accumulator budget per lane, default 96).
+
 #### `EXL3_PREFILL_WIDE` (default `1`)
 
 Models with sliding-window attention only and a fused MoE (Flint): prompts that fit are prefilled in one pass, in

@@ -1094,26 +1094,44 @@ from . import qdec_hip as _qh
 _QDEC_HIP = _qh.ENABLED
 
 
+_QDEC_HIP_DEBUG = os.environ.get("EXL3_QDEC_HIP_DEBUG") == "1"
+_qdec_hip_stats = {}
+
+
+def _qdec_hip_note(key):
+    _qdec_hip_stats[key] = _qdec_hip_stats.get(key, 0) + 1
+
+
+if _QDEC_HIP_DEBUG:
+    import atexit
+    atexit.register(lambda: print("QDEC_HIP calls:", dict(sorted(_qdec_hip_stats.items(), key = lambda kv: str(kv[0]))), flush = True))
+
+
 def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap, sinks, out,
                      num_splits, max_kv_len, qc, kv_append_len, n_kv_heads):
     """The qdec.hip path of paged_attn_triton_decode, or None when the call is outside its shapes (the Triton kernels then run it)"""
     k_scales, v_scales, qck, qcv = qc
-    if (q.dtype != torch.float16 or q.ndim != 4 or not q.is_contiguous() or num_splits is not None
-            or not all(t.is_contiguous() for t in (k_cache, v_cache, k_scales, v_scales, block_table, cache_seqlens))
-            or block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32 or k_cache.dtype != torch.int32
-            or v_cache.dtype != torch.int32 or k_scales.dtype != torch.float16 or v_scales.dtype != torch.float16):
+    why = None
+    if q.dtype != torch.float16 or q.ndim != 4: why = "q dtype/rank"
+    elif not q.is_contiguous(): why = "q not contiguous"
+    elif num_splits is not None: why = "num_splits given"
+    elif not all(t.is_contiguous() for t in (k_cache, v_cache, k_scales, v_scales, block_table, cache_seqlens)): why = "cache tensor not contiguous"
+    elif block_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32: why = "table/seqlens dtype"
+    elif k_cache.dtype != torch.int32 or v_cache.dtype != torch.int32 or k_scales.dtype != torch.float16 or v_scales.dtype != torch.float16: why = "cache dtype"
+    if why is not None:
+        if _QDEC_HIP_DEBUG: _qdec_hip_note(("no", why))
         return None
     bsz, q_len, n_q_heads, head_dim = q.shape
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     window_left, window_right = _normalize_window(window_size)
     sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
-    if has_sinks and (sinks.dtype != torch.float32 or not sinks.is_contiguous()):
-        return None
     cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
                        window_left, window_right, softcap, kv_append_len, has_sinks)
     if cfg is None:
+        if _QDEC_HIP_DEBUG: _qdec_hip_note(("no", f"cfg q_len {q_len} hd {head_dim} {n_q_heads}/{n_kv_heads} bits {qck},{qcv} window {window_left},{window_right} softcap {softcap} append {kv_append_len}"))
         return None
+    if _QDEC_HIP_DEBUG: _qdec_hip_note(("hip", f"q_len {q_len} hd {head_dim} bits {qck},{qcv} sinks {has_sinks}"))
     max_k_len = block_table.shape[1] * k_cache.shape[1] + kv_append_len
     if max_kv_len is not None:
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)

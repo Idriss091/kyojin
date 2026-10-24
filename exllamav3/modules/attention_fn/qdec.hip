@@ -203,9 +203,9 @@ qdec_split(
 
     auto slab_rows = [&](int it) {
         int n0 = n_start + (sw + it * NSW) * 16;
-        int page = n0 / PAGE;
+        int page = min(n0 / PAGE, num_pages_per_seq - 1);   // never past the block table row (cache_seqlens is trusted otherwise)
         int phys = block_table[batch * num_pages_per_seq + page];
-        row0 = phys * PAGE + (n0 - page * PAGE);
+        row0 = phys * PAGE + min(n0 - page * PAGE, PAGE - 16);
         lim = n_end - 1 - n0;                             // last valid token of the slab (>= 0)
     };
     auto load_k = [&]() {
