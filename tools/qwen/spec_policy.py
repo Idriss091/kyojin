@@ -355,12 +355,21 @@ def ngram_from_env(default=(2, 7, 16, 3)):
     if not (3 <= len(f) <= 4 and 1 <= g <= LMAX and k >= 1 and m >= g and min(f) >= 0): raise ValueError(f"QWSPEC_NGRAM={v}")
     return tuple(f)
 
-def load_caps_from_env():
+def dense_cuda_rows(model):
+    """Verify-row budget for a model whose forward takes many rows at almost the cost of a few: a CUDA build without any
+    block-sparse MoE layer (the MoE decode kernels stop at 8 rows, MAX_BSZN, and fall off a cliff above it). Qwen3.8-27B on an
+    RTX 3090, 4 requests: target forward 25 ms at 2 rows, 29 ms at 8, 33 ms for 16 (4 x 4), so the uncapped solo depth rule
+    (up to 8 rows per request, 32 rows) costs more than the tokens it drafts: 165 tok/s against 219 with a 16-row budget."""
+    if torch.version.hip is not None or not torch.cuda.is_available(): return 0
+    from exllamav3.modules import BlockSparseMLP
+    return 0 if any(isinstance(m, BlockSparseMLP) for m in model) else 16
+
+def load_caps_from_env(model=None):
     """(table, rows) from QWSPEC_LOAD_CAPS = "N:D,N:D,..." (draft depth cap D, 0 = no draft, when N requests decode together)
     and QWSPEC_LOAD_ROWS = R (no table entry for N -> cap R // N - 1, the depth at which the N jobs' verify rows, N * (D + 1),
     fit one forward of the row-invariant grouped step: generator/row_groups.py runs one forward per 8 rows). Unset / 0 = no
     load cap, the solo depth rule at every N. Unset QWSPEC_LOAD_ROWS = EXL3_ROW_INV_GROUP_ROWS (8) when EXL3_ROW_INV_GROUPS=1,
-    else 0; QWSPEC_LOAD_ROWS=0 turns the cap off."""
+    else dense_cuda_rows(model) (16 for a dense CUDA model, else 0); QWSPEC_LOAD_ROWS=0 turns the cap off."""
     v = os.environ.get("QWSPEC_LOAD_CAPS", "").strip()
     table = {}
     if v:
@@ -369,7 +378,7 @@ def load_caps_from_env():
     rows = os.environ.get("QWSPEC_LOAD_ROWS", "")
     if rows.strip() == "":      # default: on exactly when the grouped step is on, with its row cap
         on = all(os.environ.get(k, d) not in ("", "0") for k, d in (("EXL3_ROW_INV_GROUPS", "0"), ("EXL3_ROW_INV", "1")))
-        rows = os.environ.get("EXL3_ROW_INV_GROUP_ROWS", "") or "8" if on else "0"
+        rows = os.environ.get("EXL3_ROW_INV_GROUP_ROWS", "") or "8" if on else str(dense_cuda_rows(model) if model is not None else 0)
     return table, int(rows)
 
 def load_depth_cap(n, table, rows):
@@ -560,7 +569,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     log = list: logging arm. Drafts log_depth depths whatever the rule says, appends one dict per round
       (n, ng, ps, ids, keep) and verifies what `rule` would have kept (the stream is the baseline stream)."""
     lm = model.modules[model.logit_layer_idx]
-    load_table, load_rows = load_caps_from_env()
+    load_table, load_rows = load_caps_from_env(model)
     if rule is None: rule = ProductRule(thf, thv, maxd)
     maxd = rule.maxd                  # the rule owns the depth cap
     st = {"i": 0, "stop": False, "keep": None, "ps": [], "job": None, "n": None, "drafted": 0}

@@ -362,6 +362,21 @@ class TI(unittest.TestCase):
         try: self.assertEqual(sp.load_caps_from_env(), ({2: 5, 4: 0}, 8))
         finally: del os.environ["QWSPEC_LOAD_CAPS"], os.environ["QWSPEC_LOAD_ROWS"]
 
+    def test_load_rows_default_dense_cuda(self):
+        keep = {k: os.environ.pop(k, None) for k in ("QWSPEC_LOAD_ROWS", "QWSPEC_LOAD_CAPS", "EXL3_ROW_INV_GROUPS", "EXL3_ROW_INV_GROUP_ROWS")}
+        try:
+            cuda = sp.torch.version.hip is None and sp.torch.cuda.is_available()
+            self.assertEqual(sp.load_caps_from_env([object(), object()]), ({}, 16 if cuda else 0))      # dense model: a 16-row budget on CUDA only
+            os.environ["QWSPEC_LOAD_ROWS"] = "0"; self.assertEqual(sp.load_caps_from_env([object()]), ({}, 0))
+            os.environ["QWSPEC_LOAD_ROWS"] = "12"; self.assertEqual(sp.load_caps_from_env([object()]), ({}, 12))
+            del os.environ["QWSPEC_LOAD_ROWS"]
+            from exllamav3.modules import BlockSparseMLP
+            self.assertEqual(sp.load_caps_from_env([BlockSparseMLP.__new__(BlockSparseMLP)]), ({}, 0))   # a MoE layer keeps the old default (its decode kernels stop at 8 rows)
+        finally:
+            for k, v in keep.items():
+                os.environ.pop(k, None)
+                if v is not None: os.environ[k] = v
+
     def test_load_rows_default_follows_groups(self):
         keep = {k: os.environ.pop(k, None) for k in ("QWSPEC_LOAD_ROWS", "QWSPEC_LOAD_CAPS", "EXL3_ROW_INV_GROUPS", "EXL3_ROW_INV_GROUP_ROWS")}
         try:
