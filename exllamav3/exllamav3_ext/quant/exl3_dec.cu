@@ -1416,7 +1416,7 @@ __global__ void moe_combine_kernel_r(MoeArgsR a)
 
 constexpr int ROUTER_KCHUNK = 64;
 constexpr int CTR_ROUTER = 4000;          // one arrival counter per row: CTR_ROUTER + row
-constexpr int ROUTER_NORM_MAX_ROWS = 8;
+constexpr int ROUTER_NORM_MAX_ROWS = 32;   // grid.y = row, one arrival counter per row (CTR_ROUTER + row); rows never share state
 
 // Fused pre-norm (NORM): the block also computes the MLP pre-norm of r + xa (rms_norm_res_in
 // semantics, the same arithmetic as rms_norm_kernel mode 2), writes its 64 normalized fp16 inputs to
@@ -2335,6 +2335,10 @@ struct JobsR
 };
 
 constexpr int GEMV_R_ROW_BUDGET = MOE_R_MAX * MOE_R_KTW_MAX;   // 128: max rpb * ktw
+// Rows per exl3_dec_gemv_r call. One block still holds at most MOE_R_MAX rows (LDS staging, accumulators); rows beyond that run as
+// further grid.y row chunks of the same launch. Every row keeps batch-1's ktw / kbs / reduction order, so the bits of a row do not
+// depend on how many rows the call carries (checked by tools/decode/gemv_r_probe.py and gemv_r_rows_bench.py).
+constexpr int GEMV_R_MAX_ROWS = 32;
 // Tile ring depth for gemv_kernel_r. 0 (default) = batch-1's ring at RM 1, else 1: the 2-deep ring of
 // the > 4 bpw formats (80 VGPRs of tile words) plus RM x 16 accumulators spilled 125 VGPRs at
 // KB2 10 RM 2 (GLM lm_head, R 2 ran 5.0 ms vs 3.6 ms for two batch-1 launches). Result-neutral.
@@ -2480,7 +2484,7 @@ static void dec_gemv_r_impl
     TORCH_CHECK(x.dtype() == at::kHalf && x.is_contiguous() && x.dim() == 2, "exl3_dec_gemv_r: x must be [R, K] fp16");
     const int R = (int) x.size(0);
     const int Kdim = (int) x.size(1);
-    TORCH_CHECK(R >= 1 && R <= MOE_R_MAX, "exl3_dec_gemv_r: R must be 1..MOE_R_MAX");
+    TORCH_CHECK(R >= 1 && R <= GEMV_R_MAX_ROWS, "exl3_dec_gemv_r: R must be 1..GEMV_R_MAX_ROWS");
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv_r: K must be a multiple of 512");
     const int kb2 = kb2_of(K[0]);
     int strips_total = 0;
@@ -2494,12 +2498,14 @@ static void dec_gemv_r_impl
     // EXL3_GEMV_R_RPB caps rows per block (grid.y = ceil(R / rpb) row chunks, each re-reading the
     // weights). Null result (glm-mtp step 4): RM 4 spills a little at KB2 >= 8 but a cap of 1 or 2
     // always lost (lm_head R 4: 1.81 ms default vs 3.53 ms cap 2; R 3 verify 80.4 vs 94.5 ms).
-    int rpb = std::max(1, std::min(R, GEMV_R_ROW_BUDGET / ktw));
+    int rpb = std::max(1, std::min(std::min(R, GEMV_R_ROW_BUDGET / ktw), MOE_R_MAX));
     const int rpb_cap = env_int("EXL3_GEMV_R_RPB", 0);
     if (rpb_cap > 0) rpb = std::min(rpb, rpb_cap);
     // (MiMo, R 5..8 verify, bitwise independent of rpb): the 8-row kernel variant wins at R 5-6
     // but loses at R 7-8 (131 vs 123 ms per verify forward, spills); from R 7 on run two 4-row chunks (grid.y = 2).
     else if (R >= 7 && rpb > 4 && env_int("EXL3_GEMV_R_RPB78", 4) > 0) rpb = env_int("EXL3_GEMV_R_RPB78", 4);
+    // 9..32 rows: row chunks of EXL3_GEMV_R_RPB9 rows (default 4: the 4-row instantiation does not spill), grid.y = ceil(R / rpb)
+    if (R > MOE_R_MAX && !(rpb_cap > 0) && rpb > 1) rpb = std::min(rpb, std::max(1, env_int("EXL3_GEMV_R_RPB9", 4)));
 
     // EXL3_GEMV_R_RM6=1 (needs EXL3_GEMV_R_DEC1=1): 5 or 6 rows run in ONE launch of the 6-row instantiation (one decode pass,
     // no VGPR spill at K*2 = 8 / 10) instead of a 4-row chunk plus a 1..2 row chunk. Same per-row arithmetic (rows are independent
@@ -2514,7 +2520,9 @@ static void dec_gemv_r_impl
     jobs.kbs = kbs;
     jobs.R = R;
     jobs.rpb = rpb;
-    jobs.swap = env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 && R > 4 && R > rpb;   // 5..8 rows only: the <= 4 row launches keep their grid
+    // 5..8 rows only (the <= 4 row launches keep their grid); 9..32 rows swap by default (EXL3_GEMV_R_SWAP9=0 restores the plain grid):
+    // the chunks of one weight block then run side by side and share its reads through L2 instead of re-streaming the weights per chunk
+    jobs.swap = (env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 || (R > MOE_R_MAX && env_int("EXL3_GEMV_R_SWAP9", 1) != 0)) && R > 4 && R > rpb;
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
@@ -2546,6 +2554,7 @@ static void dec_gemv_r_impl
     float* sp = scratch.data_ptr<float>();
     int* cp = counters.data_ptr<int>();
     const int nch = (R + rpb - 1) / rpb;
+    if (jobs.swap && blocks > 65535 && R > MOE_R_MAX) jobs.swap = 0;       // the default-swapped 9+ row launch falls back to the plain grid
     TORCH_CHECK(!jobs.swap || blocks <= 65535, "exl3_dec_gemv_r: too many blocks for the swapped grid");
     const dim3 grid = jobs.swap ? dim3(nch, blocks) : dim3(blocks, nch);
     if (rm6)
@@ -3097,7 +3106,7 @@ void exl3_dec_router_norm
     const int E = gate.size(1);
     TORCH_CHECK(H > 0 && xa.numel() % H == 0, "exl3_dec_router_norm: xa size");
     const int NR = xa.numel() / H;
-    TORCH_CHECK(NR >= 1 && NR <= ROUTER_NORM_MAX_ROWS, "exl3_dec_router_norm: rows 1..8");
+    TORCH_CHECK(NR >= 1 && NR <= ROUTER_NORM_MAX_ROWS, "exl3_dec_router_norm: rows 1..ROUTER_NORM_MAX_ROWS");
     TORCH_CHECK((xa.dtype() == at::kHalf || xa.dtype() == at::kFloat) && xa.is_contiguous() && xa.numel() == (int64_t) NR * H,
                 "exl3_dec_router_norm: xa fp16/fp32 [NR, H]");
     TORCH_CHECK(r.dtype() == at::kFloat && r.is_contiguous() && r.numel() == (int64_t) NR * H, "exl3_dec_router_norm: r fp32 [NR, H]");

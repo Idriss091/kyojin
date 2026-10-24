@@ -33,8 +33,8 @@ def test_row_caps_follow_the_flag(rowinv):
     if "EXL3_MLA_DEC_ROWLOOP_MAX" in os.environ:
         pytest.skip("explicit rowloop cap in the environment")
     rowinv["on"] = True
-    assert R._router_rows_max() == ROW_INV_MAX_ROWS == 8
-    assert _rowloop_max() == 8
+    assert R._router_rows_max() == ROW_INV_MAX_ROWS == (32 if torch.version.hip else 8)
+    assert _rowloop_max() == ROW_INV_MAX_ROWS
     rowinv["on"] = False
     assert R._router_rows_max() == R.DEC_ROUTER_ROWS_MAX == 4
     assert _rowloop_max() == 4
