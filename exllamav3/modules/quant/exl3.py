@@ -228,7 +228,7 @@ def _had_cache_put(inner, n_offset, n, w, clock):
 # are fp16 anyway so the only loss is rounding the product to fp16 before the fp32 consumer.
 # Decode (few rows) keeps the direct fp32 path, where the tile choice does not matter.
 _f32_via_f16 = os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
-_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
+_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
 _hip_gemv_support_cache: dict[int, bool] = {}
 
 # Batch-1 decode kernels (exl3_dec.cu, gfx11.5): one launch per GEMV with both Hadamard stages
