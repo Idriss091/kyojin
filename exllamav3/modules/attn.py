@@ -19,6 +19,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 _shared_proj = os.environ.get("EXL3_ATTN_SHARED_PROJ", "1") != "0"
 _shared_check = os.environ.get("EXL3_ATTN_SHARED_CHECK", "0") != "0"
+# EXL3_ATTN_BATCH_QSA (default on): in the row-invariant multi-job step, when every sequence takes the sparse (QSA) path the plane update, the KV append and
+# the gathered attention launch once over all sequences (their kernels give each row the bits of the one-sequence launch); the selection stays per sequence
+_batch_qsa = os.environ.get("EXL3_ATTN_BATCH_QSA", "1") != "0"
 _SHARED_STATS = [0, 0]
 _QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
 
@@ -1512,7 +1515,15 @@ class Attention(Module):
             )
 
         outs = []
-        for b in range(bsz):
+        bsz_loop = bsz
+        if _batch_qsa and qsa_cpu is not None and bsz > 1:
+            thr = self.qsa_indexer.sparse_threshold()
+            if all(int(qsa_cpu[b]) + seqlen > thr for b in range(bsz)):
+                q_idx = self.qsa_indexer.update_planes(qsa_layer, x, self.rope, block_table, qsa_cpu, params)
+                qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+                outs.append(self.qsa_indexer.sparse_attend(qsa_layer, self, q, q_idx, block_table, qsa_cpu))
+                bsz_loop = 0
+        for b in range(bsz_loop):
             sl = slice(b, b + 1)
             bt_b, cs_b = block_table[sl], cache_seqlens[sl]
             if qsa_cpu is not None:
