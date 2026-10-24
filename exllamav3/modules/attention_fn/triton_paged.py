@@ -2026,7 +2026,8 @@ def paged_attn_triton_prefill(
         # chunk (q_len < 256, the direct path) runs, which made Flint kv 8,8 OOM at 256K on a 24 GiB card.
         # EXL3_QC_PF_MAXNREG overrides the cap (0 = compiler default)
         _maxnreg = int(os.environ.get("EXL3_QC_PF_MAXNREG", "255" if qc is not None and qck + qcv >= 16 else "0"))
-        _launch_opts = {"maxnreg": _maxnreg} if _maxnreg else {}
+        # the ROCm Triton backend has no maxnreg launch option (it raises on the unknown keyword)
+        _launch_opts = {"maxnreg": _maxnreg} if _maxnreg and not torch.version.hip else {}
         grid = (q_blocks, bsz * n_q_heads, num_splits)
         # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
         # fp32 partial buffer); common geometries keep pure int32 codegen
