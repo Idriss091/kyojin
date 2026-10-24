@@ -34,7 +34,7 @@ namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
-constexpr int PF = 4;                           // prefetch ring depth
+constexpr int PF = 1;                           // prefetch ring depth: deeper rings spilled at 64 registers and measured slower at every width
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
@@ -495,7 +495,7 @@ __device__ __forceinline__ void gemv_tile
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
             }
 
-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
+            if ((i + 1) % FOLD == 0 || i + 1 == myn)
             {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)

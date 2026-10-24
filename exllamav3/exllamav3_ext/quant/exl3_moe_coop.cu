@@ -158,8 +158,14 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     if (sk > 0 && wide_a && max_split >= 4 && exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) >= 2)
     {
         int sms;
-        grid_a = moe_coop_sk_grid(ka, device, sms);
-        p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+        const int grid_sk = moe_coop_sk_grid(ka, device, sms);
+        // Units that fit one per SM are whole-unit blocks either way (same sums, same results): keep the
+        // per-unit grid rather than launching a grid of resident blocks that mostly exit at once
+        if (sk == 2 || base_a > sms)
+        {
+            grid_a = grid_sk;
+            p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+        }
     }
 
     void* args[] = { (void*) &p };
