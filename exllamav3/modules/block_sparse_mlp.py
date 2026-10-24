@@ -238,6 +238,40 @@ class ExpertsCFG:
 # Routed-weighted per-expert Hessians for the quantizer (see Linear.cap_rkey, convert_model.build_rwh_blends)
 _RWH = os.environ.get("EXL3_RWH", "0") == "1"
 
+class _RouteTrace:
+    """Diagnostic (EXL3_ROUTE_TRACE=path): append every MoE layer's router top-k, one record per forward
+    (layer id, rows, k, segment, int16 experts). Read-only hook, outputs unchanged; SIGUSR1 starts a new segment
+    (= a new conversation). Syncs once per layer, run with graphs off."""
+    def __init__(self, path):
+        import signal, threading
+        self.f = open(path, "ab", buffering = 1 << 20)
+        self.keys = {}
+        self.seg = 0
+        self.kf = open(path + ".keys", "a")
+        self.lock = threading.Lock()
+        signal.signal(signal.SIGUSR1, self._seg)
+
+    def _seg(self, *a):
+        self.seg += 1
+        self.f.flush()
+
+    def record(self, key, bsz, sel):
+        import numpy as np
+        if torch.cuda.is_current_stream_capturing():
+            return
+        kid = self.keys.get(key)
+        if kid is None:
+            kid = self.keys[key] = len(self.keys)
+            self.kf.write(f"{kid} {key}\n"); self.kf.flush()
+        a = sel.detach().to(torch.int16).cpu().numpy().reshape(bsz, -1)
+        with self.lock:
+            np.array([kid, bsz, a.shape[1], self.seg], dtype = np.int32).tofile(self.f)
+            a.tofile(self.f)
+
+
+_ROUTE_TRACE = _RouteTrace(os.environ["EXL3_ROUTE_TRACE"]) if os.environ.get("EXL3_ROUTE_TRACE") else None
+
+
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def __init__(
@@ -2041,6 +2075,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+
+        if _ROUTE_TRACE is not None:
+            _ROUTE_TRACE.record(self.key, bsz, selected_experts)
 
         # Extra norm (Gemma4)
         if self.routed_pre_norm:
