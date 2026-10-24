@@ -45,7 +45,9 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
         else                  C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
         size_m_ -= TILESIZE_M;
 
-        if (size_m_ > 0 || svh)
+        // Rows beyond this tile reuse the column locks, so wait for the whole grid; the output rotation by
+        // svh is done by the last block of each column inside the tile, so nothing follows the last tile
+        if (size_m_ > 0)
             grid.sync();
     }
 
