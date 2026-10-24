@@ -245,8 +245,19 @@ def test_odd_shapes():
 
 
 def test_decode_k_split():
-    # Flint-like batch 1: 48 gate/up units fit one per SM, so the gate/up stage shares each unit's k loop over blocks
-    # (fp32 partial rows) on Ampere; shared-expert merge and mixed widths on top
+    # Flint-like batch 1: 48 gate/up units fit one per SM. Default: unsplit unit (per-unit grid); with
+    # EXL3_MOE_COOP_KSPLIT_A=3 (see test_decode_k_split_opt_in) the gate/up stage shares each unit's k loop over
+    # blocks (fp32 partial rows) on Ampere; shared-expert merge and mixed widths on top
     run_case(28, 3, 3, 3, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1)
     run_case(29, 4, 4, 5, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1, shared = "gated")
 
+
+def test_decode_k_split_opt_in():
+    # The mode is read once per process: rerun the shape test with the k-split enabled
+    if os.environ.get("EXL3_MOE_COOP_KSPLIT_A") == "3":
+        pytest.skip("already running with the k-split")
+    import subprocess, sys
+    env = dict(os.environ, EXL3_MOE_COOP_KSPLIT_A = "3")
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", f"{__file__}::test_decode_k_split"],
+                       env = env, capture_output = True, text = True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]

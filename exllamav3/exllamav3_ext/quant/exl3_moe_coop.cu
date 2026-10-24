@@ -81,17 +81,17 @@ static int moe_coop_sk_mode()
 }
 
 // Gate/up k-split for batches whose units already fit one per SM (decode: 48 units for 82 SMs on Flint): every
-// unit's k-slice loop is a latency chain of one block, so it is shared by this many blocks (as long as the grid
-// stays resident), the last arrival summing the fp32 partial rows (d_out scratch) in fixed order. The sum is not
-// rounded to fp16 before the output rotation as the unsplit unit's output is, so results differ from it by that
-// rounding. EXL3_MOE_COOP_KSPLIT_A = 1 restores the unsplit unit, bit-identical to the previous kernel
+// unit's k-slice loop is a latency chain of one block, so with EXL3_MOE_COOP_KSPLIT_A = n it is shared by up to n
+// blocks (as long as the grid stays resident), the last arrival summing the fp32 partial rows (d_out scratch) in
+// fixed order. The sum is not rounded to fp16 before the output rotation as the unsplit unit's output is, so results
+// differ from it by that rounding. Off by default (unset, 0 or 1): the unsplit unit, bit-identical to the previous kernel
 static int moe_coop_ksplit_a_mode()
 {
     static int mode = -2;
     if (mode == -2)
     {
         const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT_A");
-        mode = env ? atoi(env) : 3;
+        mode = env ? atoi(env) : 1;
     }
     return mode;
 }
