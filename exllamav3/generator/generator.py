@@ -608,9 +608,44 @@ class Generator:
     @torch.inference_mode
     def iterate(self) -> list[dict]:
         self.flush_deferred()
+        if _TORCH_PROF is not None:
+            return self._iterate_profiled()
         results = self._iterate_inner()
         if _moe_fused_check is not None:
             _moe_fused_check(self.model)
+        return results
+
+    def _iterate_profiled(self) -> list[dict]:
+        """EXL3_TORCH_PROF=JOBS:SKIP:STEPS:PATH (diagnostic): once JOBS requests have been decoding together for SKIP iterations,
+        profile the next STEPS iterations with the torch profiler and write the kernel table (per iteration) to PATH."""
+        st = _TORCH_PROF
+        n = sum(1 for j in self.active_jobs if j.is_prefill_done())
+        if st["done"] or n != st["jobs"]:
+            st["seen"] = 0
+            results = self._iterate_inner()
+            return results
+        st["seen"] += 1
+        if st["seen"] == st["skip"] + 1:
+            from torch.profiler import profile, ProfilerActivity
+            st["prof"] = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]); st["prof"].__enter__()
+            st["t0"] = time.perf_counter(); st["n"] = 0
+        results = self._iterate_inner()
+        if st["prof"] is not None:
+            st["n"] += 1
+            if st["n"] == st["steps"]:
+                torch.cuda.synchronize(); wall = time.perf_counter() - st["t0"]
+                st["prof"].__exit__(None, None, None)
+                import collections
+                g = collections.defaultdict(lambda: [0, 0.0])
+                for e in st["prof"].events():
+                    if e.device_type == torch.autograd.DeviceType.CUDA:
+                        g[e.name[:110]][0] += 1; g[e.name[:110]][1] += e.device_time
+                busy = sum(v[1] for v in g.values()); k = st["steps"]
+                with open(st["path"], "w") as f:
+                    f.write(f"jobs={st['jobs']} steps={k} wall {wall / k * 1000:.2f} ms/iter, kernel-sum {busy / k / 1000:.2f} ms/iter, launches/iter {sum(v[0] for v in g.values()) / k:.0f}\n")
+                    for name, (c, t) in sorted(g.items(), key = lambda kv: -kv[1][1])[:40]:
+                        f.write(f"{t / k / 1000:8.3f} ms {c / k:7.1f}/iter  {name}\n")
+                st["prof"] = None; st["done"] = True
         return results
 
     def _cil_views(self) -> list:
@@ -2311,6 +2346,11 @@ class Generator:
         else:
             return completions
 
+
+_TORCH_PROF = None
+if os.environ.get("EXL3_TORCH_PROF"):
+    _a = os.environ["EXL3_TORCH_PROF"].split(":", 3)
+    _TORCH_PROF = dict(jobs = int(_a[0]), skip = int(_a[1]), steps = int(_a[2]), path = _a[3], seen = 0, done = False, prof = None)
 
 SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
 SPEC_PROF_REC: list = []
