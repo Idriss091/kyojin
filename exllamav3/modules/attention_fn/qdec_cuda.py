@@ -75,6 +75,8 @@ def _compile(cfg):
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"],
                 PAGE=cfg["page"], NW=cfg["nw"], ST=cfg["st"], CAUSAL=int(cfg["causal"]), BLOCK_ROWS=cfg["block_rows"],
                 HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f")
+    defs["L2HINT"] = int(os.environ.get("EXL3_QDEC_L2HINT", "1"))       # L2 evict_first on K/V, evict_last on the scales
+    defs["FASTDQ"] = int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
     if os.environ.get("EXL3_QDEC_ABL"):
         defs["ABL"] = int(os.environ["EXL3_QDEC_ABL"])
     src = "#define INFINITY __int_as_float(0x7f800000)\n" + open(_COMMON).read() + "\n" + \
