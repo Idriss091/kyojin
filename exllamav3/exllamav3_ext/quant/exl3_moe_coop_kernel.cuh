@@ -867,9 +867,9 @@ __device__ __forceinline__ void a_unit
         const int slots = p.bsz * p.topk;
         void* C;
         bool c_f32 = p.gu_f32;
-        if (p.ksplit_a < 0 && seg[is_gate ? SEG_NPG : SEG_NPU] > 1)
+        if ((p.ksplit_a < 0 && seg[is_gate ? SEG_NPG : SEG_NPU] > 1) || p.ksplit_a > 1)
         {
-            // Stream-K segment of a shared unit: fp32 partial row in the d_out scratch
+            // Stream-K segment of a shared unit, or a split-k block: fp32 partial row in the d_out scratch
             const int nproj = p.gated ? 2 : 1;
             const int pi = is_gate ? 0 : nproj - 1;
             C = (void*) (p.d_out + (size_t) (pi * sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) + seg[SEG_Q]) * slots * p.I);
@@ -902,7 +902,7 @@ __device__ __forceinline__ void a_unit
             auto load_sum = [&] (const void* buf, int np, int pi, float& v0, float& v1, float& v2, float& v3)
             {
                 v0 = v1 = v2 = v3 = 0.0f;
-                if (p.ksplit_a < 0 && np > 1)
+                if ((p.ksplit_a < 0 || p.ksplit_a > 1) && np > 1)
                 {
                     const int nproj = p.gated ? 2 : 1;
                     const int slots = p.bsz * p.topk;
