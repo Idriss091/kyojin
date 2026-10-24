@@ -629,12 +629,24 @@ class Generator:
             from torch.profiler import profile, ProfilerActivity
             st["prof"] = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]); st["prof"].__enter__()
             st["t0"] = time.perf_counter(); st["n"] = 0
+            import collections, traceback
+            st["sites"] = collections.Counter(); st["orig"] = {n: getattr(torch.Tensor, n) for n in ("item", "tolist", "cpu", "numpy")}
+            def _mk(name, f):
+                def w(t, *a, **k):
+                    fr = traceback.extract_stack(limit = 2)[0]
+                    st["sites"][f"{name} {os.path.basename(fr.filename)}:{fr.lineno}"] += 1
+                    return f(t, *a, **k)
+                return w
+            for _n, _f in st["orig"].items(): setattr(torch.Tensor, _n, _mk(_n, _f))
         results = self._iterate_inner()
         if st["prof"] is not None:
             st["n"] += 1
             if st["n"] == st["steps"]:
-                torch.cuda.synchronize(); wall = time.perf_counter() - st["t0"]
+                torch.cuda.synchronize(); wall = time.perf_counter() - st["t0"]; k_ = st["steps"]
                 st["prof"].__exit__(None, None, None)
+                for _n, _f in st["orig"].items(): setattr(torch.Tensor, _n, _f)
+                with open(st["path"] + ".sites", "w") as f:
+                    for site, c in st["sites"].most_common(25): f.write(f"{c / k_:7.1f}/iter  {site}\n")
                 import collections
                 g = collections.defaultdict(lambda: [0, 0.0])
                 for e in st["prof"].events():
