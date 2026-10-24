@@ -242,3 +242,11 @@ def test_odd_shapes():
     # k-slices not divisible by the 16-warp split, several column groups
     run_case(16, 4, 4, 4, 1, H = 640, Hi = 640, I = 896, Ho = 640, H_out = 640)
     run_case(17, 6, 6, 6, 2, H = 384, Hi = 384, I = 1152, Ho = 384, H_out = 384)
+
+
+def test_decode_k_split():
+    # Flint-like batch 1: 48 gate/up units fit one per SM, so the gate/up stage shares each unit's k loop over blocks
+    # (fp32 partial rows) on Ampere; shared-expert merge and mixed widths on top
+    run_case(28, 3, 3, 3, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1)
+    run_case(29, 4, 4, 5, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1, shared = "gated")
+
