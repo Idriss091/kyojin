@@ -158,8 +158,13 @@ new text. `timings.prompt_n` shows how many tokens were prefilled. By default re
 ## Concurrent sessions
 
 `--sessions N` decodes up to N requests together (one recurrent slot each); more requests wait in order. A request
-reserves the pages for its prompt plus `max_tokens` when it starts, so one that does not fit next to the running ones
-waits. With N > 1, a request with `speculative: false` or `cache_prompt: false` answers 400 (both rebuild the Generator), and slot
+reserves the pages for its prompt plus its reply budget when it starts, so one that does not fit next to the running ones
+waits. A client that sends no `max_tokens` (Hermes, most chat UIs) asks for a reply as long as the context: with N > 1 such a
+request holds only its share of the context (`-c` / N, at least 2048 tokens of reply) and the generator requeues it when the
+reply goes on: the pages are released, the request re-enters the queue at the front and continues as soon as pages are free
+(the full pages are found by hash, only the tail is prefilled again). The other sessions are not blocked, and a request
+running alone still reaches the end of the context. A reply that fits its share is untouched; `--sessions 1` is unchanged.
+`--default-max-tokens` still caps the reply when you want a hard limit. With N > 1, a request with `speculative: false` or `cache_prompt: false` answers 400 (both rebuild the Generator), and slot
 save/restore/erase wait until the running requests finish.
 
 Measured with `--ndt 3`, `-c 262144`, temperature 0, two short prompts sent together (four for `--sessions 4`):
