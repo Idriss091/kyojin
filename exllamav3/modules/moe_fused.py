@@ -43,6 +43,17 @@ def _rep(tr: torch.Tensor) -> torch.Tensor:
     return tr.reshape(kt, nt // 2, 2 * nw).permute(1, 0, 2).contiguous()
 
 
+def _route_trace(fh, rows: int) -> None:
+    """EXL3_ROUTE_TRACE (diagnostic, see block_sparse_mlp._RouteTrace): record the experts the fused half-layer selected this launch,
+    read back from the kernel's own selection record (seldbg), so the trace is what the kernel really ran."""
+    from . import block_sparse_mlp as bsm
+    rt = bsm._ROUTE_TRACE
+    if rt is None:
+        return
+    k = fh.TOPK
+    rt.record(fh._tkey, rows, fh.ws_view("seldbg", rows)[: rows * k].view(rows, k))
+
+
 class FusedMoEHalf:
     """Static plan + workspace of one qwen4_exp-style MoE half-layer (HC sites, BlockSparseMLP + shared expert)."""
 
@@ -180,6 +191,7 @@ class FusedMoEHalf:
             R8["calls"] += 1
             torch.ops.mf9.half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, 0, MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
+            _route_trace(self, x.shape[0] * x.shape[1])
             return x
         if x.shape[0] * x.shape[1] > MAX_ROWS:
             # several jobs (b > 1, e.g. the MTP drafter at 5+ sessions) split over their rows like one job: rows are independent
@@ -193,9 +205,11 @@ class FusedMoEHalf:
             # core9 kernel (forced-inline phases, two blocks per WGP), byte-identical to the kernel below; same workspace layout
             torch.ops.mf9.half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, MF9["timing"], MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
+            _route_trace(self, x.shape[0] * x.shape[1])
             return x
         ext.exl3_moe_fused_half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                 self.wt, self.svt, self.ws, gr.rms_eps, int(self.native), *self.shape)
+        _route_trace(self, x.shape[0] * x.shape[1])
         return x
 
 
@@ -270,6 +284,7 @@ def maybe_apply(block, x: torch.Tensor, params: dict, hc_pending):
         if FusedMoEHalf.why_not(block) is not None:
             return None
         fh = FusedMoEHalf(block)
+        fh._tkey = block.mlp.key
         block._moe_fused = fh
     if not fh.applicable(x, params):
         return None
