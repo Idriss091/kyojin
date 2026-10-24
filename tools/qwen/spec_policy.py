@@ -355,6 +355,30 @@ def ngram_from_env(default=(2, 7, 16, 3)):
     if not (3 <= len(f) <= 4 and 1 <= g <= LMAX and k >= 1 and m >= g and min(f) >= 0): raise ValueError(f"QWSPEC_NGRAM={v}")
     return tuple(f)
 
+def load_caps_from_env():
+    """(table, rows) from QWSPEC_LOAD_CAPS = "N:D,N:D,..." (draft depth cap D, 0 = no draft, when N requests decode together)
+    and QWSPEC_LOAD_ROWS = R (no table entry for N -> cap R // N - 1, the depth at which the N jobs' verify rows, N * (D + 1),
+    fit one forward of the row-invariant grouped step: generator/row_groups.py runs one forward per 8 rows). Unset / 0 = no
+    load cap, the solo depth rule at every N. Unset QWSPEC_LOAD_ROWS = EXL3_ROW_INV_GROUP_ROWS (8) when EXL3_ROW_INV_GROUPS=1,
+    else 0; QWSPEC_LOAD_ROWS=0 turns the cap off."""
+    v = os.environ.get("QWSPEC_LOAD_CAPS", "").strip()
+    table = {}
+    if v:
+        for f in v.split(","):
+            n, d = f.split(":"); table[int(n)] = int(d)
+    rows = os.environ.get("QWSPEC_LOAD_ROWS", "")
+    if rows.strip() == "":      # default: on exactly when the grouped step is on, with its row cap
+        on = all(os.environ.get(k, d) not in ("", "0") for k, d in (("EXL3_ROW_INV_GROUPS", "0"), ("EXL3_ROW_INV", "1")))
+        rows = os.environ.get("EXL3_ROW_INV_GROUP_ROWS", "") or "8" if on else "0"
+    return table, int(rows)
+
+def load_depth_cap(n, table, rows):
+    """Deepest draft allowed while n requests decode together (None = no cap). One request keeps its own rule."""
+    if n <= 1: return None
+    if n in table: return table[n]
+    if rows <= 0: return None
+    return max(0, rows // n - 1)
+
 def _unparked(g):
     """Active jobs minus those EXL3_SCHED_CHUNK_IL skips this step (Generator._cil_parked): a short job decoding next to a parked
     big prefill still counts as alone, so its lookup/draft policy is the solo one."""
@@ -536,6 +560,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     log = list: logging arm. Drafts log_depth depths whatever the rule says, appends one dict per round
       (n, ng, ps, ids, keep) and verifies what `rule` would have kept (the stream is the baseline stream)."""
     lm = model.modules[model.logit_layer_idx]
+    load_table, load_rows = load_caps_from_env()
     if rule is None: rule = ProductRule(thf, thv, maxd)
     maxd = rule.maxd                  # the rule owns the depth cap
     st = {"i": 0, "stop": False, "keep": None, "ps": [], "job": None, "n": None, "drafted": 0}
@@ -634,6 +659,10 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
                     if a < len(c):
                         cont = c[:a] if a >= ngram[3] else None
                         if stats is not None: stats["ng_cut" if cont else "ng_skip"] = stats.get("ng_cut" if cont else "ng_skip", 0) + 1
+        # Draft depth per load: with several requests decoding together the verify rows add up (N * (D + 1)) and the grouped
+        # step runs one forward per 8 rows; the cap keeps the step in one forward (cap 0 = a plain step, no draft)
+        lcap = load_depth_cap(sum(1 for j in _unparked(g) if j.is_prefill_done()), load_table, load_rows)
+        if lcap == 0: return None
         if cont is not None:
             st["mode"] = "ng"; g.num_draft_tokens = 1
             try: out = orig_draft(results)
@@ -643,6 +672,8 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             if stats is not None: stats["ng"] = stats.get("ng", 0) + 1; stats["rows"] = stats.get("rows", 0) + 1 + len(cont)
             return torch.tensor([cont], dtype=torch.long)
         w = rule.choose() if hasattr(rule, "choose") else win
+        rule_maxd = rule.maxd
+        if lcap is not None: w = min(w, lcap); rule.maxd = min(rule_maxd, lcap)
         g.num_draft_tokens = w
         try:
             out = orig_draft(results)
@@ -650,6 +681,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             out = g.draft_ids_pinned[:, :st["keep"]]
         finally:
             g.num_draft_tokens = win      # Job.prepare / reply_room reserve against this value: keep it at the deepest window
+            rule.maxd = rule_maxd
         if out is None: return None
         if fixed is not None:
             ps = torch.stack(st["ps"]).tolist()      # the one host read of the round
