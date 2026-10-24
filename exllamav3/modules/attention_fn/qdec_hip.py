@@ -4,7 +4,7 @@ at first use with hipcc to an hsaco cached on disk, launched through the HIP mod
 qdec_combine reduces them, rotates the result back with h32 and writes the fp16 output, so one call replaces the Triton split +
 combine pair of triton_paged._paged_attn_decode_split_kernel for QCK > 0 and QCV > 0 with full (non-windowed) attention and no softcap.
 make_cfg returns None for call shapes outside what the kernel covers; the caller then keeps the Triton kernels.
-Switch: EXL3_QDEC_HIP=0/1 (see ENABLED).
+Switch: EXL3_QDEC_HIP=0/1 (see ENABLED; default on for ROCm).
 """
 import ctypes
 import hashlib
@@ -15,7 +15,7 @@ import torch
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdec.hip")
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exllamav3"))
-ENABLED = bool(torch.version.hip) and os.environ.get("EXL3_QDEC_HIP", "0") != "0"
+ENABLED = bool(torch.version.hip) and os.environ.get("EXL3_QDEC_HIP", "1") != "0"
 _kernels = {}
 _bufs = {}
 _lib = None

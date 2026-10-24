@@ -1135,6 +1135,13 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     max_k_len = block_table.shape[1] * k_cache.shape[1] + kv_append_len
     if max_kv_len is not None:
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
+    try:
+        _qh.get_kernel(cfg, q.device)        # first use compiles with hipcc: a missing compiler or a build error keeps the Triton kernels
+    except Exception as exc:                 # noqa: BLE001
+        global _QDEC_HIP
+        _QDEC_HIP = False
+        print(f"qdec_hip: disabled, the Triton decode kernels stay ({type(exc).__name__}: {str(exc)[-300:]})", flush = True)
+        return None
     if out is None:
         out = torch.empty_like(q)
     with torch.cuda.device(q.device):

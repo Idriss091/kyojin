@@ -10,7 +10,8 @@ for i, (r, n) in enumerate(zip(R["res"], N["res"])):
         top2 = r["lp"][div].float().topk(2); msg += f" (ref top1-top2 logprob gap {float(top2.values[0] - top2.values[1]):.3f}; ref tok {g[div]} new tok {h[div]})"
     p, q = r["lp"].float(), n["lp_forced"].float()
     m = min(len(p), len(q)); p, q = p[:m], q[:m]
-    kl = (p.exp() * (p - q)).sum(-1)
+    pe = p.exp()
+    kl = torch.where(pe > 0, pe * (p - q), torch.zeros_like(p)).sum(-1)    # masked vocabulary (-inf in both) contributes 0
     agree = (p.argmax(-1) == q.argmax(-1)).float().mean().item()
     msg += f" | TF top1 agree {agree * 100:.1f}% KL mean {kl.mean().item():.2e} max {kl.max().item():.2e} steps {m}"
     print(msg)

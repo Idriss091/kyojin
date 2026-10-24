@@ -190,6 +190,17 @@ class FusedBuffers:
     temp_intermediate_u: torch.Tensor
 
 
+_SHARED_SIDE_HIP = bool(torch.version.hip)   # EXL3_SHARED_SIDE=1 is read per call (A/B inside one process)
+_side_state: dict = {}
+
+
+def _side(device):
+    st = _side_state.get(device)
+    if st is None:
+        st = _side_state[device] = (torch.cuda.Stream(device = device), torch.cuda.Event(), torch.cuda.Event())
+    return st
+
+
 @dataclass
 class HIPGroupedBuffers:
     gu_had: torch.Tensor
@@ -1987,6 +1998,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("BSZ_DEBUG"):
             print(f"[bsz_debug] layer={self.key} bsz={bsz} union={os.environ.get('EXL3_DEC_MOE_UNION')}")
         bc_sh_exp = False
+        side_y = None
         #  R-row union MoE with the unique-expert table built on device (no host sync),
         # fed by the batched router -- independent of EXL3_DEC_MOE_UNION's bit-exact per-row loops
         union_dev = os.environ.get("EXL3_DEC_MOE_UNION_DEV", "0") != "0"
@@ -2119,6 +2131,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.latent_out is None and self.routed_post_norm is None and (shf or not self.shared_experts) and
                 cpu_partial is None and cpu_pending is None and not self.tp_reduce and out_dtype is None
             )
+            if (
+                _SHARED_SIDE_HIP and os.environ.get("EXL3_SHARED_SIDE", "0") != "0" and not shf and self.shared_experts is not None and isinstance(self.shared_experts, GatedMLP) and
+                self.shared_gate is None and self.shared_experts_post_norm is None and cpu_partial is None and cpu_pending is None and
+                not self.tp_reduce and not self.routed_post_norm
+            ):
+                # batch-1 decode: the shared expert's three small GEMVs do not depend on the routed experts, run them on a side
+                # stream (own GEMV scratch/counters) while the routed kernels occupy the main one; joined at the shared add below
+                from .quant.exl3 import dec_side_workspace
+                side, ev_in, ev_out = _side(y.device)
+                ev_in.record(torch.cuda.current_stream(y.device))
+                with torch.cuda.stream(side):
+                    side.wait_event(ev_in)
+                    with dec_side_workspace():
+                        side_y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+                    ev_out.record(side)
             if shf:
                 ext.exl3_dec_moe_shared(
                     y,
@@ -2840,7 +2867,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
         elif self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if side_y is not None:
+                cur = torch.cuda.current_stream(final_hidden_states.device)
+                cur.wait_event(_side(final_hidden_states.device)[2])
+                side_y.record_stream(cur)
+                y = side_y
+            else:
+                y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:

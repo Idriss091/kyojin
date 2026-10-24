@@ -1233,7 +1233,7 @@ rows of K and V with the same arithmetic and packed plane layout as the PyTorch 
 `tests/test_qwrite.py`). The fallback needs ~70 launches per layer (decode append 402 us, 4096-row prefill chunk 5.2 ms at
 K/V 6,6 per layer; native 17 us / 89 us). `0` restores the fallback.
 
-#### `EXL3_QDEC_HIP` (default `0`; ROCm gfx11.5)
+#### `EXL3_QDEC_HIP` (default `1`; ROCm gfx11.5)
 
 HIP counterpart of `EXL3_QDEC` for AMD (Strix Halo): a wave32 WMMA kernel (`attention_fn/qdec.hip`, compiled with hipcc at first
 use and cached under `~/.cache/exllamav3`) that dequantizes the packed K/V pages straight into the WMMA operands, plus a small
@@ -1242,6 +1242,14 @@ full attention, no softcap; windowed layers, 1-bit planes and bigger shapes keep
 Tuning knobs for A/B work: `EXL3_QDEC_HIP_NW` (waves per CTA, default 4), `EXL3_QDEC_HIP_DW` (waves splitting the head dim),
 `EXL3_QDEC_HIP_WAVES` (target resident waves for the split count), `EXL3_QDEC_HIP_SPL` (fixed split count),
 `EXL3_QDEC_HIP_MAXO` (accumulator budget per lane, default 96).
+
+#### `EXL3_SHARED_SIDE` (default `0`; ROCm)
+
+Batch-1 MoE decode with a shared expert that is not folded into the routed launch (Flint: shared expert K=6, I=1024; the fold needs
+K=4 and the routed shape): the shared expert's GEMVs, which do not depend on the routed experts, run on a side stream with their
+own GEMV scratch/counters while the routed kernels run on the main one, and are joined at the shared add. Bit-identical results
+(same kernels, tests/gate_kv.py KL 0), Flint 4K / 32K decode +4..5 % (tests/ab_decode.py, alternating windows in one process).
+`EXL3_DEC_MIN_BLOCKS` (default 32; read per call) at 512 adds about 1.5 % on Flint (more blocks for its small GEMVs).
 
 #### `EXL3_PREFILL_WIDE` (default `1`)
 

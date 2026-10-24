@@ -240,10 +240,22 @@ DEC_SCRATCH_FLOATS = 2 << 20
 _dec_workspaces: dict = {}
 
 
+_dec_side = [False]
+
+
+class dec_side_workspace:
+    """Context: dec_workspace() hands out a second scratch/counter pair, for GEMVs that run on a side stream concurrently with
+    launches that use the main pair (the pair is shared only among stream-ordered launches)."""
+    def __enter__(self):
+        _dec_side[0] = True
+    def __exit__(self, *a):
+        _dec_side[0] = False
+
+
 def dec_workspace(device: torch.device):
     """fp32 scratch (cross-block partial sums) + int32 arrival counters, one pair per device. The
     kernels leave the counters zeroed; all launches share them because they are stream-ordered."""
-    key = str(device)
+    key = str(device) + ("#side" if _dec_side[0] else "")
     ws = _dec_workspaces.get(key)
     if ws is None:
         ws = (torch.zeros(DEC_SCRATCH_FLOATS, dtype = torch.float, device = device),
