@@ -578,13 +578,19 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     orig_sfs = dm.sample_from_state; orig_fwd = dm.forward; orig_lmf = lm.forward
     cap = {}
     fol = SeqFollower(ngram[0]) if ngram is not None else None
+    # Lookup drafts while several requests decode together (QWSPEC_NG_MULTI_ROWS = verify-row budget of such a round, 0 = off,
+    # default 32 = the multi-job graph's B x Q limit for a dense CUDA model, off elsewhere): one follower per request
+    ngm_rows = int(os.environ.get("QWSPEC_NG_MULTI_ROWS", "") or (2 * dense_cuda_rows(model))) if ngram is not None else 0
+    mf = {}
     orig_enqueue = g.enqueue
     def enq(job):
         # prime the index at enqueue: its cold build (about 1 s at 192K) lands in time-to-first-token, not in decode
         r = orig_enqueue(job)
         if fol is not None and os.environ.get("QWSPEC_NGRAM_IDX", "1") != "0":
             for j in (job if isinstance(job, list) else [job]):
-                if len(getattr(j, "sequences", ())) == 1: fol.sync(j.sequences[0].sequence_ids)
+                if len(getattr(j, "sequences", ())) == 1:
+                    fol.sync(j.sequences[0].sequence_ids)
+                    if ngm_rows: mf.setdefault(j, SeqFollower(ngram[0])).sync(j.sequences[0].sequence_ids)
         return r
     if fol is not None: g.enqueue = enq
     def lmf(*a, **k):
@@ -634,6 +640,47 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         _n, _v = _c.split(":"); f = _v.split(",")
         cap_n, deep = int(_n), (float(f[0]), float(f[1]), int(f[2]), float(f[3]), float(f[4]))
         base = (rule.thf, rule.thv, rule.maxd, rule.thfd, rule.thvd); cap_ng = os.environ.get("QWSPEC_CAP_NG", "0") != "0"
+    def multi_conts(gj):
+        """The lookup continuation of each decoding request (None = no match), same rule as the single-request round."""
+        for k in [k for k in mf if k not in gj]: del mf[k]
+        K = min(ngram[1], maxd); cs = []
+        for j in gj:
+            cont = None
+            if len(j.sequences) == 1:
+                f = mf.get(j)
+                if f is None: f = mf[j] = SeqFollower(ngram[0])
+                idx = f.sync(j.sequences[0].sequence_ids)
+                L, c = idx.match(K)
+                if L >= ngram[2] and c:
+                    cont = c
+                    if len(ngram) > 3 and ngram[3] > 0:
+                        a = idx.witness_len(c)
+                        if a < len(c): cont = c[:a] if a >= ngram[3] else None
+            cs.append(cont)
+        return cs
+    def multi_draft(results, conts, lcap):
+        """One draft tensor (requests x width) for a round in which some requests have a lookup continuation: those rows carry it,
+        the others their drafter tokens (the drafter runs for all, so its cache has no hole), every row padded with its last token
+        (a wrong draft is rejected by the verify like any other; rows of a dense model cost little). Width bounded by the row budget."""
+        N = len(conts); wmax = max(1, ngm_rows // N - 1)
+        mtp = None
+        if lcap is None or lcap >= 1:
+            w = rule.choose() if hasattr(rule, "choose") else win
+            rule_maxd = rule.maxd
+            if lcap is not None: w = min(w, lcap); rule.maxd = min(rule_maxd, lcap)
+            g.num_draft_tokens = w
+            try: mtp = orig_draft(results)
+            except StopDraft: mtp = g.draft_ids_pinned[:, :st["keep"]]
+            finally: g.num_draft_tokens = win; rule.maxd = rule_maxd
+        rows = [] if mtp is None else mtp.tolist()
+        W = min(wmax, max(max(len(c) for c in conts if c), len(rows[0]) if rows else 0))
+        out = []
+        for i, c in enumerate(conts):
+            t = list(c[:W]) if c else (rows[i][:W] if rows else [])
+            out.append(t + [t[-1] if t else 0] * (W - len(t)))
+        if stats is not None:
+            stats["ngm"] = stats.get("ngm", 0) + 1; stats["rows"] = stats.get("rows", 0) + N * (W + 1)
+        return torch.tensor(out, dtype=torch.long)
     def wrapped(results):
         st.update(i=0, stop=False, keep=None, mode="mtp", ps=[])
         job = next((j for j in g.active_jobs if j.is_prefill_done()), None)
@@ -671,6 +718,11 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         # Draft depth per load: with several requests decoding together the verify rows add up (N * (D + 1)) and the grouped
         # step runs one forward per 8 rows; the cap keeps the step in one forward (cap 0 = a plain step, no draft)
         lcap = load_depth_cap(sum(1 for j in _unparked(g) if j.is_prefill_done()), load_table, load_rows)
+        if ngm_rows:
+            gj = [j for j in g.active_jobs if j.is_prefill_done()]
+            if len(gj) > 1:
+                conts = multi_conts(gj)
+                if any(conts): return multi_draft(results, conts, lcap)
         if lcap == 0: return None
         if cont is not None:
             st["mode"] = "ng"; g.num_draft_tokens = 1
