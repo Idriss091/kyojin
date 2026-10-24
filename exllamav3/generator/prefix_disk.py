@@ -238,10 +238,12 @@ class PagedPrefixDisk:
             return None
         # what RAM can resume from
         ram_depth = 0
+        ram_res = 0
         for i, h in enumerate(hashes):
             pg = pt.referenced_pages.get(h) or pt.unreferenced_pages.get(h)
             if pg is None or pg.kv_position != PAGE_SIZE:
                 break
+            ram_res = i + 1
             s = rc.get(h)
             if s is not None and s["position"] == (i + 1) * PAGE_SIZE:
                 ram_depth = i + 1
@@ -249,8 +251,8 @@ class PagedPrefixDisk:
         for e in g.tail_ckpts:
             ph = e["prev_hash"]
             k = 0 if ph is None else (hashes.index(ph) + 1 if ph in hashes else -1)
-            if k < 0:
-                continue
+            if k < 0 or k > ram_res:
+                continue    # tail without its resident page chain is unreachable: prefill matches pages from page 0
             L = e["ids"].shape[-1]
             if torch.equal(e["ids"].cpu().view(1, -1), ids[:, k * PAGE_SIZE:k * PAGE_SIZE + L]):
                 ram_pos = max(ram_pos, k * PAGE_SIZE + L)
@@ -318,6 +320,7 @@ class PagedPrefixDisk:
                 prev = h
                 continue
             if live is not None:
+                print(f"prefix_disk: restore aborted at page {i} kv={live.kv_position} idx={len(self.pages)}", flush=True)
                 return None
             nm, pos = self.pages[h]
             d = loaded[nm]
