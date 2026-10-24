@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import logging
 import os
 import time
@@ -801,6 +802,8 @@ class Generator:
             elif self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
+            elif self.mtp_draft and SPEC_PROF:
+                self._prof_multi_step(results, self.iterate_draftmodel_mtp_gen)
             elif self.mtp_draft:
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -1243,6 +1246,24 @@ class Generator:
         )
 
 
+    def _prof_multi_step(self, results: list, draft_fn):
+        """EXL3_SPEC_PROF=1: one decode step with a synced record (jobs, drafted width, per-phase seconds, tokens produced); EXL3_SPEC_PROF_FILE appends it as a JSON line."""
+        gen_jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+        n0 = [j.new_tokens for j in gen_jobs]
+        cuda_sync_active()
+        t0 = time.perf_counter()
+        _PROF_CUR.clear()
+        draft_tokens = draft_fn(results)
+        self.iterate_gen(results, draft_tokens)
+        cuda_sync_active()
+        _PROF_CUR.update(t_step = time.perf_counter() - t0, jobs = len(gen_jobs), spec = draft_tokens is not None,
+                         drafted = 0 if draft_tokens is None else int(draft_tokens.shape[-1]),
+                         produced = sum(j.new_tokens - n for j, n in zip(gen_jobs, n0)))
+        SPEC_PROF_REC.append(dict(_PROF_CUR))
+        if SPEC_PROF_FILE:
+            with open(SPEC_PROF_FILE, "a") as f:
+                f.write(json.dumps(_PROF_CUR) + "\n")
+
     # TODO: Refactor, share code with other draft fns
     def _iterate_gated(self, results: list, draft_fn):
         """One decode step under the spec gate: speculative round (drafter + R-row verify) or a plain
@@ -1256,6 +1277,9 @@ class Generator:
             self._flush_dkv()
         if len(gen_jobs) != 1:
             # Batched decode or nothing to decode: keep the old behaviour, no timing
+            if SPEC_PROF and gen_jobs:
+                self._prof_multi_step(results, draft_fn)
+                return
             draft_tokens = draft_fn(results) if gen_jobs else None
             self.iterate_gen(results, draft_tokens)
             return
@@ -1276,6 +1300,9 @@ class Generator:
             _PROF_CUR.update(t_step = dt, produced = produced, spec = bool(spec),
                              drafted = 0 if draft_tokens is None else int(draft_tokens.shape[-1]))
             SPEC_PROF_REC.append(dict(_PROF_CUR))
+            if SPEC_PROF_FILE:
+                with open(SPEC_PROF_FILE, "a") as f:
+                    f.write(json.dumps(dict(_PROF_CUR, jobs = 1)) + "\n")
         if spec:
             # includes rounds where the drafter ran but -dds truncated the window to nothing
             gate.record_spec(dt, produced)
@@ -2287,6 +2314,7 @@ class Generator:
 
 SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
 SPEC_PROF_REC: list = []
+SPEC_PROF_FILE = os.environ.get("EXL3_SPEC_PROF_FILE", "")   # multi-job step records, one JSON line each
 _PROF_CUR: dict = {}
 
 
