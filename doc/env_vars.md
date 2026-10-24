@@ -972,6 +972,23 @@ With `EXL3_ROW_INV_GROUPS=1`: the most token rows one forward of a decode step m
 job, which is the slowest plan and exact by construction. Values above 8 leave the range where the row-exact
 kernels apply.
 
+#### `EXL3_PLAIN_ROWS_VERIFY` (default: `0`, off; the GLM server sets `1` with `--sessions` above 1)
+
+A decode step without drafted tokens that carries 2 to 8 rows (several sessions decoding together) is run like a verify
+forward: the union MoE on the device table, the R-row GEMV, the batched router and the per-sequence attention loops
+that `EXL3_ROW_INV` enables for verify forwards. Without it such a step fell to per-expert eager loops, thousands of
+host launches. Needs `EXL3_ROW_INV` on. One-row steps are untouched, so a single request decodes as before. GLM-5.3-Flash
+on the box (v1.7.2), 4 sessions, 4 greedy prompts: 26.1 to 40.7 tok/s aggregate. Qwen already has these paths, so it does
+not change there. The text of 4 concurrent plain streams still differs from the solo run at a near-tie word (the solo step
+uses the one-row kernels), as it did before the flag.
+
+#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server, else `0`)
+
+Qwen speculative decoding: with N requests decoding together the draft depth is capped at `R // N - 1`, so the verify rows
+of the step, `N * (depth + 1)`, stay within `R` rows (no draft when that is below 1). `0` turns the cap off.
+`QWSPEC_LOAD_CAPS="N:D,..."` sets the cap for chosen N. Qwen3.8-Flash-Next on the box (v1.7.2 with an equivalent cap), 4 sessions,
+4 greedy prompts: 54.9 tok/s aggregate without the cap, 71.2 with it.
+
 #### `EXL3_MTP_EH_FP16` (default: unset, off)
 
 Path of a safetensors sidecar holding an unquantized copy of the MTP `eh_proj`, which raises

@@ -46,6 +46,14 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
+# --sessions > 1 (several requests decode in one step): plain steps take the R-row exact paths (union MoE on the device table, R-row
+# GEMV, batched router) instead of per-expert eager loops, and 2..8-row verify blocks replay as graphs. Box 4 requests, same prompts:
+# plain 26.1 -> 40.7 tok/s aggregate, speculative 38.1 -> 42.5; one request alone and speculative text equal to the solo run unchanged.
+MULTI_SESSION_ENV = {
+    "EXL3_PLAIN_ROWS_VERIFY": "1",
+    "EXL3_BLOCK_GRAPH_VERIFY": "1",
+    "EXL3_DEC_MOE_UNION_DEV": "1",
+}
 SPEED_ENV = {
     # Vision spatial-merge convolution as one GEMM: no MIOpen solver search, so the first image of a new
     # size costs seconds, not minutes (first 1024x1024: 433 s -> 4 s; answers byte-identical). "0" = F.conv2d.
@@ -2113,6 +2121,9 @@ def main() -> None:
         os.environ["EXL3_PREFILL_BIG_TAIL"] = "0"
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
+    if args.sessions > 1:
+        for key, value in MULTI_SESSION_ENV.items():
+            os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
     apply_draft2s_default(args.model)
