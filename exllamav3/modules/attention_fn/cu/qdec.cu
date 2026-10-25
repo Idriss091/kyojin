@@ -295,7 +295,7 @@ qdec_split(
             for (int e = 0; e < 4; e++) {
                 int tk = n0 + g + ((e >> 1) << 3);
                 int ri = e & 1;
-                ok[e] = rvalid[j][ri] && tk < n_end && (!CAUSAL || (float)tk <= qabs[j][ri]);
+                ok[e] = rvalid[j][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[j][ri]);
                 s[e] = ok[e] ? S[j][e] * sl : -INFINITY;
             }
             float alpha[2];

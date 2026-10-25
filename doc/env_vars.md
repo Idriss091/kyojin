@@ -157,6 +157,20 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
 
+### `EXL3_KVWIN` (default: unset = off)
+
+`sink:window`, e.g. `4:128`. Keeps the first `sink` positions and the last `window` positions of every job in fp16
+next to a quantized K/V cache (`--k-bits/--v-bits`): attention reads the quantized pool for everything in between
+and a small fp16 ring (`sink + window + 16` rows per layer and job) for the rest, merged exactly by the flash-decoding
+combine. Costs about 10 MiB of VRAM per job slot at `4:128` on a 16-layer, 4-kv-head, head-dim-256 model. Applies to
+quantized-cache attention layers of models with recurrent state slots (Qwen3.5/3.8 hybrids); the ring is part of the
+job's recurrent state, so prefix/tail checkpoints, the CPU stash and the prefix disk carry it and restores stay
+bit-exact (a checkpoint written without the switch rebuilds the ring from the pool, with quantized precision for the
+first `window` tokens). While it is on, the graph-captured decode attention (`EXL3_BC_ATTN`) and the whole-forward
+graph (`EXL3_CUDA_GRAPH`) decline, and tensor-parallel loading is not supported. Prefill chunks attend the exact
+sinks, the exact window before the chunk and all of the chunk's own rows (a superset of the per-row decode window).
+Unset or `0` leaves every code path bit-identical.
+
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
 Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the compressed cache

@@ -787,10 +787,18 @@ def paged_attn_triton_decode_cu(
     programs_split = programs if split_batch is None else programs // bsz * split_batch
     req_splits = num_splits
 
-    if qc is not None and qck > 0 and qcv > 0 and ring is None:
+    # KVWIN: the pool pass attends [S, q-W] (causal bound shifted by W, KEY_LO cuts the sinks) and the fp16 ring pass is one
+    # more partial after the pool splits, so the combine needs no change but its split count
+    pool_seqlens, key_lo = cache_seqlens, 0
+    if ring is not None:
+        if qc is None or not causal or softcap or window_left >= 0 or window_right >= 0 or k is not None:
+            raise ValueError("KVWIN ring: quantized, causal, pre-appended, unwindowed decode only")
+        pool_seqlens, key_lo = cache_seqlens - ring.cfg.W, ring.cfg.S
+
+    if qc is not None and qck > 0 and qcv > 0:
         from . import qdec_cuda
         qcfg = qdec_cuda.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, page_size, causal, softmax_scale,
-                                  block_rows, window_left, window_right, softcap, kv_append_len)
+                                  block_rows, window_left, window_right, softcap, kv_append_len, key_lo)
         if qcfg is not None and (h_blocks == 1 or qcfg.get("rows_kernel")):
             if qcfg.get("rows_kernel"):
                 # many-row kernel (cu/qdec_rows.cu): all of a kv head's (query, head) rows in one program
@@ -801,19 +809,24 @@ def paged_attn_triton_decode_cu(
             qsplits = req_splits if req_splits is not None else \
                 max(1, min(qdec_cuda.split_cap(qcfg, q.device, programs_split), triton.cdiv(max_k_len, 16), 128))
             qsplit_len = triton.cdiv(triton.cdiv(max_k_len, qsplits), 16) * 16
-            partial_o = torch.empty(programs * qsplits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-            partial_ml = torch.empty(programs * qsplits * block_rows * 2, dtype = torch.float32, device = q.device)
+            ns_total = qsplits + (1 if ring is not None else 0)
+            partial_o = torch.empty(programs * ns_total * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * ns_total * block_rows * 2, dtype = torch.float32, device = q.device)
             with torch.cuda.device(q.device):
                 qdec_cuda.get_kernel(qcfg).launch(
                     (programs, qsplits),
-                    [q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr(), cache_seqlens.data_ptr(),
+                    [q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr(), pool_seqlens.data_ptr(),
                      out.data_ptr(), partial_o.data_ptr(), partial_ml.data_ptr(), k_scales.data_ptr(), v_scales.data_ptr(),
                      h32.data_ptr()],
-                    [qsplit_len, num_pages_per_seq, qsplits])
+                    [qsplit_len, num_pages_per_seq, ns_total])
+                if ring is not None:
+                    from .kvwin_triton import ring_split
+                    ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
+                               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, True, 0, 1, 1, block_rows)
                 rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
                 _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                     partial_o, partial_ml, out, h32,
-                    qsplits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+                    ns_total, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
                     block_rows, rows_sub, d_sub,
                     num_warps=4, num_stages=1,
                 )
@@ -824,12 +837,6 @@ def paged_attn_triton_decode_cu(
                 d = (ref.float() - out.float()).abs().max().item(); mx = ref.float().abs().max().item()
                 _QDEC_STATS.append((d, mx, d / max(mx, 1e-9), q_len, head_dim, qck, qcv))
             return out
-
-    pool_seqlens, key_lo = cache_seqlens, 0
-    if ring is not None:
-        if qc is None or not causal or softcap or window_left >= 0 or window_right >= 0 or k is not None:
-            raise ValueError("KVWIN ring: quantized, causal, pre-appended, unwindowed decode only")
-        pool_seqlens, key_lo = cache_seqlens - ring.cfg.W, ring.cfg.S
 
     def prepare(block_n):
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""

@@ -74,7 +74,7 @@ def _compile(cfg):
     from cuda.bindings import nvrtc
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"],
                 PAGE=cfg["page"], NW=cfg["nw"], ST=cfg["st"], CAUSAL=int(cfg["causal"]), BLOCK_ROWS=cfg["block_rows"],
-                HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f")
+                HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f", KEY_LO=cfg.get("key_lo", 0))
     defs["L2HINT"] = int(os.environ.get("EXL3_QDEC_L2HINT", "1"))       # L2 evict_first on K/V, evict_last on the scales
     defs["FASTDQ"] = int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
     if os.environ.get("EXL3_QDEC_ABL"):
@@ -184,13 +184,15 @@ _sm = {}
 
 
 def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, causal, sm_scale, block_rows,
-             window_left, window_right, softcap, kv_append_len):
-    """Kernel config for a call, or None when the Triton kernels must run it"""
+             window_left, window_right, softcap, kv_append_len, key_lo = 0):
+    """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended"""
     if (not ENABLED or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
             or k_bits == 0 or v_bits == 0):
         return None
     cfg = dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size,
                nw=4, st=2, causal=bool(causal), scale=float(sm_scale), block_rows=block_rows)
+    if key_lo:
+        cfg["key_lo"] = int(key_lo)
     old_ok = supported(cfg) and geometry(cfg)["nt"] * 8 <= block_rows
     # the many-row kernel also serves 2-row hd256 steps (qdec.cu needs 74 KB there: one CTA per SM)
     if ROWS_MODE == "2" or (ROWS_MODE == "1" and (not old_ok or (cfg["hd"] >= 256 and cfg["qlen"] == 2))):

@@ -14,12 +14,11 @@ import pytest
 
 pytestmark = pytest.mark.skipif(not CPU and not torch.cuda.is_available(), reason = "needs a GPU (or KVWIN_TEST_CPU=1)")
 
-if torch.cuda.is_available():
-    from exllamav3.cache.quant import CacheLayer_quant
-    from exllamav3.cache import kvwin
-    from exllamav3.cache.kvwin import KVWinLayerState, KVWinCtx, KVWinCfg, ring_rows, ring_positions, ov_write_ref, parse_spec
-    from exllamav3.modules.attention_fn.kvwin_triton import ov_write
-    from exllamav3.modules.attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill, _get_h32
+from exllamav3.cache.quant import CacheLayer_quant
+from exllamav3.cache import kvwin
+from exllamav3.cache.kvwin import KVWinLayerState, KVWinCtx, KVWinCfg, ring_rows, ring_positions, ov_write_ref, parse_spec
+from exllamav3.modules.attention_fn.kvwin_triton import ov_write
+from exllamav3.modules.attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill, _get_h32
 
 DEV = "cpu" if CPU else "cuda:0"
 PAGE = 256
