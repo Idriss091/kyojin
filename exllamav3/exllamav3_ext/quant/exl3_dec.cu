@@ -501,6 +501,42 @@ __device__ __forceinline__ void lane_gemv_r1(const u32x4* tiles, size_t tstride,
     }
 }
 
+// lane_gemv_r1 with the x words held in SGPRs (EXL3_GEMV_R_WIDE8, the 7..8 row single-pass form). The tile's x words are the same for every
+// lane of a wave (xs_rows[j] + i * 16 is wave-uniform), so they are read from LDS once per tile and moved to scalar registers with
+// readfirstlane: RM x 8 words stay out of the VGPR file, which RM 8 needs (128 accumulators + tile words + RM x 8 x words spilled to
+// scratch as VGPRs). Same fdot2 operands, same accumulation order as lane_gemv_r1, so the output is bit-identical.
+template <int KB2, int CB, int RM, int RING_ = 0>
+__device__ __forceinline__ void lane_gemv_r2(const u32x4* tiles, size_t tstride, const half* const* xs_rows, int n, float acc[][16])
+{
+    constexpr int VEC = Fmt<KB2>::VEC;
+    constexpr int RING = RING_ > 0 ? RING_ : ring_of<KB2>();
+    u32x4 buf[RING][VEC];
+    const DecConst dc = dec_const<CB>();
+    #pragma unroll
+    for (int r = 0; r < RING; ++r) if (r < n) load_tile<KB2>(tiles + r * tstride, buf[r]);
+    for (int i0 = 0; i0 < n; i0 += RING)
+    {
+        #pragma unroll
+        for (int r = 0; r < RING; ++r)
+        {
+            const int i = i0 + r;
+            if (i >= n) break;
+            f16x2 xp[RM][8];
+            #pragma unroll
+            for (int j = 0; j < RM; ++j)
+            {
+                const uint32_t* xq = reinterpret_cast<const uint32_t*>(xs_rows[j] + i * 16);
+                #pragma unroll
+                for (int q = 0; q < 8; ++q) xp[j][q] = PORT_AS_F16X2(PORT_READFIRSTLANE(xq[q]));
+            }
+            if constexpr (dec_built<KB2, CB>()) pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            else PORT_TRAP();
+            if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
+            PORT_SCHED_BARRIER();
+        }
+    }
+}
+
 // In-place normalised... (unscaled) 128-point Walsh-Hadamard over a wave: lane holds elements
 // 4 * lane + i, i = 0..3.
 __device__ __forceinline__ void fwht128(float* v, int lane)
@@ -536,41 +572,60 @@ __device__ __forceinline__ float wave_sum(float v)
 // of the stored fp16 values of chunk c.
 // x_gstride > 0: input chunk g (inputs 128g .. 128g + 127) sits at x + g * x_gstride (e.g. the
 // first 128 of every 192-wide head), otherwise x is contiguous.
+// One 128-element chunk of the rotated input (wave-wide: lane owns 4 elements): suh sign, 128-point Hadamard, fp16 store at dst, chunk sum into *xsum_slot.
+__device__ __forceinline__ void prologue_chunk(const half* x, const half* suh, int k, int kx, half* dst, float* xsum_slot, int lane)
+{
+    const uint2 xr = *reinterpret_cast<const uint2*>(x + kx);
+    const half* xh = reinterpret_cast<const half*>(&xr);
+    half o[4];
+#if defined(EXL3_DEC_DEBUG)
+    if (false)
+#else
+    if (suh)
+#endif
+    {
+        const uint2 sr = *reinterpret_cast<const uint2*>(suh + k);
+        const half* sh = reinterpret_cast<const half*>(&sr);
+        float v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = __half2float(xh[i]) * __half2float(sh[i]);
+        fwht128(v, lane);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i] * HAD_SCALE);
+    }
+    else
+    {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = xh[i];
+    }
+    *reinterpret_cast<uint2*>(dst + lane * 4) = *reinterpret_cast<uint2*>(o);
+    float t = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) t += __half2float(o[i]);
+    t = wave_sum(t);
+    if (lane == 0) *xsum_slot = t;
+}
+
 __device__ __forceinline__ void prologue_x(const half* x, const half* suh, int k0, int n, half* xs, float* xsum, int wave, int lane, int x_gstride = 0)
 {
     for (int c = wave; c < n / 128; c += WPB)
     {
         const int k = k0 + c * 128 + lane * 4;
         const int kx = x_gstride ? (k0 / 128 + c) * x_gstride + lane * 4 : k;
-        const uint2 xr = *reinterpret_cast<const uint2*>(x + kx);
-        const half* xh = reinterpret_cast<const half*>(&xr);
-        half o[4];
-#if defined(EXL3_DEC_DEBUG)
-        if (false)
-#else
-        if (suh)
-#endif
-        {
-            const uint2 sr = *reinterpret_cast<const uint2*>(suh + k);
-            const half* sh = reinterpret_cast<const half*>(&sr);
-            float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] = __half2float(xh[i]) * __half2float(sh[i]);
-            fwht128(v, lane);
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i] * HAD_SCALE);
-        }
-        else
-        {
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) o[i] = xh[i];
-        }
-        *reinterpret_cast<uint2*>(xs + c * 128 + lane * 4) = *reinterpret_cast<uint2*>(o);
-        float t = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) t += __half2float(o[i]);
-        t = wave_sum(t);
-        if (lane == 0) xsum[c] = t;
+        prologue_chunk(x, suh, k, kx, xs + c * 128, xsum + c, lane);
+    }
+}
+
+// Phase `ph` of a block whose waves each own ktw / 8 chunks of the rotated input (ktw a multiple of 16): stages 2 chunks per wave
+// (16 tiles of every wave) into xs, chunk c = 2 * wave + m, so a row needs 16 x 128 halves of LDS whatever ktw is. xsum keeps the
+// block-wide chunk index, so the sum over the block's ktw chunks is the one prologue_x produces.
+__device__ __forceinline__ void prologue_x_phase(const half* x, const half* suh, int k0, int ktw, int ph, half* xs, float* xsum, int wave, int lane)
+{
+    for (int c = wave; c < 16; c += WPB)
+    {
+        const int cg = (c >> 1) * (ktw >> 3) + ph * 2 + (c & 1);
+        const int k = k0 + cg * 128 + lane * 4;
+        prologue_chunk(x, suh, k, k, xs + c * 128, xsum + cg, lane);
     }
 }
 
@@ -2379,13 +2434,19 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
     int k0, ktw;
     k_split(jobs.K / 128, kb, jobs.kbs, k0, ktw);
 
-    for (int j = 0; j < nrows; ++j)
+    // MODE 2: ktw > 16 stages the input in phases of 16 tiles per wave (the 8-row LDS budget), the wave's tile order is unchanged
+    const int ktp = (MODE == 2 && ktw > 16) ? 16 : ktw;
+    const int nph = ktw / ktp;
+    if (nph == 1)
     {
-        const int row = row0 + j;
-        prologue_x(x + (size_t) row * jobs.x_row_pitch, job.suh, k0, ktw * 128,
-                   xs + j * (ktw * 128), s_xsum[j], wave, lane);
+        for (int j = 0; j < nrows; ++j)
+        {
+            const int row = row0 + j;
+            prologue_x(x + (size_t) row * jobs.x_row_pitch, job.suh, k0, ktw * 128,
+                       xs + j * (ktw * 128), s_xsum[j], wave, lane);
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     float acc[RM][16];
     #pragma unroll
@@ -2394,14 +2455,36 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
         for (int c = 0; c < 16; ++c) acc[j][c] = 0.0f;
 
     const int nt = strip * 32 + lane;
-    if (nt < NT)
+    if constexpr (MODE == 2)
+    {
+        if (nph > 1)
+        {
+            const int kt0 = k0 / 16 + wave * ktw;
+            const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
+            const half* xs_rows[RM];
+            #pragma unroll
+            for (int j = 0; j < RM; ++j) xs_rows[j] = xs + min(j, nrows - 1) * (16 * 128) + wave * 16 * 16;
+            for (int ph = 0; ph < nph; ++ph)
+            {
+                if (ph > 0) __syncthreads();      // every wave is done with the previous phase's x
+                for (int j = 0; j < nrows; ++j)
+                    prologue_x_phase(x + (size_t) (row0 + j) * jobs.x_row_pitch, job.suh, k0, ktw, ph, xs + j * (16 * 128), s_xsum[j], wave, lane);
+                __syncthreads();
+                if (nt < NT)
+                    lane_gemv_r2<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles + (size_t) ph * 16 * NT * VEC, (size_t) NT * VEC, xs_rows, 16, acc);
+            }
+        }
+    }
+    if (nph == 1 && nt < NT)
     {
         const int kt0 = k0 / 16 + wave * ktw;
         const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
         const half* xs_rows[RM];
         #pragma unroll
         for (int j = 0; j < RM; ++j) xs_rows[j] = xs + (MODE ? min(j, nrows - 1) : j) * (ktw * 128) + wave * ktw * 16;
-        if constexpr (MODE == 1 && RM > 1)
+        if constexpr (MODE == 2 && RM > 1)
+            lane_gemv_r2<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, ktw, acc);
+        else if constexpr (MODE == 1 && RM > 1)
             lane_gemv_r1<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, ktw, acc);
         else
             lane_gemv_r<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, nrows, ktw, acc);
@@ -2514,6 +2597,15 @@ static void dec_gemv_r_impl
                      env_int("EXL3_GEMV_R_DEC1", 0) == 1 && GEMV_R_ROW_BUDGET / ktw >= R;
     if (rm6) rpb = R;
 
+    // EXL3_GEMV_R_WIDE8=1 (needs EXL3_GEMV_R_DEC1=1): 7..8 rows run in ONE launch of the 8-row instantiation with the x words in SGPRs
+    // (lane_gemv_r2) instead of two 4-row chunks that each decode every tile (ktw > 16: the input is staged in 16-tile phases). Grids under
+    // EXL3_GEMV_R_WIDE8_MINBLK (32) blocks keep the two chunks. Same per-row arithmetic, bit-identical output.
+    const bool wide8 = R >= 7 && R <= MOE_R_MAX && env_int("EXL3_GEMV_R_WIDE8", 0) != 0 &&
+                       env_int("EXL3_GEMV_R_DEC1", 0) == 1 &&
+                       (GEMV_R_ROW_BUDGET / ktw >= R || (ktw % 16 == 0 && ktw <= 64)) &&      // ktw 32 / 48 / 64: staged in 16-tile phases
+                       strips_total * kbs >= env_int("EXL3_GEMV_R_WIDE8_MINBLK", 32);          // one pass runs half the blocks of the two 4-row chunks: it loses when the grid gets sparse
+    if (wide8) rpb = R;
+
     JobsR jobs;
     jobs.count = n;
     jobs.K = Kdim;
@@ -2570,7 +2662,9 @@ static void dec_gemv_r_impl
     EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2, EXL3_DEC_DISPATCH_RM(rpb, EXL3_DEC_DISPATCH_KB2(kb2,
         {
             // EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)
-            if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
+            if (wide8 && RM == 8)
+            { auto kfn = gemv_kernel_r<KB2, CB, RM, 2>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
             { auto kfn = gemv_kernel_r<KB2, CB, RM, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else
             { auto kfn = gemv_kernel_r<KB2, CB, RM>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
