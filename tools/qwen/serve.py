@@ -928,7 +928,10 @@ class QwenEngine:
         try:
             r = self.prefix_disk.restore(ids)
         except Exception as exc:                                        # noqa: BLE001 the disk never fails a request
-            print(f"qserve: prefix disk restore failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            import traceback
+            where = traceback.extract_tb(exc.__traceback__)[-1]
+            print(f"qserve: prefix disk restore failed: {type(exc).__name__}: {exc} ({where.filename.split('/')[-1]}:{where.lineno} {where.line})",
+                  file=sys.stderr, flush=True)
             return
         if r:
             print(f"qserve: prefix disk restore resume_at={r['resume_at']} (ram {r['ram_at']}) pages={r['pages']} {r['ms']:.0f} ms",
