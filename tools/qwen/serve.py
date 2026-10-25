@@ -608,7 +608,10 @@ HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMM
 # EXL3_PF_EMB_UPLOAD: a long prefill chunk gathers the CPU-resident embedding rows straight into pinned memory in the table dtype (bf16),
 # uploads them asynchronously and widens on the device (bit-identical): 94 MB of pageable fp32 per 4.5K-row chunk plus the 47 MB of the MTP
 # block (~37 ms of idle GPU per chunk) become two async 47 MB copies. Served prefill 4K 1712.8 -> 1729.0, 35K 1515.7 -> 1523.8 tok/s, text identical.
-CUDA_SERVE_ENV = (("EXL3_PF_EMB_UPLOAD", "1"), ("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
+# EXL3_NC2_ASYNC_STASH + EXL3_STASH_SIDE: the prompt-end tail checkpoint (96 D2H copies, 153 MB, 40 ms over a x4 PCIe link) was queued on the
+# compute stream right before the first decode step; it is now a device snapshot (~0.4 ms) whose D2H runs on a side stream, settled by the
+# existing stash worker before any reader. First token 35-47 ms earlier on every prompt of 512+ tokens (tail_ckpt_min), text identical.
+CUDA_SERVE_ENV = (("EXL3_NC2_ASYNC_STASH", "1"), ("EXL3_STASH_SIDE", "1"), ("EXL3_PF_EMB_UPLOAD", "1"), ("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.

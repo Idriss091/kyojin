@@ -240,6 +240,23 @@ class GDNState:
         if not self.cache.model.loaded_tp:
             layers = self.cache.get_all_recurrent_layers()
             if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+                if os.environ.get("EXL3_STASH_SIDE", "0") == "1" and torch.cuda.is_available():
+                    # Snapshot every layer's state on the device (one D2D copy each, 153 MB at 27B: ~0.4 ms) and run the D2H
+                    # on a side stream: the copies (40 ms over a x4 link) overlap the first decode steps instead of delaying
+                    # them, and the live state is free to advance because the copies read the snapshots.
+                    snaps = {k: l.snapshot(self.slot) for k, l in layers.items()}
+                    side = _stash_stream(self.cache)
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for k, l in layers.items():
+                            stashed[k] = l.stash_from_snapshot(snaps[k], pin_pool)
+                        ev = torch.cuda.Event()
+                        ev.record(side)
+                    for sn in snaps.values():
+                        for t in sn:
+                            t.record_stream(side)
+                    stashed["_ev"] = ev
+                    return stashed
                 for k, l in layers.items():
                     stashed[k] = l.stash_async(self.slot, pin_pool)
                 ev = torch.cuda.Event()
@@ -280,6 +297,17 @@ class GDNState:
 
     def reset(self):
         self.position = 0
+
+
+_stash_streams = {}
+
+
+def _stash_stream(cache):
+    dev = torch.cuda.current_device()
+    st = _stash_streams.get(dev)
+    if st is None:
+        st = _stash_streams[dev] = torch.cuda.Stream()
+    return st
 
 
 class GDNLayerState:
@@ -430,6 +458,23 @@ class GDNLayerState:
             self.recurrent_state[slot, b:b + 1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
+
+
+    def snapshot(self, slot):
+        """Device copies of the committed recurrent state and the conv window (what stash() reads)."""
+        cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
+        return (self.recurrent_state[slot, b:b + 1].clone(), self.conv_state[slot, :, :cdim].clone())
+
+
+    def stash_from_snapshot(self, snap, pin_pool: dict = None):
+        out = []
+        for src in snap:
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
 
 
     def stash_async(self, slot, pin_pool: dict = None):
