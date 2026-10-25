@@ -26,6 +26,9 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/apply-template":
             m = b["messages"]; p = "TOOLMARK " + m[0]["content"] + " " + m[1]["content"]
             self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({"prompt": p}).encode()); return
+        if self.path == "/v1/completions":
+            self.send_response(200); self.end_headers()
+            self.wfile.write(json.dumps({"usage": {"prompt_tokens": len(b["prompt"]), "completion_tokens": b["max_tokens"]}}).encode()); return
         text = b["messages"][-1]["content"]
         pt = max(1, len(text) // 4); mt = b["max_tokens"]
         self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()

@@ -14,6 +14,7 @@ from pathlib import Path
 STAGE_TABLE = {
     "fetch":   dict(job="cpu",    needs=[],                         est=60,    gpu=False),
     "meta":    dict(job="cpu",    needs=["fetch"],                  est=5,     gpu=False),
+    "autotune": dict(job="autotune", needs=["meta"],                est=180,   gpu=True),
     "parity":  dict(job="parity", needs=["meta"],                   est=900,   gpu=True),
     "kv":      dict(job="kv",     needs=["meta", "parity"],         est=900,   gpu=True),
     "maxctx":  dict(job="maxctx", needs=["meta", "kv"],             est=1500,  gpu=True),
@@ -36,7 +37,7 @@ class Stage:
     cmd: list = field(default_factory=list)
 
 
-RELEVANT = {"fetch": ("ref",), "meta": (), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits"), "maxctx": ("sessions", "ctx_cap"),
+RELEVANT = {"fetch": ("ref",), "meta": (), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits"), "maxctx": ("sessions", "ctx_cap"),
             "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
 
 

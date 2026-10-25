@@ -17,7 +17,7 @@ def assemble(meta: dict, args: dict, stages: dict, repo: Path) -> dict:
     ctxs = {k: v for k, v in (d.get("maxctx") or {}).items() if k.isdigit()}
     sv = d.get("serve") or {}
     sm = d.get("smoke")
-    q = dict(parity=d.get("parity"), kv=d.get("kv"), maxctx=ctxs or None, serve=sv or None, smoke=sm)
+    q = dict(autotune=d.get("autotune"), parity=d.get("parity"), kv=d.get("kv"), maxctx=ctxs or None, serve=sv or None, smoke=sm)
     kv = (d.get("kv") or {}).get("chosen") or [6, 6]
     try:
         git = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -29,6 +29,7 @@ def assemble(meta: dict, args: dict, stages: dict, repo: Path) -> dict:
         stages={n: dict(status=s.get("status"), wall_s=s.get("wall_s")) for n, s in stages.items()},
         serve=dict(cmd=(d.get("serve") or {}).get("cmd") or (d.get("smoke") or {}).get("cmd"), kv=kv, ctx=ctxs, draft_policy=meta.get("draft_policy"),
                    template=meta["template"]),
+        tuning={k: (d.get("autotune") or {}).get(k) for k in ("tuning_dir", "files", "records", "plan_points", "wall_s")} if d.get("autotune") else None,
         quality=dict(parity=d.get("parity"), kv=d.get("kv")),
         speed={k: sv.get(k) for k in ("decode_tps_median", "prefill_8k_tps", "curve", "agg")} if sv else None,
         sha=sv.get("sha"), smoke=sm,

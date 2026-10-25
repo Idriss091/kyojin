@@ -96,7 +96,7 @@ def main(argv=None) -> int:
             names = [x.name for x in todo if x.name in ("serve", "smoke")]
             runner = lambda: _split_serve(c, "serve" in names, "smoke" in names)
         else:
-            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "parity": lambda: st.job_parity(c),
+            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "parity": lambda: st.job_parity(c),
                       "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "report": None}[s.name]
         if s.name == "report":
             continue

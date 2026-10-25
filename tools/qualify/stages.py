@@ -86,6 +86,63 @@ def stage_meta(c: Ctx) -> dict:
     return m
 
 
+# ---------------------------------------------------------------- autotune
+def _tune_cache_mod():
+    """exllamav3/util/tune_cache.py by path: the cache file format needs no torch (the package import does)."""
+    import importlib.util
+    f = Path(__file__).resolve().parents[2] / "exllamav3/util/tune_cache.py"
+    spec = importlib.util.spec_from_file_location("tune_cache", f)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m
+
+
+def job_autotune(c: Ctx) -> dict:
+    """Day-0 autotune by shape replay (replay.py): serve the pack on a FRESH tune cache, drive the row sweep through the real served path,
+    keep the winners the engine's autotuner wrote -> <pack>/tuning/<device signature>.bin (+ .json), loaded at serve start."""
+    import shutil
+    import replay
+    tc = _tune_cache_mod()
+    c.need_ram()
+    tdir = Path(c.meta["path"]) / "tuning"
+    scratch = c.out / "tune_scratch"
+    shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
+    sessions = max(c.args["sessions"])
+    ctx = min(c.args.get("ctx_cap") or 16384, 16384, c.meta["max_pos"])
+    prof = {**c.prof, "env": {**c.prof["env"], "EXLLAMAV3_TUNE_CACHE": str(scratch), "EXL3_PACK_TUNE": "0"}}
+    k, v = chosen_kv(c)
+    argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v)
+    log = c.out / "srv_autotune.log"
+    with c.locks():
+        sig = json.loads(c.py("autotune.py", "--signature").strip().splitlines()[-1])
+        t0 = time.time()
+        with running_server(prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
+            if not ok:
+                raise RuntimeError("autotune: server did not start: " + (log.read_text(errors="replace").strip().splitlines() or [""])[-1][:200])
+            load_s = time.time() - t0
+            at_load = len(tc.read_records(scratch / "coop_autotune_v1.bin"))
+            sweep = replay.run_sweep(c.args["port"], sessions, ctx, log=c.log)
+        if oom_in(log):
+            raise RuntimeError("autotune: OOM in the server log")
+    recs = tc.read_records(scratch / "coop_autotune_v1.bin")
+    if not recs:
+        raise RuntimeError("autotune: the replay produced no tuning records (does this build have the GEMM autotuner?)")
+    tdir.mkdir(exist_ok=True)
+    tc.write_records(tdir / f"{sig['file']}.bin", recs)
+    man = dict(schema=1, signature=sig, records=len(recs), records_at_load=at_load, load_s=round(load_s, 1), wall_s=round(time.time() - t0, 1),
+               sessions=sessions, ctx=ctx, sweep=sweep, cmd=argv, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"))
+    (tdir / f"{sig['file']}.json").write_text(json.dumps(man, indent=1))
+    c.log(f"autotune: {len(recs)} records ({at_load} at load) -> {tdir / (sig['file'] + '.bin')}")
+    return dict(tuning_dir=str(tdir), files=sorted(p.name for p in tdir.glob("*.bin")), records=len(recs), records_at_load=at_load,
+                plan_points=len(sweep), wall_s=man["wall_s"], sweep_failed=[s for s in sweep if not s["ok"]])
+
+
+def _git(repo) -> str | None:
+    try:
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip() or None
+    except Exception:   # noqa: BLE001
+        return None
+
+
 # ---------------------------------------------------------------- parity / kv
 SQNR = re.compile(r"Quantized: model\.layers\.(\d+)\s+bpw:\s*([\d.]+)\s+rfn:\s*([\d.]+)\s+cos:\s*([\d.]+)\s+sqnr:\s*([\d.]+)")
 
