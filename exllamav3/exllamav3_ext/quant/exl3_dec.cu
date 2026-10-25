@@ -702,6 +702,24 @@ __device__ __forceinline__ float ld_coherent(const float* p)
     return PORT_LD_COHERENT(p);
 }
 
+// sum_b p[b * stride], b = 0..n-1, added in index order (bitwise the plain `for b: s += ld_coherent(..)` loop), with the loads of 8 partials
+// in flight at once: the plain loop waits for each load before issuing the next, so the last block of a split-K launch paid n L2 round trips
+__device__ __forceinline__ float sum_coherent(const float* p, size_t stride, int n)
+{
+    float s = 0.0f;
+    int b = 0;
+    for (; b + 8 <= n; b += 8)
+    {
+        float v[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = ld_coherent(p + (size_t) (b + j) * stride);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) s += v[j];
+    }
+    for (; b < n; ++b) s += ld_coherent(p + (size_t) b * stride);
+    return s;
+}
+
 // ------------------------------------------------------------------------------------------------
 // Dense GEMV, up to 4 matrices sharing x (and K bits), one launch.
 
@@ -1639,8 +1657,7 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
         ch[i] = -INFINITY;
         if (e < E)
         {
-            float l = 0.0f;
-            for (int b = 0; b < nkb; ++b) l += ld_coherent(scratch + (size_t) b * E + e);
+            float l = sum_coherent(scratch + e, E, nkb);
             l = __half2float(__float2half_rn(l));
             const float sc = 1.0f / (1.0f + __expf(-l));
             score[e] = sc;
@@ -1804,8 +1821,7 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     {
         const int r = i / E, e = i - r * E;
         const float* sc_r = scratch + (size_t) r * nkb * E;
-        float l = 0.0f;
-        for (int b = 0; b < nkb; ++b) l += ld_coherent(sc_r + (size_t) b * E + e);
+        float l = sum_coherent(sc_r + e, E, nkb);
         l = __half2float(__float2half_rn(l));
         const float sc = 1.0f / (1.0f + __expf(-l));
         score[r][e] = sc;
