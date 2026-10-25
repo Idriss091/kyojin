@@ -25,7 +25,7 @@ PAGE = 256
 
 def glue():
     src = (ROOT / "exllamav3" / "generator" / "generator.py").read_text()
-    ns = {"os": os, "prefill_share": prefill_share, "PAGE_SIZE": PAGE}
+    ns = {"os": os, "prefill_share": prefill_share, "PAGE_SIZE": PAGE, "_PF_PROF": None}   # _PF_PROF: the EXL3_PF_PROF diagnostic is off
     for n in ast.walk(ast.parse(src)):
         if isinstance(n, ast.FunctionDef) and n.name in ("_prefill_leader", "iterate_start_jobs", "_prefill_round"):
             exec(textwrap.dedent(ast.get_source_segment(src, n)), ns)
