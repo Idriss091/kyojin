@@ -2135,6 +2135,11 @@ class Generator:
                 for j in skipped_jobs:
                     j.skips += 1
 
+                # Serving hook (the prefix disk restore): the job fits, its pages are allocated right after
+                hook = getattr(self, "pre_start_hook", None)
+                if hook is not None:
+                    hook(job)
+
                 # Add job to active list
                 self.pending_jobs.remove(job)
                 self.active_jobs.append(job)

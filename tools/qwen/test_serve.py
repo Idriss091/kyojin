@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -1231,9 +1232,13 @@ class PrefixDiskConcurrencyTests(unittest.TestCase):
         eng.prefix_disk, eng.generator, eng._post, eng._disk_ids = PD(), Gen(), post, {}
         return eng, calls
 
-    def test_restore_runs_with_other_jobs(self):
+    def test_restore_runs_at_job_start_with_other_jobs(self):
         eng, calls = self._engine()
-        asyncio.run(eng.disk_restore("ids-a"))
+        job = types.SimpleNamespace(_restore_ids="ids-a")
+        eng._pre_start(job)
+        self.assertEqual(calls, [("restore", "ids-a")])
+        eng._pre_start(job)                        # once per job
+        eng._pre_start(types.SimpleNamespace())    # a job without ids (images, cache_prompt=false)
         self.assertEqual(calls, [("restore", "ids-a")])
 
     def test_save_uses_the_ids_of_its_own_request(self):

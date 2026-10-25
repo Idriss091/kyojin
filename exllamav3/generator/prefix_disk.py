@@ -293,6 +293,11 @@ class PagedPrefixDisk:
             if pg is not None and pg.kv_position == PAGE_SIZE:
                 continue
             want.setdefault(self.pages[h][0], []).append((i, h))
+        # every page to put back takes an unreferenced page: while a long prompt holds the pool there is none to take (the restore
+        # raised IndexError on the empty eviction order and the request prefilled from zero)
+        take = sum(len(v) for v in want.values()) + (0 if tail_ix is None else 1)
+        if take > pt.num_unreferenced_pages():
+            return None
         loaded = {}
         try:
             for nm in want:

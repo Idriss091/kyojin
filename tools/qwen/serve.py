@@ -857,6 +857,7 @@ class QwenEngine:
                                                  thf, thv, maxd, spec_policy.ngram_from_env(), {},
                                                  rule=spec_policy.rule_from_env(thf, thv, maxd), fixed=int(fx) if fx else None)
         self.spec_on = spec
+        self.generator.pre_start_hook = self._pre_start
         if self.slot_store is not None:
             self.slot_store.generator = self.generator
 
@@ -904,16 +905,22 @@ class QwenEngine:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
 
-    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). Both run on the driver, between two
-    # iterate() calls, while other requests may be decoding or prefilling: restore only takes unreferenced pages and the save reads
-    # pages of a finished prompt. (They used to wait for a fully idle Generator, which with several users is almost never:
-    # 3 users, a 180K prompt evicted the other two sessions, every follow-up re-prefilled 19-32K tokens from zero although
-    # 3 GB of their state was on the disk, and a save after a request saved the prompt of the request that started last.)
-    async def disk_restore(self, ids) -> None:
-        """Before the request is enqueued: put a deeper resume point from the disk (an earlier run, an evicted prefix) back."""
-        pd = self.prefix_disk
+    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). The restore runs inside the Generator's job
+    # start, the save on the driver between two iterate() calls, both while other requests may be decoding or prefilling: restore
+    # only takes unreferenced pages and the save reads pages of a finished prompt. (They used to wait for a fully idle Generator,
+    # which with several users is almost never: 3 users, a 180K prompt evicted the other two sessions, every follow-up
+    # re-prefilled 19-32K tokens from zero although 3 GB of their state was on the disk, and a save after a request saved the
+    # prompt of the request that started last.)
+    def _pre_start(self, job) -> None:
+        """Generator hook, run by iterate_start_jobs right before a pending job allocates its pages (so the cache has room for it):
+        put a deeper resume point from the disk (an earlier run, an evicted prefix) back. Restoring when the request arrives instead
+        failed with no page to take while a long prompt held the pool, and a second restore could evict the first one's pages."""
+        ids = getattr(job, "_restore_ids", None)
+        if ids is None or getattr(self, "prefix_disk", None) is None:
+            return
+        job._restore_ids = None
         try:
-            r = await self._post(pd.restore, ids)
+            r = self.prefix_disk.restore(ids)
         except Exception as exc:                                        # noqa: BLE001 the disk never fails a request
             print(f"qserve: prefix disk restore failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             return
@@ -1175,8 +1182,8 @@ class QwenEngine:
             max_tokens = min(max_tokens, room)
         if self.slot_store is not None:
             self.slot_store.note_prompt(prompt, ids)
-        if getattr(self, "prefix_disk", None) is not None and cache_prompt and not embs:
-            await self.disk_restore(ids)
+        disk_on = getattr(self, "prefix_disk", None) is not None and cache_prompt and not embs
+        if disk_on:
             self._disk_ids[id(stats) if stats is not None else 0] = ids
             while len(self._disk_ids) > 32:   # requests that ended without a save
                 self._disk_ids.pop(next(iter(self._disk_ids)))
@@ -1208,6 +1215,8 @@ class QwenEngine:
                            embeddings=embs or None, decode_special_tokens=True, seed=seed,
                            **({} if rq is None else {"max_rq_tokens": rq}),
                            **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
+            if disk_on and generated == 0 and not discount:
+                job._restore_ids = ids          # see _pre_start
             _mine.append(job)
             q = await self._submit(job)
             seg: list[int] = []
