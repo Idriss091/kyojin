@@ -972,6 +972,23 @@ With `EXL3_ROW_INV_GROUPS=1`: the most token rows one forward of a decode step m
 job, which is the slowest plan and exact by construction. Values above 8 leave the range where the row-exact
 kernels apply.
 
+#### `EXL3_PLAIN_ROWS_VERIFY` (default: `0`, off; the GLM server sets `1` with `--sessions` above 1)
+
+A decode step without drafted tokens that carries 2 to 8 rows (several sessions decoding together) is run like a verify
+forward: the union MoE on the device table, the R-row GEMV, the batched router and the per-sequence attention loops
+that `EXL3_ROW_INV` enables for verify forwards. Without it such a step fell to per-expert eager loops, thousands of
+host launches. Needs `EXL3_ROW_INV` on. One-row steps are untouched, so a single request decodes as before. GLM-5.3-Flash
+on the box (v1.7.2), 4 sessions, 4 greedy prompts: 26.1 to 40.7 tok/s aggregate. Qwen already has these paths, so it does
+not change there. The text of 4 concurrent plain streams still differs from the solo run at a near-tie word (the solo step
+uses the one-row kernels), as it did before the flag.
+
+#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server on ROCm; on NVIDIA `16` for a dense model and `0` for a model with MoE layers; `0` elsewhere)
+
+Qwen speculative decoding: with N requests decoding together the draft depth is capped at `R // N - 1`, so the verify rows
+of the step, `N * (depth + 1)`, stay within `R` rows (no draft when that is below 1). `0` turns the cap off.
+`QWSPEC_LOAD_CAPS="N:D,..."` sets the cap for chosen N. Qwen3.8-Flash-Next on the box (v1.7.2 with an equivalent cap), 4 sessions,
+4 greedy prompts: 54.9 tok/s aggregate without the cap, 71.2 with it.
+
 #### `EXL3_MTP_EH_FP16` (default: unset, off)
 
 Path of a safetensors sidecar holding an unquantized copy of the MTP `eh_proj`, which raises
@@ -1217,7 +1234,7 @@ noise of the quantization), which is why each has an off switch for A/B work.
 #### `EXL3_CUDA_GRAPH` (default `0`; `tools/qwen/serve.py` and `tools/flint/serve.py` set it to `1` on NVIDIA)
 
 Whole-forward CUDA graph for decode steps (Qwen GDN, Flint sliding-window ring, MTP verify). `EXL3_CUDA_GRAPH_MULTI=1`
-(default off) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache.
+(default off; `tools/flint/serve.py --max-batch N` and `tools/qwen/serve.py --sessions N` set it to `1` on NVIDIA when N > 1) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache (16 with MULTI, 32 from the Qwen server with `--sessions` > 1).
 
 #### `EXL3_QDEC` (default `1`), `EXL3_QDEC_GRAPH` (default `1`), `EXL3_QDEC_ROWS` (default `1`)
 
@@ -1225,6 +1242,31 @@ Decode attention for quantized KV caches (K/V bits 2..8): a tensor-core split ke
 build step) that reads the packed pages directly. `EXL3_QDEC=0` falls back to the Triton kernels, `EXL3_QDEC_GRAPH=0`
 disables its CUDA-graph capture path, `EXL3_QDEC_ROWS` selects the many-row kernel for verify steps (q_len 2..8 at
 head dim 256): `0` off, `1` only where the single-row kernel cannot serve, `2` always.
+
+#### `EXL3_QWRITE_TRITON` (default `1`; ROCm)
+
+Native Triton writer for the quantized paged cache (K/V bits 2..8, `attention_fn/qwrite_triton.py`): one launch appends the new
+rows of K and V with the same arithmetic and packed plane layout as the PyTorch fallback (bit-identical words and scales,
+`tests/test_qwrite.py`). The fallback needs ~70 launches per layer (decode append 402 us, 4096-row prefill chunk 5.2 ms at
+K/V 6,6 per layer; native 17 us / 89 us). `0` restores the fallback.
+
+#### `EXL3_QDEC_HIP` (default `1`; ROCm gfx11.5)
+
+HIP counterpart of `EXL3_QDEC` for AMD (Strix Halo): a wave32 WMMA kernel (`attention_fn/qdec.hip`, compiled with hipcc at first
+use and cached under `~/.cache/exllamav3`) that dequantizes the packed K/V pages straight into the WMMA operands, plus a small
+combine kernel. Used for quantized-KV decode (K/V bits 2..8, head dim 128 or 256, q_len up to 6 at head dim 128 / 3 at 256) with
+full attention, no softcap; windowed layers, 1-bit planes and bigger shapes keep the Triton kernels. `0` keeps the Triton kernels.
+Tuning knobs for A/B work: `EXL3_QDEC_HIP_NW` (waves per CTA, default 4), `EXL3_QDEC_HIP_DW` (waves splitting the head dim),
+`EXL3_QDEC_HIP_WAVES` (target resident waves for the split count), `EXL3_QDEC_HIP_SPL` (fixed split count),
+`EXL3_QDEC_HIP_MAXO` (accumulator budget per lane, default 96).
+
+#### `EXL3_SHARED_SIDE` (default `0`; ROCm)
+
+Batch-1 MoE decode with a shared expert that is not folded into the routed launch (Flint: shared expert K=6, I=1024; the fold needs
+K=4 and the routed shape): the shared expert's GEMVs, which do not depend on the routed experts, run on a side stream with their
+own GEMV scratch/counters while the routed kernels run on the main one, and are joined at the shared add. Bit-identical results
+(same kernels, tests/gate_kv.py KL 0), Flint 4K / 32K decode +4..5 % (tests/ab_decode.py, alternating windows in one process).
+`EXL3_DEC_MIN_BLOCKS` (default 32; read per call) at 512 adds about 1.5 % on Flint (more blocks for its small GEMVs).
 
 #### `EXL3_PREFILL_WIDE` (default `1`)
 

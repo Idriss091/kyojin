@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import logging
 import os
 import time
@@ -15,6 +16,21 @@ from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
+_PADDED_VOCAB_LOGGED = set()
+
+
+def _log_padded_vocab(model_vocab: int, piece_count: int):
+    """One start-up line per process and vocabulary shape: the head is wider than the tokenizer's table."""
+    if (model_vocab, piece_count) in _PADDED_VOCAB_LOGGED:
+        return
+    _PADDED_VOCAB_LOGGED.add((model_vocab, piece_count))
+    logger.warning(
+        "vocabulary: the model head has %d columns but the tokenizer defines %d pieces; ids %d..%d are padding. "
+        "They are masked at sampling and in the drafters; a padding id that still got through decodes to empty text",
+        model_vocab, piece_count, piece_count, model_vocab - 1
+    )
+
+
 from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
@@ -28,7 +44,7 @@ from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 _REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
 from . import spec_sample
 from .filter import Filter
-from .row_groups import plan_groups, group_rows_cap, GROUPS as ROW_GROUPS
+from .row_groups import plan_groups, group_rows_cap, plain_rows_verify, GROUPS as ROW_GROUPS
 from ..util.row_inv import ROW_INV
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -213,6 +229,16 @@ class Generator:
         cfg = self.model.config
         self.padded_vocab_size = ((cfg.vocab_size + 31) // 32) * 32
 
+        # Padded head: the logits (and the embedding table) can be wider than the vocabulary the tokenizer defines, and the
+        # ids in between have no piece. CustomSampler masks them, the drafters are bounded to vocab_limit (_bound_draft_ids)
+        # and Job.receive_sample decodes an unknown id to empty text (note_unknown_token logs the first one)
+        self.vocab_limit = None
+        self._unknown_token_seen = False
+        piece_count = getattr(tokenizer, "actual_vocab_size", None)
+        if isinstance(piece_count, int) and 0 < piece_count < cfg.vocab_size:
+            self.vocab_limit = piece_count
+            _log_padded_vocab(cfg.vocab_size, piece_count)
+
         # Paging
         self.pagetable = PageTable(self, cache)
         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
@@ -224,6 +250,8 @@ class Generator:
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
+        if draft_model is not None:
+            draft_model.vocab_limit = self.vocab_limit    # read by the MTP heads (sample_from_state); None = whole head
         if draft_model:
             assert not ngram_match_min, \
                 "Cannot use both draft model and n-gram draft."
@@ -580,9 +608,56 @@ class Generator:
     @torch.inference_mode
     def iterate(self) -> list[dict]:
         self.flush_deferred()
+        if _TORCH_PROF is not None:
+            return self._iterate_profiled()
         results = self._iterate_inner()
         if _moe_fused_check is not None:
             _moe_fused_check(self.model)
+        return results
+
+    def _iterate_profiled(self) -> list[dict]:
+        """EXL3_TORCH_PROF=JOBS:SKIP:STEPS:PATH (diagnostic): once JOBS requests have been decoding together for SKIP iterations,
+        profile the next STEPS iterations with the torch profiler and write the kernel table (per iteration) to PATH."""
+        st = _TORCH_PROF
+        n = sum(1 for j in self.active_jobs if j.is_prefill_done())
+        if st["done"] or n != st["jobs"]:
+            st["seen"] = 0
+            results = self._iterate_inner()
+            return results
+        st["seen"] += 1
+        if st["seen"] == st["skip"] + 1:
+            from torch.profiler import profile, ProfilerActivity
+            st["prof"] = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]); st["prof"].__enter__()
+            st["t0"] = time.perf_counter(); st["n"] = 0
+            import collections, traceback
+            st["sites"] = collections.Counter(); st["orig"] = {n: getattr(torch.Tensor, n) for n in ("item", "tolist", "cpu", "numpy")}
+            def _mk(name, f):
+                def w(t, *a, **k):
+                    fr = traceback.extract_stack(limit = 2)[0]
+                    st["sites"][f"{name} {os.path.basename(fr.filename)}:{fr.lineno}"] += 1
+                    return f(t, *a, **k)
+                return w
+            for _n, _f in st["orig"].items(): setattr(torch.Tensor, _n, _mk(_n, _f))
+        results = self._iterate_inner()
+        if st["prof"] is not None:
+            st["n"] += 1
+            if st["n"] == st["steps"]:
+                torch.cuda.synchronize(); wall = time.perf_counter() - st["t0"]; k_ = st["steps"]
+                st["prof"].__exit__(None, None, None)
+                for _n, _f in st["orig"].items(): setattr(torch.Tensor, _n, _f)
+                with open(st["path"] + ".sites", "w") as f:
+                    for site, c in st["sites"].most_common(25): f.write(f"{c / k_:7.1f}/iter  {site}\n")
+                import collections
+                g = collections.defaultdict(lambda: [0, 0.0])
+                for e in st["prof"].events():
+                    if e.device_type == torch.autograd.DeviceType.CUDA:
+                        g[e.name[:110]][0] += 1; g[e.name[:110]][1] += e.device_time
+                busy = sum(v[1] for v in g.values()); k = st["steps"]
+                with open(st["path"], "w") as f:
+                    f.write(f"jobs={st['jobs']} steps={k} wall {wall / k * 1000:.2f} ms/iter, kernel-sum {busy / k / 1000:.2f} ms/iter, launches/iter {sum(v[0] for v in g.values()) / k:.0f}\n")
+                    for name, (c, t) in sorted(g.items(), key = lambda kv: -kv[1][1])[:40]:
+                        f.write(f"{t / k / 1000:8.3f} ms {c / k:7.1f}/iter  {name}\n")
+                st["prof"] = None; st["done"] = True
         return results
 
     def _cil_views(self) -> list:
@@ -774,6 +849,8 @@ class Generator:
             elif self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
+            elif self.mtp_draft and SPEC_PROF:
+                self._prof_multi_step(results, self.iterate_draftmodel_mtp_gen)
             elif self.mtp_draft:
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -897,6 +974,8 @@ class Generator:
                     "cache_seqlens": cache_seqlens,
                 }
             )
+            if self.vocab_limit is not None:
+                batch_logits = batch_logits[..., :self.vocab_limit]    # the draft head's padding columns have no piece
             if cal is not None:
                 conf, new_ids = torch.max(batch_logits, dim = -1)
             else:
@@ -977,6 +1056,31 @@ class Generator:
         for j in pend:
             self._flush_mtp_defer(j, with_tail = j.mtp_defer_plain)
         return False
+
+
+    def _bound_draft_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        Draft proposals come from a head as wide as the embedding table, whose last columns are padding (no piece in the
+        tokenizer). Such a draft can never be accepted, because the sampler never returns a padding id, and fed back to
+        the drafter it reads a meaningless embedding row. Replace it by id 0: the round verifies that position as a
+        rejection exactly as it would have, and accepted tokens do not change. The drafters that know vocab_limit already
+        search the bounded head, so this only guards the rest. No host sync.
+        """
+        if self.vocab_limit is None:
+            return ids
+        return torch.where(ids < self.vocab_limit, ids, torch.zeros_like(ids))
+
+
+    def note_unknown_token(self, token_id: int, piece_count: int):
+        """A sampled id without a piece reached Job.receive_sample. It decodes to empty text; the first one is logged."""
+        if self._unknown_token_seen:
+            return
+        self._unknown_token_seen = True
+        logger.error(
+            "sampled token id %d has no piece (the tokenizer defines %d, the model head has %d columns); decoded as empty "
+            "text. Logged once per generator",
+            token_id, piece_count, self.model.config.vocab_size
+        )
 
 
     def iterate_draftmodel_mtp_gen(self, results: list):
@@ -1102,6 +1206,7 @@ class Generator:
                     q = spec_sample.law(dl[0, -1, :], spec_prm)
                     spec_q.append(q)
                     new_ids = spec_sample.draw(q, spec_job.rng.random()).view(1, 1)
+            new_ids = self._bound_draft_ids(new_ids)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1 + (n_pend if idx == 0 else 0)
@@ -1188,6 +1293,24 @@ class Generator:
         )
 
 
+    def _prof_multi_step(self, results: list, draft_fn):
+        """EXL3_SPEC_PROF=1: one decode step with a synced record (jobs, drafted width, per-phase seconds, tokens produced); EXL3_SPEC_PROF_FILE appends it as a JSON line."""
+        gen_jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+        n0 = [j.new_tokens for j in gen_jobs]
+        cuda_sync_active()
+        t0 = time.perf_counter()
+        _PROF_CUR.clear()
+        draft_tokens = draft_fn(results)
+        self.iterate_gen(results, draft_tokens)
+        cuda_sync_active()
+        _PROF_CUR.update(t_step = time.perf_counter() - t0, jobs = len(gen_jobs), spec = draft_tokens is not None,
+                         drafted = 0 if draft_tokens is None else int(draft_tokens.shape[-1]),
+                         produced = sum(j.new_tokens - n for j, n in zip(gen_jobs, n0)))
+        SPEC_PROF_REC.append(dict(_PROF_CUR))
+        if SPEC_PROF_FILE:
+            with open(SPEC_PROF_FILE, "a") as f:
+                f.write(json.dumps(_PROF_CUR) + "\n")
+
     # TODO: Refactor, share code with other draft fns
     def _iterate_gated(self, results: list, draft_fn):
         """One decode step under the spec gate: speculative round (drafter + R-row verify) or a plain
@@ -1201,6 +1324,9 @@ class Generator:
             self._flush_dkv()
         if len(gen_jobs) != 1:
             # Batched decode or nothing to decode: keep the old behaviour, no timing
+            if SPEC_PROF and gen_jobs:
+                self._prof_multi_step(results, draft_fn)
+                return
             draft_tokens = draft_fn(results) if gen_jobs else None
             self.iterate_gen(results, draft_tokens)
             return
@@ -1221,6 +1347,9 @@ class Generator:
             _PROF_CUR.update(t_step = dt, produced = produced, spec = bool(spec),
                              drafted = 0 if draft_tokens is None else int(draft_tokens.shape[-1]))
             SPEC_PROF_REC.append(dict(_PROF_CUR))
+            if SPEC_PROF_FILE:
+                with open(SPEC_PROF_FILE, "a") as f:
+                    f.write(json.dumps(dict(_PROF_CUR, jobs = 1)) + "\n")
         if spec:
             # includes rounds where the drafter ran but -dds truncated the window to nothing
             gate.record_spec(dt, produced)
@@ -1326,7 +1455,7 @@ class Generator:
                 return None
             window = w_used
 
-        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        self.draft_ids_pinned[:batch_size, :window].copy_(self._bound_draft_ids(new_ids[:batch_size, :window]))
         return self.draft_ids_pinned[:, :window]
 
 
@@ -1526,7 +1655,7 @@ class Generator:
             # sliding_attn.py's qkv gemv_r_multi branch) all require this marker in addition to
             # the row-count bound, so they only ever fire on the one call they were verified
             # bit-exact against.
-            "dflash_verify": draft_tokens is not None,
+            "dflash_verify": draft_tokens is not None or plain_rows_verify(batch_ids.shape[0] * batch_ids.shape[1], False),
         }
         if own_pages is not None:
             params["dflash_table_pages"] = own_pages
@@ -2230,8 +2359,14 @@ class Generator:
             return completions
 
 
+_TORCH_PROF = None
+if os.environ.get("EXL3_TORCH_PROF"):
+    _a = os.environ["EXL3_TORCH_PROF"].split(":", 3)
+    _TORCH_PROF = dict(jobs = int(_a[0]), skip = int(_a[1]), steps = int(_a[2]), path = _a[3], seen = 0, done = False, prof = None)
+
 SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
 SPEC_PROF_REC: list = []
+SPEC_PROF_FILE = os.environ.get("EXL3_SPEC_PROF_FILE", "")   # multi-job step records, one JSON line each
 _PROF_CUR: dict = {}
 
 

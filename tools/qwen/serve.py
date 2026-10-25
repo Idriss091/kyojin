@@ -700,6 +700,12 @@ class QwenEngine:
         if on_cuda:
             for k, v in CUDA_SERVE_ENV:
                 os.environ.setdefault(k, v)
+            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 4 x 8 shapes
+                os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")
+                os.environ.setdefault("EXL3_CUDA_GRAPH_MAX", "32")
+        if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
+            # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
+            os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job

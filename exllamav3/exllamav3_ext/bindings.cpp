@@ -116,6 +116,7 @@
 #include "generator/cache.cuh"
 #include "generator/dry.cuh"
 #include "ngram.cuh"
+#include "sam.h"
 
 #endif
 
@@ -417,6 +418,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/dsv4_attn_bc.h"
     #include "sam_bc.h"
 #else
+    #include "sam_bc.h"   // n-gram drafting (CPU suffix automaton), same binding as the CUDA build
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
 
