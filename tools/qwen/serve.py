@@ -795,6 +795,7 @@ class QwenEngine:
         self.spec_on = self.draft_model is not None
         self.slot_store = None
         self.last_stats: dict[str, Any] = {}
+        self._disk_ids: dict[int, Any] = {}   # id(stats of the request) -> its prompt ids, until its disk_save
         # The loaded model and tokenizer are about 1.9 M Python objects, and every later gc.collect() walked them all: the Generator
         # rebuild of a cache_salt change or cache_prompt=false spent 0.5 s there, inside time to first token (0.53 -> 0.03 s).
         # Keep them out of the collector, before the first Generator exists (a frozen Generator would never be freed). 0 = off.
@@ -903,12 +904,16 @@ class QwenEngine:
         """POST /tokenize: the ids of text (special-token text is encoded as the special token; add_special_tokens adds BOS)."""
         return [int(t) for t in self.tokenizer.encode(text, add_bos=add_special_tokens, encode_special_tokens=True).flatten().tolist()]
 
-    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). Both run on the driver, generator idle.
+    # Persistent prompt cache (EXL3_PREFIX_DISK_DIR, exllamav3/generator/prefix_disk.py). Both run on the driver, between two
+    # iterate() calls, while other requests may be decoding or prefilling: restore only takes unreferenced pages and the save reads
+    # pages of a finished prompt. (They used to wait for a fully idle Generator, which with several users is almost never:
+    # 3 users, a 180K prompt evicted the other two sessions, every follow-up re-prefilled 19-32K tokens from zero although
+    # 3 GB of their state was on the disk, and a save after a request saved the prompt of the request that started last.)
     async def disk_restore(self, ids) -> None:
         """Before the request is enqueued: put a deeper resume point from the disk (an earlier run, an evicted prefix) back."""
         pd = self.prefix_disk
         try:
-            r = await self._post(lambda: None if self.generator.num_remaining_jobs() else pd.restore(ids))
+            r = await self._post(pd.restore, ids)
         except Exception as exc:                                        # noqa: BLE001 the disk never fails a request
             print(f"qserve: prefix disk restore failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             return
@@ -916,19 +921,16 @@ class QwenEngine:
             print(f"qserve: prefix disk restore resume_at={r['resume_at']} (ram {r['ram_at']}) pages={r['pages']} {r['ms']:.0f} ms",
                   file=sys.stderr, flush=True)
 
-    async def disk_save(self) -> None:
-        """After a request: persist its prompt (new pages, checkpoints) with a background write."""
+    async def disk_save(self, stats=None) -> None:
+        """After a request: persist ITS prompt (new pages, checkpoints) with a background write. `stats` is the dict generate() got."""
         pd = getattr(self, "prefix_disk", None)
-        ids = getattr(self, "_disk_ids", None)
+        ids = self._disk_ids.pop(id(stats) if stats is not None else 0, None)
         if pd is None or ids is None:
             return
         try:
-            r = await self._post(lambda: None if self.generator.num_remaining_jobs() else pd.save(ids))
+            await self._post(pd.save, ids)
         except Exception as exc:                                        # noqa: BLE001
             print(f"qserve: prefix disk save failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-            return
-        if r is not None:
-            self._disk_ids = None
 
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (page table, recurrent checkpoints, n-gram index): a fresh Generator, the path
@@ -1175,7 +1177,9 @@ class QwenEngine:
             self.slot_store.note_prompt(prompt, ids)
         if getattr(self, "prefix_disk", None) is not None and cache_prompt and not embs:
             await self.disk_restore(ids)
-            self._disk_ids = ids
+            self._disk_ids[id(stats) if stats is not None else 0] = ids
+            while len(self._disk_ids) > 32:   # requests that ended without a save
+                self._disk_ids.pop(next(iter(self._disk_ids)))
         guard_on = loop_guard_default() if loop_guard is None else bool(loop_guard)
         budget = thinking_budget if reasoning_first else None
         close_id, close_seq = self._close_ids()
@@ -1547,7 +1551,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
                     if getattr(engine, "prefix_disk", None) is not None:
-                        await engine.disk_save()    # the reply is out: the host copy of the new pages holds the lock, the write does not
+                        await engine.disk_save(stats)    # the reply is out: the host copy of the new pages holds the lock, the write does not
             except Exception as exc:                                  # noqa: BLE001
                 lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)

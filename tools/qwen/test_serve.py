@@ -1206,5 +1206,47 @@ class SSEKeepAliveTests(unittest.TestCase):
         self.assertIn(b"hel", body)
 
 
+class PrefixDiskConcurrencyTests(unittest.TestCase):
+    """The disk cache must work while other requests run (3 users): restore with a busy Generator, save of the request's own prompt."""
+
+    def _engine(self):
+        eng = serve.QwenEngine.__new__(serve.QwenEngine)
+        calls = []
+
+        class PD:
+            def restore(self, ids):
+                calls.append(("restore", ids))
+                return {"resume_at": 256, "ram_at": 0, "pages": 1, "ms": 1.0}
+
+            def save(self, ids):
+                calls.append(("save", ids))
+                return {"saved": 1}
+
+        class Gen:
+            def num_remaining_jobs(self):
+                return 2    # other users are decoding
+
+        async def post(fn, *args):
+            return fn(*args)
+        eng.prefix_disk, eng.generator, eng._post, eng._disk_ids = PD(), Gen(), post, {}
+        return eng, calls
+
+    def test_restore_runs_with_other_jobs(self):
+        eng, calls = self._engine()
+        asyncio.run(eng.disk_restore("ids-a"))
+        self.assertEqual(calls, [("restore", "ids-a")])
+
+    def test_save_uses_the_ids_of_its_own_request(self):
+        eng, calls = self._engine()
+        stats_a, stats_b = {}, {}
+        eng._disk_ids[id(stats_a)] = "ids-a"
+        eng._disk_ids[id(stats_b)] = "ids-b"     # B started after A and is still running when A ends
+        asyncio.run(eng.disk_save(stats_a))
+        self.assertEqual(calls, [("save", "ids-a")])
+        asyncio.run(eng.disk_save(stats_a))       # nothing left for A
+        asyncio.run(eng.disk_save(stats_b))
+        self.assertEqual(calls, [("save", "ids-a"), ("save", "ids-b")])
+
+
 if __name__ == "__main__":
     unittest.main()
