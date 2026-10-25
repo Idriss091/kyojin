@@ -23,7 +23,7 @@ class Job:
 
 pt = types.SimpleNamespace(num_unreferenced_pages=lambda: 10)
 gen = types.SimpleNamespace(active_jobs=[], pending_jobs=[Job("a", 4), Job("big", 50), Job("c", 3)], max_batch_size=4, pagetable=pt,
-                            reap_failed_job=lambda *a: None, pre_start_hook=lambda job: events.append(("hook", job.name)))
+                            reap_failed_job=lambda *a: None, _prefill_leader=lambda job: None, pre_start_hook=lambda job: events.append(("hook", job.name)))
 fn(gen, [])
 assert events == [("hook", "a"), ("activate", "a"), ("allocate", "a"), ("hook", "c"), ("activate", "c"), ("allocate", "c")], events
 assert [j.name for j in gen.pending_jobs] == ["big"]
