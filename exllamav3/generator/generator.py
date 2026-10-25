@@ -739,6 +739,29 @@ class Generator:
         for job in self.active_jobs:
             job._cil_hold = False
 
+    def _prefill_round(self, parked, results: list):
+        """One prefill chunk for each active job that is not parked. The first token of a job is sampled in the generation round
+        after this one, so jobs that finish their prefill here all wait for the longest prefill of the step: four sub-agents of one
+        parent got their first token together, after the sum of the four prefills (4.7 s) instead of one by one (1.4 s for the first).
+        The round therefore ends at the first job that completes its prefill while other jobs still have chunks to run; the
+        rest run in the next step (EXL3_PF_FIRST_OUT=0: the whole round every step)."""
+        stop_early = os.environ.get("EXL3_PF_FIRST_OUT", "1") != "0"
+        jobs = list(self.active_jobs)
+        for i, job in enumerate(jobs):
+            if job in parked:
+                continue
+            was_done = job.is_prefill_done()
+            try:
+                job.prefill(results)
+            except Exception as e:
+                if os.environ.get("KYO_TURN_TRACE"):
+                    import traceback; traceback.print_exc()
+                self.reap_failed_job(job, e, results)
+                continue
+            if stop_early and not was_done and job.is_prefill_done() and \
+                    any(j in self.active_jobs and j not in parked and not j.is_prefill_done() for j in jobs[i + 1:]):
+                break
+
     def _iterate_inner(self) -> list[dict]:
         """
         Performs inference on available jobs.
@@ -827,15 +850,7 @@ class Generator:
         # Perform one round of prefill
         _t0 = _ttrace_begin()
         parked = self._cil_parked() if chunk_il.chunk_il_enabled() else ()
-        for job in list(self.active_jobs):
-            if job in parked:
-                continue
-            try:
-                job.prefill(results)
-            except Exception as e:
-                if os.environ.get("KYO_TURN_TRACE"):
-                    import traceback; traceback.print_exc()
-                self.reap_failed_job(job, e, results)
+        self._prefill_round(parked, results)
         _ttrace_end("prefill total", _t0)
 
         # Recurrent checkpoints

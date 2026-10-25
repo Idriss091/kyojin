@@ -27,9 +27,9 @@ def glue():
     src = (ROOT / "exllamav3" / "generator" / "generator.py").read_text()
     ns = {"os": os, "prefill_share": prefill_share, "PAGE_SIZE": PAGE}
     for n in ast.walk(ast.parse(src)):
-        if isinstance(n, ast.FunctionDef) and n.name in ("_prefill_leader", "iterate_start_jobs"):
+        if isinstance(n, ast.FunctionDef) and n.name in ("_prefill_leader", "iterate_start_jobs", "_prefill_round"):
             exec(textwrap.dedent(ast.get_source_segment(src, n)), ns)
-    return ns["_prefill_leader"], ns["iterate_start_jobs"]
+    return ns["_prefill_leader"], ns["iterate_start_jobs"], ns["_prefill_round"]
 
 
 class Seq:
@@ -66,11 +66,30 @@ class FakeGen:
         self.pending_jobs, self.active_jobs = list(pending), []
         self.pagetable = types.SimpleNamespace(num_unreferenced_pages=lambda: 100)
 
-    _prefill_leader, iterate_start_jobs = glue()
+    _prefill_leader, iterate_start_jobs, _prefill_round = glue()
+
+    def reap_failed_job(self, job, e, results):
+        self.active_jobs.remove(job)
 
 
 def chain(n, tag="p"):
     return [f"{tag}{i}" for i in range(n)]
+
+
+class PJob(FakeJob):
+    """prefill() advances `rows` of `need`; done once it got them all."""
+    def __init__(self, need, rows=1, fail=False):
+        super().__init__([])
+        self.need, self.have, self.rows, self.fail, self.ran = need, 0, rows, fail, 0
+
+    def is_prefill_done(self):
+        return self.have >= self.need
+
+    def prefill(self, results):
+        if self.fail:
+            raise RuntimeError("boom")
+        self.ran += 1
+        self.have += self.rows
 
 
 class T(unittest.TestCase):
@@ -123,6 +142,44 @@ class T(unittest.TestCase):
         g.iterate_start_jobs([])
         self.assertEqual(len(g.active_jobs), 2)
         self.assertEqual(g.active_jobs[1].sequences[0].page_hashes[0], "q0")
+
+    def _round(self, jobs, parked=()):
+        g = FakeGen([])
+        g.active_jobs = list(jobs)
+        g._prefill_round(parked, [])
+        return g
+
+    def test_round_ends_at_first_job_that_finishes_its_prefill(self):
+        a, b, c = PJob(1), PJob(1), PJob(1)
+        self._round([a, b, c])
+        self.assertEqual((a.ran, b.ran, c.ran), (1, 0, 0))
+
+    def test_round_runs_every_job_that_does_not_finish(self):
+        a, b, c = PJob(5), PJob(5), PJob(5)
+        self._round([a, b, c])
+        self.assertEqual((a.ran, b.ran, c.ran), (1, 1, 1))
+
+    def test_round_last_job_finishing_ends_nothing_early(self):
+        a, b = PJob(5), PJob(1)
+        self._round([a, b])
+        self.assertEqual((a.ran, b.ran), (1, 1))
+
+    def test_round_skips_parked_and_failed(self):
+        a, b, c = PJob(1), PJob(1), PJob(1)
+        g = self._round([a, b, c], parked=(b,))
+        self.assertEqual((a.ran, b.ran, c.ran), (1, 0, 0))
+        f, d = PJob(2, fail=True), PJob(2)
+        g = self._round([f, d])
+        self.assertEqual((d.ran, len(g.active_jobs)), (1, 1))
+
+    def test_round_off_switch(self):
+        os.environ["EXL3_PF_FIRST_OUT"] = "0"
+        try:
+            a, b, c = PJob(1), PJob(1), PJob(1)
+            self._round([a, b, c])
+            self.assertEqual((a.ran, b.ran, c.ran), (1, 1, 1))
+        finally:
+            del os.environ["EXL3_PF_FIRST_OUT"]
 
 
 if __name__ == "__main__":
