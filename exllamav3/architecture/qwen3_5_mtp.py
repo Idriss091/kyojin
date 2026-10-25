@@ -273,6 +273,21 @@ class Qwen3_5MTPModel(Model):
             return sub
         return exl3_block_subhead(inner, blocks)
 
+    def lazy_vram_bytes(self):
+        """Device memory the adaptive draft-head subset takes at its first build (about 2048 draft rows into the first request),
+        at most EXL3_DRAFT_VOCAB rows of the head. 0 when off, not plain, or already built. The start-up VRAM guard counts it:
+        measured 3090 Qwen3.8-27B (98304 rows): 150 MiB that appeared during the first 32K request and tipped the second
+        distinct 32K prompt into CUDA out of memory, 48 MiB short."""
+        if int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) < 128 or os.environ.get("EXL3_DRAFT_ADAPT", "1") == "0":
+            return 0
+        model = self.attached_model()
+        lm = model.modules[model.logit_layer_idx]
+        if not self._head_plain(lm) or (self.__dict__.get("_dad") or {}).get("sub") is not None:
+            return 0
+        inner = lm.inner
+        n = min(int(os.environ.get("EXL3_DRAFT_VOCAB", "0")) // 128 * 128, lm.out_features)
+        return inner.trellis.numel() * inner.trellis.element_size() * n // lm.out_features + n * inner.svh.element_size()
+
     def _adapt_state(self, lm):
         """Adaptive draft-head subset (EXL3_DRAFT_ADAPT, default on when EXL3_DRAFT_VOCAB is set; 0 = the fixed prefix).
         Counts the head's own argmax ids per 128-id block (every step while the full head runs, the probe steps while the
@@ -316,6 +331,7 @@ class Qwen3_5MTPModel(Model):
         k = max(int(os.environ.get("EXL3_DRAFT_MINROWS", "49152") or 0) // 128, k)       # a short calibration under-counts the tail
         k = max(2, min(k + (k & 1), cap, order.numel()))       # an even number of blocks: the 1-2 row int8 GEMV needs n % 256 == 0
         blocks = torch.sort(order[:k]).values
+        st["sub"] = st["gmap"] = None
         sub = self._draft_subhead(lm, blocks)
         if sub is None:
             return False
@@ -377,6 +393,7 @@ class Qwen3_5MTPModel(Model):
                     adapt["counts"].index_add_(0, (fids.reshape(-1) // 128), torch.ones(rows, device = fids.device))
                     adapt["seen"] += rows
                     if adapt["seen"] - adapt["built_at"] >= adapt["warm"]:
+                        sub = None      # a rebuild must not hold the old subset while the new one is made (another 150 MiB at 98304 rows)
                         self._adapt_build(lm, adapt)
                     if params.get("export_draft_conf"):
                         params["draft_conf"] = fconf

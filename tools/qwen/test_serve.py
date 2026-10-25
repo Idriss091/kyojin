@@ -9,6 +9,7 @@ import os
 import sys
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1296,6 +1297,35 @@ class VramHeadroomTests(unittest.TestCase):
 
     def test_196608_sessions_3_is_accepted(self):
         self.assertIsNone(serve.vram_headroom_problem(2600, 196608, 0.0182, 3))   # measured: ~2.6 GiB left, 50 calls clean in realA
+
+    def test_lazy_draft_head_subset_counts_against_the_floor(self):
+        # measured on the 24 GB 3090, Qwen3.8-27B k6v6 sessions 3 -c 183040: 1551 MiB left after load passed the 1536 floor, the 150 MiB
+        # draft-head subset appeared in the first 32K request and the second distinct 32K prompt died with CUDA out of memory (48 MiB short)
+        self.assertIsNone(serve.vram_headroom_problem(1551, 183040, 0.0182, 3))
+        msg = serve.vram_headroom_problem(1551, 183040, 0.0182, 3, lazy_mib=150)
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertLessEqual(fits, 183040 - (1536 - 1401) / 0.0182)
+        self.assertIsNone(serve.vram_headroom_problem(1551 + 150, 183040, 0.0182, 3, lazy_mib=150))
+
+    def test_lazy_bytes_of_the_draft_subset(self):
+        import torch
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from exllamav3.architecture.qwen3_5_mtp import Qwen3_5MTPModel as M
+        inner = type("LinearEXL3", (), {})()
+        inner.trellis, inner.svh, inner.K, inner.bias = torch.zeros(256, 1024, 16, dtype=torch.int16), torch.zeros(16384, dtype=torch.float16), 4, None
+        lm = types.SimpleNamespace(inner=inner, out_features=16384, pre_scale=1.0, post_scale=1.0, softcap=0.0)
+        model = types.SimpleNamespace(modules=[lm], logit_layer_idx=0)
+        mtp = types.SimpleNamespace(attached_model=lambda: model, _head_plain=staticmethod(M._head_plain), __dict__={})
+        env = {"EXL3_DRAFT_VOCAB": "4096"}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(M.lazy_vram_bytes(mtp), 256 * 1024 * 16 * 2 // 4 + 4096 * 2)     # a quarter of the head rows
+            with unittest.mock.patch.dict(os.environ, {"EXL3_DRAFT_ADAPT": "0"}):
+                self.assertEqual(M.lazy_vram_bytes(mtp), 0)
+            mtp.__dict__["_dad"] = {"sub": object()}
+            self.assertEqual(M.lazy_vram_bytes(mtp), 0)       # already built: it is in the measured free figure
+        with unittest.mock.patch.dict(os.environ, {"EXL3_DRAFT_VOCAB": "0"}):
+            self.assertEqual(M.lazy_vram_bytes(types.SimpleNamespace(__dict__={})), 0)
 
 
 if __name__ == "__main__":

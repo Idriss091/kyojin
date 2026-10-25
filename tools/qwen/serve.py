@@ -2182,9 +2182,12 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 MIN_FREE_MIB = 1536   # VRAM that must stay free after load: a 2048-row prefill chunk and the multi-row graph pools come on top of the resident state (measured 3090 Qwen3.8-27B: the first prefills raise the use by 1.3-1.4 GiB; 1024 let -c 262144 sessions 3, 1369 MiB free, start and then die with CUDA out of memory on the third distinct prompt)
 
 
-def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, sessions: int, min_free_mib: float = MIN_FREE_MIB) -> str | None:
+def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, sessions: int, min_free_mib: float = MIN_FREE_MIB, lazy_mib: float = 0.0) -> str | None:
     """None when the memory left after load covers the first real request, else the start-up error with the context that fits.
-    3090, Qwen3.8-27B K4V4: sessions 3 at -c 262144 left 0.47 GiB and every cold prefill died with CUDA out of memory while /health said ok."""
+    3090, Qwen3.8-27B K4V4: sessions 3 at -c 262144 left 0.47 GiB and every cold prefill died with CUDA out of memory while /health said ok.
+    lazy_mib: persistent buffers that only appear while serving (the adaptive draft-head subset): k6v6 sessions 3 -c 183040 left 1551 MiB
+    after load, passed the 1536 floor, then lost 150 MiB to the subset during the first 32K prompt and died on the second distinct one."""
+    free_mib -= lazy_mib
     if free_mib >= min_free_mib:
         return None
     fits = max(0, int(ctx - (min_free_mib - free_mib) / kv_mib_per_token) // 256 * 256) if kv_mib_per_token > 0 else 0
@@ -2226,8 +2229,9 @@ def load_all(args: argparse.Namespace):
     if engine.torch.cuda.is_available() and not engine.torch.version.hip and os.environ.get("EXL3_MIN_FREE_MIB", "") != "0":
         free_mib = free_vram_mib(engine.torch)
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
-        print(f"qserve: VRAM left after load: {free_mib:.0f} MiB (ctx={args.ctx}, sessions={args.sessions})", flush=True)
-        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB))
+        lazy = getattr(engine.draft_model, "lazy_vram_bytes", lambda: 0)() / 2**20 if engine.draft_model is not None else 0.0
+        print(f"qserve: VRAM left after load: {free_mib:.0f} MiB, {lazy:.0f} MiB of it taken later by the draft-head subset (ctx={args.ctx}, sessions={args.sessions})", flush=True)
+        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB), lazy)
         if bad:
             raise RuntimeError(bad)
     if os.environ.get("EXL3_SWAP_IN", "1") != "0":
