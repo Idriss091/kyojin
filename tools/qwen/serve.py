@@ -941,9 +941,12 @@ class QwenEngine:
         if pd is None or ids is None:
             return
         try:
-            await self._post(pd.save, ids)
+            r = await self._post(pd.save, ids)
         except Exception as exc:                                        # noqa: BLE001
             print(f"qserve: prefix disk save failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            return
+        if r and r.get("ms", 0) >= 250:   # the driver, and with it every other user's decode, waited this long
+            print(f"qserve: prefix disk save pages={r['saved']} {r['ms']:.0f} ms", file=sys.stderr, flush=True)
 
     async def reset_prefix_cache(self) -> None:
         """Forget every cached prompt prefix (page table, recurrent checkpoints, n-gram index): a fresh Generator, the path
