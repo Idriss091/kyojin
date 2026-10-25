@@ -605,7 +605,10 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
 HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
                                 "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
                                 "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
-CUDA_SERVE_ENV = (("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
+# EXL3_PF_EMB_UPLOAD: a long prefill chunk gathers the CPU-resident embedding rows straight into pinned memory in the table dtype (bf16),
+# uploads them asynchronously and widens on the device (bit-identical): 94 MB of pageable fp32 per 4.5K-row chunk plus the 47 MB of the MTP
+# block (~37 ms of idle GPU per chunk) become two async 47 MB copies. Served prefill 4K 1712.8 -> 1729.0, 35K 1515.7 -> 1523.8 tok/s, text identical.
+CUDA_SERVE_ENV = (("EXL3_PF_EMB_UPLOAD", "1"), ("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
 
 HC_GS_SIDECAR = "hc_gs_sidecar.safetensors"
 # The sidecar of the published pack. A file with another hash (wrong pack, damaged download) is not used: plain group rounding, one log line.
