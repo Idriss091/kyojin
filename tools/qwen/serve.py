@@ -151,6 +151,20 @@ class Splitter:
                 self.said, self.after_call = True, False
             out.append((self.mode, body))
 
+    def _tool_open(self, final: bool) -> tuple[int, bool]:
+        """(position, undecided) of the first <tool_call> in buf that opens a call: <function= or a JSON object follows it.
+        The tag quoted in the text (a thought about tool calls, an answer that explains them) is text: taking it for a call
+        swallowed the rest of the reply (a reply of 2602 tokens delivered 1364 characters, empty answer, finish stop)."""
+        i = self.buf.find(TOOL_OPEN)
+        while i >= 0:
+            rest = self.buf[i + len(TOOL_OPEN):].lstrip()
+            if rest.startswith(("<function=", "{")):
+                return i, False
+            if not final and (not rest or "<function=".startswith(rest)):
+                return i, True
+            i = self.buf.find(TOOL_OPEN, i + 1)
+        return -1, False
+
     def feed(self, text: str, final: bool = False) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         self.buf += text
@@ -167,9 +181,16 @@ class Splitter:
                 self.mode, self.lead, self.after_call = "content", True, True
                 continue
             tags = [TOOL_OPEN] + ([THINK_CLOSE] if self.mode == "reasoning" else [])
-            hits = [(self.buf.find(t), t) for t in tags if t in self.buf]
+            hits = [(self.buf.find(t), t) for t in tags if t in self.buf and t != TOOL_OPEN]
+            tpos, undecided = self._tool_open(final)
+            if tpos >= 0:
+                hits.append((tpos, TOOL_OPEN))
             if hits:
                 pos, tag = min(hits)
+                if tag == TOOL_OPEN and undecided:   # the text after the tag is too short to tell a call from a quotation: wait
+                    self._emit(self.buf[:pos], out)
+                    self.buf = self.buf[pos:]
+                    return out
                 self._emit(self.buf[:pos], out)
                 self.ws = ""
                 self.buf = self.buf[pos + len(tag):]

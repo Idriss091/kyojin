@@ -121,6 +121,31 @@ class ParserTests(unittest.TestCase):
         self.assertNotIn("EXL3_DRAFT2S", dict(serve.SERVE_ENV))
         self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
 
+    def test_quoted_tool_call_tag_is_text(self):
+        # reasoning and answers that mention the tag: no call, nothing swallowed (streamed in 3-character pieces too)
+        text = "the Splitter (handles `<tool_call>` blocks) matters\n</think>\n\nUse <tool_call> then </tool_call> like this."
+        for step in (len(text), 3, 1):
+            sp = serve.Splitter(True)
+            pieces = []
+            for i in range(0, len(text), step):
+                pieces += sp.feed(text[i:i + step])
+            pieces += sp.finish()
+            self.assertEqual("".join(t for k, t in pieces if k == "reasoning"), "the Splitter (handles `<tool_call>` blocks) matters")
+            self.assertEqual("".join(t for k, t in pieces if k == "content"), "Use <tool_call> then </tool_call> like this.")
+            self.assertEqual(sp.tool_text, "")
+
+    def test_real_call_after_a_quotation(self):
+        text = "see `<tool_call>` here\n</think>\n\n<tool_call>\n<function=f>\n<parameter=a>1</parameter>\n</function>\n</tool_call>"
+        for step in (len(text), 2, 1):
+            sp = serve.Splitter(True)
+            for i in range(0, len(text), step):
+                sp.feed(text[i:i + step])
+            sp.finish()
+            self.assertEqual([c["function"]["name"] for c in serve.parse_tool_calls(sp.tool_text, None)], ["f"])
+        sp = serve.Splitter(False)
+        sp.feed('<tool_call>\n{"name": "g", "arguments": {}}\n</tool_call>'); sp.finish()
+        self.assertEqual([c["function"]["name"] for c in serve.parse_tool_calls(sp.tool_text, None)], ["g"])
+
     def test_reasoning_first_split(self):
         m = serve.split_completion("let me think\nmore\n</think>\n\nThe answer.\n", True, None)
         self.assertEqual(m["reasoning_content"], "let me think\nmore")
