@@ -1,0 +1,418 @@
+"""KVWIN (fp16 sink + recent-window ring next to a quantized KV pool): ring write / merge / rollback / restore checks.
+
+Tiny shapes on any GPU (CUDA or ROCm); run with pytest or `python tests/test_kvwin.py`. The references are fp32 torch.
+"""
+import os, sys, types, math, contextlib
+# KVWIN_TEST_CPU=1: run the Triton kernels in the Triton interpreter on CPU tensors (no GPU, slow); set before triton is imported
+CPU = os.environ.get("KVWIN_TEST_CPU") == "1"
+if CPU:
+    os.environ["TRITON_INTERPRET"] = "1"
+import torch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import pytest
+
+pytestmark = pytest.mark.skipif(not CPU and not torch.cuda.is_available(), reason = "needs a GPU (or KVWIN_TEST_CPU=1)")
+
+if torch.cuda.is_available():
+    from exllamav3.cache.quant import CacheLayer_quant
+    from exllamav3.cache import kvwin
+    from exllamav3.cache.kvwin import KVWinLayerState, KVWinCtx, KVWinCfg, ring_rows, ring_positions, ov_write_ref, parse_spec
+    from exllamav3.modules.attention_fn.kvwin_triton import ov_write
+    from exllamav3.modules.attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill, _get_h32
+
+DEV = "cpu" if CPU else "cuda:0"
+PAGE = 256
+
+
+@pytest.fixture(autouse = True)
+def cpu_env(monkeypatch):
+    """CPU/interpreter mode: the launch wrappers query the CUDA device (context, SM count, shared memory); stub those."""
+    if not CPU:
+        return
+    from exllamav3.modules.attention_fn import triton_paged, triton_paged_cu
+    props = types.SimpleNamespace(multi_processor_count = 8, major = 8, minor = 6, shared_memory_per_block_optin = 99 * 1024)
+    monkeypatch.setattr(torch.cuda, "device", lambda d: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d = None: (8, 6))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    for mod in (triton_paged, triton_paged_cu):
+        monkeypatch.setattr(mod, "_check_tensor", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_same_device", lambda *a, **k: True)
+    monkeypatch.setattr(triton_paged_cu, "pick_config", lambda device, name, key, candidates, probe: candidates[0])
+
+
+@pytest.fixture(autouse = True, params = ["legacy", "cu"])
+def impl(request, monkeypatch):
+    """Both decode wrappers: the pre-1.6 kernels (ROCm default) and the 1.6 ones (CUDA default; run here on whatever GPU)."""
+    from exllamav3.modules.attention_fn import triton_paged
+    monkeypatch.setattr(triton_paged, "ATTN16", request.param == "cu")
+    return request.param
+
+
+class Rig:
+    """A quantized pool + KVWIN ring for nseq sequences (slot i of sequence i unless slots given)."""
+
+    def __init__(self, cfg, kvh = 2, qh = 8, hd = 128, kb = 4, vb = 4, pages = 8, nslots = 4, slots = (2, 0), seed = 0):
+        self.cfg, self.kvh, self.qh, self.hd, self.kb, self.vb = cfg, kvh, qh, hd, kb, vb
+        self.g = torch.Generator(device = DEV).manual_seed(seed)
+        attn = types.SimpleNamespace(num_kv_heads = kvh, head_dim = hd, window_arg = lambda: -1, logit_softcapping = 0.0)
+        self.cl = CacheLayer_quant(None, attn, 0, pages * PAGE, kb, vb)
+        self.cl.alloc(torch.device(DEV))
+        self.st = KVWinLayerState(attn, nslots, 0, 0)
+        self.st.cfg = cfg
+        self.st.cache_layer = self.cl
+        self.st.alloc(torch.device(DEV))
+        self.nseq = len(slots)
+        self.slots = torch.tensor(slots, dtype = torch.int32, device = DEV)
+        # non-trivial page order: sequence b owns pages perm[b*pp : (b+1)*pp]
+        pp = pages // self.nseq
+        perm = torch.randperm(pages, generator = torch.Generator().manual_seed(seed + 1))
+        self.bt = perm[: pp * self.nseq].view(self.nseq, pp).to(torch.int32).to(DEV)
+        self.len = [0] * self.nseq
+        self.K = [torch.empty(0, kvh, hd, dtype = torch.half, device = DEV) for _ in slots]
+        self.V = [torch.empty(0, kvh, hd, dtype = torch.half, device = DEV) for _ in slots]
+
+    def rnd(self, *shape):
+        # K/V with per-token scale variation so quantization error is visible
+        x = torch.randn(*shape, device = DEV, generator = self.g)
+        return (x * (0.5 + torch.rand(*shape[:-1], 1, device = DEV, generator = self.g) * 2)).half()
+
+    def ctx(self, rows = None):
+        rows = list(range(self.nseq)) if rows is None else rows
+        return KVWinCtx(self.st, self.slots[rows].contiguous())
+
+    def append(self, b, n, ring = True, k = None, v = None):
+        """Quantize n new rows of sequence b into the pool and (ring) into the ring, like attn_dispatch does."""
+        k = self.rnd(1, n, self.kvh, self.hd) if k is None else k
+        v = self.rnd(1, n, self.kvh, self.hd) if v is None else v
+        sl = torch.tensor([self.len[b]], dtype = torch.int32, device = DEV)
+        bt = self.bt[b:b + 1].contiguous()
+        self.cl.update_kv_direct(sl, bt, k, v, n)
+        if ring:
+            ov_write(self.ctx([b]), k, v, sl, n)
+        self.K[b] = torch.cat([self.K[b][: self.len[b]], k[0]])
+        self.V[b] = torch.cat([self.V[b][: self.len[b]], v[0]])
+        self.len[b] += n
+        return k, v
+
+    def dequant(self, b):
+        """fp32 dequantized K/V of sequence b, positions 0..len-1."""
+        sl = torch.tensor([self.len[b]], dtype = torch.int32, device = DEV)
+        k, v = self.cl.get_kv(sl, self.bt[b:b + 1].contiguous())
+        pos = torch.arange(self.len[b], device = DEV)
+        page = self.bt[b].long()[pos // PAGE]
+        return k[page, pos % PAGE].float(), v[page, pos % PAGE].float()
+
+
+def ref_attn(rig, b, q, L, mix = True):
+    """q [q_len, qh, hd] at positions L..L+q_len-1 of sequence b (all of whose K/V are in the rig).
+    mix: sinks + per-row window exact, the rest dequantized; else everything dequantized."""
+    cfg = rig.cfg
+    kd, vd = rig.dequant(b)
+    ke, ve = rig.K[b].float(), rig.V[b].float()
+    out = torch.empty(q.shape, dtype = torch.float32, device = DEV)
+    group = rig.qh // rig.kvh
+    for i in range(q.shape[0]):
+        qa = L + i
+        pos = torch.arange(qa + 1, device = DEV)
+        exact = ((pos < cfg.S) | (pos > qa - cfg.W)) if mix else torch.zeros_like(pos, dtype = torch.bool)
+        kk = torch.where(exact[:, None, None], ke[: qa + 1], kd[: qa + 1])
+        vv = torch.where(exact[:, None, None], ve[: qa + 1], vd[: qa + 1])
+        kk = kk.repeat_interleave(group, dim = 1)     # [T, qh, hd]
+        vv = vv.repeat_interleave(group, dim = 1)
+        s = torch.einsum("hd,thd->ht", q[i].float(), kk) / math.sqrt(rig.hd)
+        out[i] = torch.einsum("ht,thd->hd", s.softmax(-1), vv)
+    return out
+
+
+def decode(rig, b, q, L, ring = True, **kw):
+    q_len = q.shape[0]
+    sl = torch.tensor([L], dtype = torch.int32, device = DEV)
+    return paged_attn_triton_decode(
+        q[None].contiguous(), None, None, rig.cl.qk, rig.cl.qv, rig.bt[b:b + 1].contiguous(), sl, causal = True,
+        qc = (rig.cl.sk, rig.cl.sv, rig.kb, rig.vb), pre_appended_len = q_len, n_kv_heads_override = rig.kvh,
+        ring = rig.ctx([b]) if ring else None, **kw)[0]
+
+
+def close(a, b, rel = 6e-3):
+    err = (a.float() - b.float()).abs().max().item()
+    mx = b.float().abs().max().item()
+    return err <= rel * max(mx, 1e-3), err, mx
+
+
+CFGS = [KVWinCfg(4, 32, 32 + 16, 4 + 32 + 16), KVWinCfg(0, 64, 64 + 16, 64 + 16), KVWinCfg(4, 128, 128 + 16, 4 + 128 + 16)]
+
+
+# -- ring row mapping / reference writer -------------------------------------------------------------------------------
+
+def test_parse():
+    assert parse_spec(None) is None and parse_spec("") is None and parse_spec("0") is None
+    c = parse_spec("4:128")
+    assert (c.S, c.W, c.Rc, c.R) == (4, 128, 144, 148)
+    with pytest.raises(ValueError):
+        parse_spec("12")
+
+
+@pytest.mark.parametrize("cfg", CFGS)
+def test_ring_write_matches_reference(cfg):
+    """Chunks crossing a page boundary and several ring wraps, then decode and verify rows: ring == reference writer."""
+    rig = Rig(cfg, pages = 8, slots = (3, 1))
+    ref_k = torch.zeros(4, cfg.R, rig.kvh, rig.hd, dtype = torch.half, device = DEV)
+    ref_v = torch.zeros_like(ref_k)
+    for n in (200, 100, 257, 1, 1, 7, 16, 300, 1, 5):    # 889 rows: page edge at 256/512/768, wraps of 48..148
+        for b in (0, 1):
+            L = rig.len[b]
+            if L + n > 8 // 2 * PAGE:
+                continue
+            k, v = rig.append(b, n)
+            ov_write_ref(ref_k, ref_v, int(rig.slots[b]), k[0], v[0], L, cfg)
+    for b in (0, 1):
+        s = int(rig.slots[b])
+        assert torch.equal(rig.st.ov_k[s], ref_k[s]) and torch.equal(rig.st.ov_v[s], ref_v[s]), f"slot {s}"
+    # untouched slots stay zero
+    assert not rig.st.ov_k[0].any() and not rig.st.ov_k[2].any()
+    # positions held by the ring after the last write
+    for b in (0, 1):
+        p = ring_positions(rig.len[b], cfg)
+        s = int(rig.slots[b])
+        for r in range(cfg.R):
+            if p[r] >= 0:
+                assert torch.equal(rig.st.ov_k[s, r], rig.K[b][int(p[r])]), (b, r, int(p[r]))
+
+
+# -- attention: LSE merge == attention over the dequantized + exact mix ----------------------------------------------------
+
+@pytest.mark.parametrize("cfg", CFGS)
+@pytest.mark.parametrize("bits", [(4, 4), (6, 6), (8, 8)])
+@pytest.mark.parametrize("q_len", [1, 5, 16])
+def test_merge_equals_mix(cfg, bits, q_len):
+    for L0 in (3, 30, 150, 600):             # shorter than S+W, around the window, page crossing
+        rig = Rig(cfg, hd = 128, kb = bits[0], vb = bits[1], pages = 8, slots = (2, 0), seed = L0)
+        b = 0
+        rig.append(b, L0)
+        k, v = rig.append(b, q_len)            # the verify rows
+        q = rig.rnd(q_len, rig.qh, rig.hd)
+        o = decode(rig, b, q, L0)
+        ok, err, mx = close(o, ref_attn(rig, b, q, L0, mix = True))
+        assert ok, f"{cfg} {bits} q_len {q_len} L0 {L0}: err {err:.3e} vs max {mx:.3e}"
+
+
+def test_tolerance_discriminates():
+    """Negative control: the pool-only result (no ring) must NOT pass the mix check at 4 bit, or the check proves nothing."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, kb = 4, vb = 4, seed = 21)
+    rig.append(0, 300); rig.append(0, 1)
+    q = rig.rnd(1, rig.qh, rig.hd)
+    ok_on, e_on, mx = close(decode(rig, 0, q, 300), ref_attn(rig, 0, q, 300))
+    ok_off, e_off, _ = close(decode(rig, 0, q, 300, ring = False), ref_attn(rig, 0, q, 300))
+    assert ok_on and not ok_off, (e_on, e_off, mx)
+
+
+def test_ring_beats_pool_only():
+    """Sanity of the premise: against the exact attention the ring result is closer than the pool-only result."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, kb = 4, vb = 4, seed = 11)
+    rig.append(0, 400)
+    rig.append(0, 1)
+    # a query aligned with the newest keys, so the window carries real attention mass
+    q = (rig.K[0][-3:].float().mean(0).repeat_interleave(rig.qh // rig.kvh, 0) * 1.5)[None].half()
+    ke, ve = rig.K[0].float().repeat_interleave(rig.qh // rig.kvh, 1), rig.V[0].float().repeat_interleave(rig.qh // rig.kvh, 1)
+    s = torch.einsum("hd,thd->ht", q[0].float(), ke) / math.sqrt(rig.hd)
+    exact = torch.einsum("ht,thd->hd", s.softmax(-1), ve)
+    e_ring = (decode(rig, 0, q, 400)[0].float() - exact).abs().mean().item()
+    e_pool = (decode(rig, 0, q, 400, ring = False)[0].float() - exact).abs().mean().item()
+    assert e_ring < e_pool, (e_ring, e_pool)
+
+
+def test_batch_two_slots_and_lengths():
+    """Two sequences with different lengths and permuted slots in one launch."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, pages = 8, slots = (3, 1), seed = 5)
+    rig.append(0, 500); rig.append(1, 90)
+    for b in (0, 1):
+        rig.append(b, 3)
+    q = rig.rnd(2, 3, rig.qh, rig.hd)
+    sl = torch.tensor([500, 90], dtype = torch.int32, device = DEV)
+    o = paged_attn_triton_decode(
+        q.contiguous(), None, None, rig.cl.qk, rig.cl.qv, rig.bt.contiguous(), sl, causal = True,
+        qc = (rig.cl.sk, rig.cl.sv, rig.kb, rig.vb), pre_appended_len = 3, n_kv_heads_override = rig.kvh, ring = rig.ctx())
+    for b, L in ((0, 500), (1, 90)):
+        ok, err, mx = close(o[b], ref_attn(rig, b, q[b], L))
+        assert ok, (b, err, mx)
+
+
+@pytest.mark.parametrize("splits", [None, 1, 3])
+def test_split_counts(splits):
+    cfg = CFGS[0]
+    rig = Rig(cfg, seed = 7)
+    rig.append(0, 700); rig.append(0, 2)
+    q = rig.rnd(2, rig.qh, rig.hd)
+    o = decode(rig, 0, q, 700, num_splits = splits)
+    ok, err, mx = close(o, ref_attn(rig, 0, q, 700))
+    assert ok, (err, mx)
+
+
+# -- speculative rollback ---------------------------------------------------------------------------------------------------
+
+def test_rollback_of_draft_rows():
+    """D draft rows are verified (written), only some accepted: the next block attends the right window."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, seed = 3)
+    rig.append(0, 300)
+    L = 300
+    D = 16
+    rig.append(0, D)                              # verify block of 16 draft rows (positions 300..315)
+    q = rig.rnd(D, rig.qh, rig.hd)
+    ok, err, mx = close(decode(rig, 0, q, L), ref_attn(rig, 0, q, L))
+    assert ok
+    # reject all but 3: sequence continues at 303 with fresh rows (the stale rows 303..315 are overwritten as they land)
+    rig.len[0] = L + 3
+    rig.K[0] = rig.K[0][: L + 3]; rig.V[0] = rig.V[0][: L + 3]
+    for step in (1, 4, 16):
+        L2 = rig.len[0]
+        rig.append(0, step)
+        q = rig.rnd(step, rig.qh, rig.hd)
+        ok, err, mx = close(decode(rig, 0, q, L2), ref_attn(rig, 0, q, L2))
+        assert ok, (step, err, mx)
+
+
+def test_rollback_across_ring_wrap():
+    """Verify blocks of 16 at every offset around a ring wrap; reject everything each time (len stays)."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, seed = 4)
+    rig.append(0, 100)
+    for rep in range(6):
+        L = rig.len[0]
+        rig.append(0, 16)
+        rig.len[0] = L; rig.K[0] = rig.K[0][:L]; rig.V[0] = rig.V[0][:L]      # all rejected
+        rig.append(0, 1 + rep)                                                  # real tokens land on the stale rows
+        L2 = rig.len[0] - (1 + rep)
+        q = rig.rnd(1 + rep, rig.qh, rig.hd)
+        ok, err, mx = close(decode(rig, 0, q, L2), ref_attn(rig, 0, q, L2))
+        assert ok, (rep, err, mx)
+
+
+# -- stash / restore ----------------------------------------------------------------------------------------------------------
+
+def test_stash_restore_bitwise():
+    cfg = CFGS[0]
+    rig = Rig(cfg, slots = (1, 2), seed = 9)
+    rig.append(0, 450)
+    stashed = rig.st.stash(1)
+    pinned = rig.st.stash(1, pinned = True)
+    torch.cuda.synchronize()
+    assert torch.equal(stashed[0], pinned[0]) and torch.equal(stashed[1], pinned[1])
+    rig.st.clear(3)
+    rig.st.unstash(3, stashed)
+    assert torch.equal(rig.st.ov_k[3], rig.st.ov_k[1]) and torch.equal(rig.st.ov_v[3], rig.st.ov_v[1])
+    # disk round trip (prefix_disk uses torch.save of the stash dict)
+    import io
+    buf = io.BytesIO(); torch.save({"x": stashed}, buf); buf.seek(0)
+    back = torch.load(buf)["x"]
+    rig.st.clear(0)
+    rig.st.unstash(0, back)
+    assert torch.equal(rig.st.ov_k[0], rig.st.ov_k[1])
+    # the restored slot attends identically to the original
+    rig.slots[1] = 0
+    q = rig.rnd(1, rig.qh, rig.hd)
+    rig.append(0, 1)
+    o_new = decode(rig, 0, q, 450)
+    ok, err, mx = close(o_new, ref_attn(rig, 0, q, 450))
+    assert ok, (err, mx)
+
+
+def test_cold_fill_from_pool():
+    """A checkpoint without ring blob: fill rebuilds sinks + window from the dequantized pool (quant-level window)."""
+    cfg = CFGS[0]
+    rig = Rig(cfg, slots = (1, 2), seed = 10)
+    rig.append(0, 420)
+    rig.st.unstash_missing(2)
+    assert rig.st.cold[2] and not rig.st.cold[1]
+    rig.st.fill(2, rig.bt[0], 420)
+    assert not rig.st.cold[2]
+    kd, vd = rig.dequant(0)
+    for p in list(range(cfg.S)) + list(range(420 - cfg.W, 420)):
+        r = p if p < cfg.S else cfg.S + (p - cfg.S) % cfg.Rc
+        assert torch.equal(rig.st.ov_k[2, r].float(), kd[p]) and torch.equal(rig.st.ov_v[2, r].float(), vd[p]), p
+    # after the fill, new rows land normally and the window slides over filled + new rows
+    rig.slots[0] = 2
+    rig.append(0, 1)
+    q = rig.rnd(1, rig.qh, rig.hd)
+    o = decode(rig, 0, q, 420)
+    # reference: window rows 420-W+1..419 are dequantized (filled), row 420 and the sinks exact
+    kk, vv = rig.K[0].clone(), rig.V[0].clone()
+    keep = torch.zeros(421, dtype = torch.bool, device = DEV); keep[:cfg.S] = True; keep[420] = True
+    kk = torch.where(keep[:, None, None], kk.float(), torch.cat([kd, kd[-1:]])); vv = torch.where(keep[:, None, None], vv.float(), torch.cat([vd, vd[-1:]]))
+    g = rig.qh // rig.kvh
+    s = torch.einsum("hd,thd->ht", q[0].float(), kk.repeat_interleave(g, 1)) / math.sqrt(rig.hd)
+    ref = torch.einsum("ht,thd->hd", s.softmax(-1), vv.repeat_interleave(g, 1))
+    ok, err, mx = close(o[0], ref)
+    assert ok, (err, mx)
+
+
+# -- prefill staging patch ------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("past,q_len", [(0, 300), (700, 300), (90, 40)])
+def test_prefill_patch(past, q_len):
+    cfg = CFGS[0]
+    rig = Rig(cfg, hd = 128, pages = 8, slots = (2, 0), seed = 12)
+    if past:
+        rig.append(0, past)
+    k = rig.rnd(1, q_len, rig.kvh, rig.hd); v = rig.rnd(1, q_len, rig.kvh, rig.hd)
+    sl = torch.tensor([past], dtype = torch.int32, device = DEV)
+    rig.cl.update_kv_direct(sl, rig.bt[0:1].contiguous(), k, v, q_len)
+    ctx = rig.ctx([0])._replace(chunk_k = k, chunk_v = v)
+    q = rig.rnd(q_len, rig.qh, rig.hd)
+    o = paged_attn_triton_prefill(
+        q[None].contiguous(), None, None, rig.cl.qk, rig.cl.qv, rig.bt[0:1].contiguous(), sl, causal = True,
+        qc = (rig.cl.sk, rig.cl.sv, rig.kb, rig.vb), pre_appended_len = q_len, n_kv_heads_override = rig.kvh,
+        max_kv_len = past, ring = ctx)[0]
+    ov_write(rig.ctx([0]), k, v, sl, q_len)
+    rig.K[0] = torch.cat([rig.K[0][:past], k[0]]); rig.V[0] = torch.cat([rig.V[0][:past], v[0]]); rig.len[0] = past + q_len
+    # reference: chunk rows exact, past window / sinks exact, rest dequantized (a superset of the decode window)
+    kd, vd = rig.dequant(0)
+    ke, ve = rig.K[0].float(), rig.V[0].float()
+    pos = torch.arange(past + q_len, device = DEV)
+    exact = (pos < cfg.S) | (pos >= past - cfg.W)
+    kk = torch.where(exact[:, None, None], ke, kd); vv = torch.where(exact[:, None, None], ve, vd)
+    g = rig.qh // rig.kvh
+    kk, vv = kk.repeat_interleave(g, 1), vv.repeat_interleave(g, 1)
+    s = torch.einsum("qhd,thd->hqt", q.float(), kk) / math.sqrt(rig.hd)
+    mask = pos[None, :] <= (past + torch.arange(q_len, device = DEV))[:, None]
+    s = s.masked_fill(~mask[None], -float("inf"))
+    ref = torch.einsum("hqt,thd->qhd", s.softmax(-1), vv)
+    ok, err, mx = close(o, ref)
+    assert ok, (err, mx)
+    # and the ring now holds the end of the chunk
+    pp = ring_positions(past + q_len, cfg)
+    for r in range(cfg.R):
+        if pp[r] >= 0:
+            assert torch.equal(rig.st.ov_k[2, r], rig.K[0][int(pp[r])])
+
+
+def test_off_is_bitwise_today():
+    """EXL3_KVWIN unset: attn_dispatch outputs (prefill / decode / verify rows, 4/6/8 bit) equal the tree before KVWIN bit for bit.
+    KVWIN_BASE_TREE = checkout of the parent commit (default: the sibling worktree wt_empty27)."""
+    import subprocess, tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    new_tree = os.path.dirname(here)
+    base = os.environ.get("KVWIN_BASE_TREE", os.path.join(new_tree, "..", "wt_empty27"))
+    if not os.path.isdir(os.path.join(base, "exllamav3")):
+        pytest.skip("no baseline tree (set KVWIN_BASE_TREE)")
+    ext_dir = os.environ.get("KVWIN_EXT_DIR", "")
+    outs = []
+    with tempfile.TemporaryDirectory() as d:
+        for name, tree in (("base", base), ("new", new_tree)):
+            o = os.path.join(d, name + ".pt")
+            env = {k: v for k, v in os.environ.items() if k != "EXL3_KVWIN"}
+            subprocess.run([sys.executable, "-I", os.path.join(here, "kvwin_off_scenario.py"), tree, o] + ([ext_dir] if ext_dir else []),
+                           check = True, env = env, stdout = subprocess.DEVNULL)
+            outs.append(torch.load(o))
+    for bits in outs[0]:
+        for a, b in zip(outs[0][bits], outs[1][bits]):
+            assert torch.equal(a, b), bits
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-x", "-q"] + sys.argv[1:]))

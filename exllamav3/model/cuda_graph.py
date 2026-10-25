@@ -311,6 +311,9 @@ class CudaGraphRunner:
             return "no_block_table"
         if params.get("indexed_embeddings"):
             return "state"
+        from ..cache import kvwin
+        if kvwin.ANY_ACTIVE:
+            return "kvwin"   # the ring writes / cold fills run in Python between layers
         rs = params.get("recurrent_states")
         if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa:
             slots = params.get("recurrent_slots")

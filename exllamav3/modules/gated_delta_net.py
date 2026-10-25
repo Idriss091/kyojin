@@ -202,9 +202,11 @@ class GDNState:
                     l._set_base(self.slot, 0)
             return ent[1]
         jobs = _collect_rewind_jobs(layers.values(), self.slot, self.last_history, num_tokens)
-        if all(isinstance(l, GDNLayerState) for l in layers.values()):
+        # KVWIN ring states rewind as a no-op, so they do not break the pointer-only memo
+        if all(isinstance(l, GDNLayerState) or getattr(l, "rewind_noop", False) for l in layers.values()):
             reps = {}
-            for l in layers.values(): reps.setdefault(l.cache_id, l)
+            for l in layers.values():
+                if isinstance(l, GDNLayerState): reps.setdefault(l.cache_id, l)
             memo[key] = (_alloc_epoch, jobs, list(reps.values()))
         return jobs
 
@@ -276,7 +278,10 @@ class GDNState:
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k])
+                if k in stashed or not hasattr(l, "unstash_missing"):
+                    l.unstash(self.slot, stashed[k])
+                else:
+                    l.unstash_missing(self.slot)   # KVWIN ring absent from a checkpoint written with the switch off
         else:
             cp_handle = stashed["tp_handle"]
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))

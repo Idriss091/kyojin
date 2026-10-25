@@ -69,7 +69,11 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     @cached_property
     def _get_recurrent_layers(self):
-        return [m for m in self if m.caps.get("recurrent_cache")]
+        rl = [m for m in self if m.caps.get("recurrent_cache")]
+        if self.recurrent_state_cls is None:
+            # KVWIN rings ride the job's recurrent state: a model without recurrent state slots has none
+            rl = [m for m in rl if not getattr(getattr(m, "layer_state_cls", None), "kvwin", False)]
+        return rl
 
     def get_recurrent_layers(self):
         return self._get_recurrent_layers
