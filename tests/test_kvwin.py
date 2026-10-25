@@ -391,6 +391,152 @@ def test_prefill_patch(past, q_len):
             assert torch.equal(rig.st.ov_k[2, r], rig.K[0][int(pp[r])])
 
 
+# -- Cache / GDNState integration (fake attention module, real Cache + GDNState) --------------------------------------------------
+
+class _FakeAttn:
+    layer_idx = 0
+    num_kv_heads = 2
+    head_dim = 128
+    logit_softcapping = 0.0
+
+    def __init__(self):
+        self.caps = {"kv_cache": True, "recurrent_cache": True}
+        self.layer_state_cls = KVWinLayerState
+        self.cache_layers, self.recurrent_layers = [], []
+
+    def window_arg(self):
+        return -1
+
+
+class _FakeModel:
+    def __init__(self):
+        from exllamav3.modules.gated_delta_net import GDNState
+        self.config = types.SimpleNamespace(layer_map = None)
+        self.recurrent_state_cls = GDNState
+        self.loaded_tp = False
+        self.cache_weakrefs = {}
+        self.attn = _FakeAttn()
+
+    def get_cache_layers(self): return [self.attn]
+    def get_recurrent_layers(self): return [self.attn]
+    def get_layer_instances(self, idx): return [(idx, 0)]
+
+
+def _fake_cache(monkeypatch, spec = "4:32"):
+    from exllamav3.cache import Cache
+    monkeypatch.setenv("EXL3_KVWIN", spec)
+    model = _FakeModel()
+    cache = Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 3, k_bits = 4, v_bits = 4)
+    model.attn.cache_layers[0].alloc(torch.device(DEV))
+    model.attn.recurrent_layers[0].alloc(torch.device(DEV))
+    return cache, model, model.attn.cache_layers[0], model.attn.recurrent_layers[0]
+
+
+def test_cache_binds_ring_to_recurrent_state_lifecycle(monkeypatch):
+    cache, model, cl, st = _fake_cache(monkeypatch)
+    assert st.active and cl.kvwin is st and st.cfg == parse_spec("4:32")
+    state = cache.get_new_state()
+    k = torch.randn(1, 300, 2, 128, device = DEV).half(); v = torch.randn_like(k)
+    sl = torch.zeros(1, dtype = torch.int32, device = DEV)
+    ov_write(KVWinCtx(st, torch.tensor([state.slot], dtype = torch.int32, device = DEV)), k, v, sl, 300)
+    state.position = 300
+    state.rewind(3)                                   # ring rewind is a no-op (positional rows); GDN-less cache here
+    state.position = 300
+    stashed = state.stash()
+    assert stashed["checkpoint_size"] == st.get_checkpoint_size() > 0
+    slot_a = state.slot
+    state.free()
+    # restore into a different slot: bitwise
+    cache.free_list.rotate(1)
+    state2 = cache.new_from_stashed(stashed, 300)
+    assert state2.slot != slot_a
+    assert torch.equal(st.ov_k[state2.slot], st.ov_k[slot_a]) and torch.equal(st.ov_v[state2.slot], st.ov_v[slot_a])
+    assert not st.cold[state2.slot]
+    # a checkpoint written with the switch off has no ring entry (or None): cold, then rebuilt from the pool
+    for variant in ("missing", "none"):
+        s2 = dict(stashed)
+        if variant == "missing": del s2[(0, 0)]
+        else: s2[(0, 0)] = None
+        state2.free()
+        state3 = cache.new_from_stashed(s2, 300)
+        assert st.cold[state3.slot]
+        params = {"recurrent_states": [state3], "recurrent_slots": torch.tensor([state3.slot], dtype = torch.int32),
+                  "cache_seqlens": torch.tensor([300], dtype = torch.int32)}
+        cl.update_kv_direct(sl, torch.tensor([[1, 4, 6, 0, 2, 3, 5, 7]], dtype = torch.int32, device = DEV)[:, :4].contiguous(), k, v, 300)
+        from exllamav3.cache.kvwin import make_ctx, ensure_filled
+        ctx = make_ctx(st, params, torch.device(DEV), 1)
+        assert ctx is not None
+        ensure_filled(ctx, params, torch.tensor([[1, 4, 6, 0]], dtype = torch.int32, device = DEV))
+        assert not st.cold[state3.slot]
+        assert st.ov_k[state3.slot].any()
+        state2 = state3
+
+
+def test_ring_inert_when_off_or_unsupported(monkeypatch):
+    from exllamav3.cache import Cache
+    monkeypatch.delenv("EXL3_KVWIN", raising = False)
+    model = _FakeModel()
+    cache = Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = 4, v_bits = 4)
+    st = model.attn.recurrent_layers[0]
+    st.alloc(torch.device(DEV))
+    assert not st.active and st.ov_k is None and st.get_checkpoint_size() == 0 and st.storage_size() == 0
+    state = cache.get_new_state()
+    stashed = state.stash()
+    assert stashed[(0, 0)] is None and stashed["checkpoint_size"] == 0
+    # fp16 cache layer: inert even with the switch on
+    from exllamav3.cache import CacheLayer_fp16
+    monkeypatch.setenv("EXL3_KVWIN", "4:32")
+    model2 = _FakeModel()
+    Cache(model2, 8 * PAGE, layer_type = CacheLayer_fp16, max_batch_size = 2)
+    assert model2.attn.recurrent_layers[0].cfg is None
+
+
+def test_models_without_recurrent_state_drop_ring_layers():
+    from exllamav3.model.model import Model
+    a = _FakeAttn()
+    other = types.SimpleNamespace(caps = {"recurrent_cache": True}, layer_state_cls = object)
+    fake = types.SimpleNamespace(recurrent_state_cls = None, __iter__ = None)
+    fake = type("M", (), {"recurrent_state_cls": None, "__iter__": lambda self: iter([a, other])})()
+    assert Model._get_recurrent_layers.func(fake) == [other]
+    fake2 = type("M", (), {"recurrent_state_cls": object, "__iter__": lambda self: iter([a, other])})()
+    assert Model._get_recurrent_layers.func(fake2) == [a, other]
+
+
+def test_attention_kvwin_ctx_entry(monkeypatch):
+    """Attention.kvwin_ctx (the hook of decode_flash_attn / decode_flash_attn_shared) on a bound cache."""
+    from exllamav3.modules.attn import Attention
+    cache, model, cl, st = _fake_cache(monkeypatch)
+    state = cache.get_new_state()
+    me = types.SimpleNamespace(caps = {"recurrent_cache": True}, layer_idx = 0, device = torch.device(DEV))
+    params = {"recurrent_states": [state], "recurrent_slots": torch.tensor([state.slot], dtype = torch.int32)}
+    bt = torch.zeros((1, 4), dtype = torch.int32, device = DEV)
+    ctx = Attention.kvwin_ctx(me, cache, params, 1, bt)
+    assert ctx is not None and int(ctx.slots[0]) == state.slot
+    assert Attention.kvwin_ctx(types.SimpleNamespace(caps = {}), cache, params, 1, bt) is None      # off: untouched
+    assert Attention.kvwin_ctx(me, cache, {}, 1, bt) is None                                          # no job states
+    assert Attention.kvwin_ctx(me, None, params, 1, bt) is None                                       # no Cache
+
+
+def test_midchunk_checkpoint_keeps_working_with_a_ring():
+    """EXL3_MIDCHUNK_CKPT stashes skip the ring (cold on restore) instead of being dropped."""
+    from exllamav3.generator.job import Job
+    ring = types.SimpleNamespace(kvwin = True)
+    gdn = types.SimpleNamespace()
+    puts = []
+    page = types.SimpleNamespace(kv_position = PAGE, phash = b"h")
+    fake = types.SimpleNamespace(
+        sequences = [types.SimpleNamespace(allocated_pages = [page])],
+        recurrent_state = types.SimpleNamespace(checkpoint_size = 7),
+        generator = types.SimpleNamespace(
+            recurrent_cache = types.SimpleNamespace(put = lambda key, st, stashed = None: puts.append((key, stashed)), metrics = {}),
+            cache = types.SimpleNamespace(get_all_recurrent_layers = lambda: {(0, 0): ring, (1, 0): gdn})))
+    t = (torch.zeros(2), torch.zeros(3))
+    assert Job.stash_midchunk(fake, {PAGE: {(1, 0): t}}, 0) == 1
+    (key, stashed), = puts
+    assert key == b"h" and stashed[(0, 0)] is None and stashed[(1, 0)][0].shape == (2,) and stashed["position"] == PAGE
+    assert Job.stash_midchunk(fake, {PAGE: {}}, 0) == 0                       # still skipped when a GDN layer is missing
+
+
 def test_off_is_bitwise_today():
     """EXL3_KVWIN unset: attn_dispatch outputs (prefill / decode / verify rows, 4/6/8 bit) equal the tree before KVWIN bit for bit.
     KVWIN_BASE_TREE = checkout of the parent commit (default: the sibling worktree wt_empty27)."""
