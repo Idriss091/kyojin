@@ -691,8 +691,10 @@ class Generator:
         for job in self.active_jobs:
             job._cil_skip = False
             job._cil_hold = False
+        base = getattr(self, "base_chunk_size", self.max_chunk_size)
         if getattr(self, "_cil_broken", False) or len(self.active_jobs) < 2:
             self._cil_plan = None
+            self.max_chunk_size = base                                   # decode priority lowered it only beside a decode-ready job
             if getattr(self, "_cil", None) is not None:
                 self._cil.solo()                                         # these steps are not interleave time
             return []
@@ -702,9 +704,12 @@ class Generator:
             views = self._cil_views()
             self._cil_plan = self._cil.plan_prefill(views)
             parked = [j for j in self.active_jobs if id(j) in self._cil_plan.parked and not j.is_prefill_done()]
+            rows = getattr(self._cil_plan, "chunk_rows", 0)
+            self.max_chunk_size = min(rows, base) if rows else base      # decode priority: a prefill step is short while others decode
         except Exception as e:                                           # noqa: BLE001
             logging.warning("EXL3_SCHED_CHUNK_IL disabled (%r); serving without it", e)
             self._cil_broken, self._cil_plan = True, None
+            self.max_chunk_size = base
             return []
         for job in parked:
             job._cil_skip = True
