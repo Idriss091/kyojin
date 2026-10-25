@@ -547,6 +547,8 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # verify of 5..8 rows (deep draft tier of spec_policy.TierRule): row split, one-launch fused MoE, one-launch 6-row dense GEMV;
              # bit-identical per row, rows <= 4 untouched. 0 = off.
              ("EXL3_VERIFY_ROW_SPLIT", "2"), ("EXL3_MOE_R8", "1"), ("EXL3_GEMV_R_RM6", "1"),
+             # 7..8 rows (4 sessions x 2 draft rows): one decode pass of the dense GEMV instead of two 4-row chunks, bit-identical. 0 = off.
+             ("EXL3_GEMV_R_WIDE8", "1"),
              # Fidelity first: int8 mixer weights with group scales (fn 128 along H*D, up 64
              # along rank) and, when <model_dir>/hc_gs_sidecar.safetensors exists, its GPTQ-rounded codes (decoded-token KLD 0.0504 ->
              # 0.0455, plain decode +0.5-0.8 ms). A missing file means group scales with plain rounding. EXL3_GR_GS=0 = per-row scales.
@@ -579,7 +581,7 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
 # SERVE_ENV entries tuned on gfx1151 for conversation resume and HIP kernels, not validated on NVIDIA (the 3090 numbers were
 # measured without them): CUDA starts without them, the environment still wins.
 HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
-                                "EXL3_NC2_ATTN_F16", "EXL3_REPLY_FIRST", "EXL3_STATE_REBASE", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
+                                "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_STATE_REBASE", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
                                 "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
 CUDA_SERVE_ENV = (("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
 
