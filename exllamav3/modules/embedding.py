@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing_extensions import override
 import os
 import torch
@@ -47,7 +48,12 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
+        weight = None
+        if self.device.type == "cpu" and os.environ.get("EXL3_EMB_MMAP", "1") != "0" and hasattr(self.config.stc, "get_tensor_mmap"):
+            # The table is only gathered from: map it from the file (page cache) rather than holding a 2+ GiB anonymous copy
+            weight = self.config.stc.get_tensor_mmap(self.key + ".weight")
+        if weight is None:
+            weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,
