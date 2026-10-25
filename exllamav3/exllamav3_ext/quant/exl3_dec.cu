@@ -1817,8 +1817,8 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     // Tail: every thread reduces the cross-block partials of all rows (same b order per element),
     // then 64-thread groups (2 waves) run the rows' top-k concurrently, group g = row g. The pick
     // (max choice, lowest index on ties) and the weight sum order equal router_kernel's.
-    __shared__ float score[4][320];
-    __shared__ float chs[4][320];
+    __shared__ float score[NR][320];
+    __shared__ float chs[NR][320];
     for (int i = tid; i < NR * E; i += 256)
     {
         const int r = i / E, e = i - r * E;
@@ -1832,17 +1832,20 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     __syncthreads();
     __shared__ float s_val[2][8];
     __shared__ int s_idx[2][8];
-    __shared__ int s_sel[4][64];
+    __shared__ int s_sel[NR][64];
     const int lane = tid & 31;
     const int wave = tid >> 5;
-    const int g = tid >> 6;
-    const int gl = tid & 63;
+    // up to 4 rows: a row per 64-thread group (two waves, winners combined through LDS); 5..8 rows: a row per wave, no barrier in the rounds
+    constexpr int GT = NR <= 4 ? 64 : 32;
+    constexpr int CH = 320 / GT;
+    const int g = tid / GT;
+    const int gl = tid % GT;
     const bool act = g < NR;
-    float ch[5];
+    float ch[CH];
     #pragma unroll
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < CH; ++i)
     {
-        const int e = gl + 64 * i;
+        const int e = gl + GT * i;
         ch[i] = (act && e < E) ? chs[g][e] : -INFINITY;
     }
     for (int j = 0; j < topk; ++j)
@@ -1850,9 +1853,9 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
         float bv = -INFINITY;
         int bi = 0x7fffffff;
         #pragma unroll
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < CH; ++i)
         {
-            const int e = gl + 64 * i;
+            const int e = gl + GT * i;
             if (e < E && (ch[i] > bv || (ch[i] == bv && e < bi))) { bv = ch[i]; bi = e; }
         }
         #pragma unroll
@@ -1862,17 +1865,22 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
             const int oi = PORT_SHFL_XOR(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        const int pb = j & 1;
-        if (lane == 0) { s_val[pb][wave] = bv; s_idx[pb][wave] = bi; }
-        __syncthreads();
-        float v = s_val[pb][2 * g]; int w0 = s_idx[pb][2 * g];
+        int w0;
+        if constexpr (GT == 64)
         {
-            const float v1 = s_val[pb][2 * g + 1]; const int w1 = s_idx[pb][2 * g + 1];
-            if (v1 > v || (v1 == v && w1 < w0)) { v = v1; w0 = w1; }
+            const int pb = j & 1;
+            if (lane == 0) { s_val[pb][wave] = bv; s_idx[pb][wave] = bi; }
+            __syncthreads();
+            float v = s_val[pb][2 * g]; w0 = s_idx[pb][2 * g];
+            {
+                const float v1 = s_val[pb][2 * g + 1]; const int w1 = s_idx[pb][2 * g + 1];
+                if (v1 > v || (v1 == v && w1 < w0)) { v = v1; w0 = w1; }
+            }
         }
+        else w0 = bi;   // the butterfly leaves the wave winner in every lane
         if (act && gl == 0) s_sel[g][j] = w0;
         #pragma unroll
-        for (int i = 0; i < 5; ++i) if (gl + 64 * i == w0) ch[i] = -INFINITY;
+        for (int i = 0; i < CH; ++i) if (gl + GT * i == w0) ch[i] = -INFINITY;
     }
     __syncthreads();
     if (act && gl == 0)
@@ -3147,7 +3155,7 @@ void exl3_dec_router
     cuda_check(cudaPeekAtLastError());
 }
 
-// NR = 2..4 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
+// NR = 2..8 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
 void exl3_dec_router_rows
 (
     const at::Tensor& x,
@@ -3169,7 +3177,7 @@ void exl3_dec_router_rows
     const int E = gate.size(1);
     TORCH_CHECK(selected.dim() == 2 && selected.size(0) == NR && selected.is_contiguous(), "exl3_dec_router_rows: selected [NR, topk]");
     const int topk = selected.size(1);
-    TORCH_CHECK(NR >= 2 && NR <= 4, "exl3_dec_router_rows: NR in 2..4");
+    TORCH_CHECK(NR >= 2 && NR <= 8, "exl3_dec_router_rows: NR in 2..8");
     TORCH_CHECK(H % ROUTER_KCHUNK == 0 && E <= 320 && E % 8 == 0 && topk <= 64 && topk <= E, "exl3_dec_router_rows: unsupported shape");
     TORCH_CHECK(selected.dtype() == at::kLong && weights.dtype() == at::kHalf && weights.is_contiguous() && weights.numel() == NR * topk, "exl3_dec_router_rows: outputs");
     TORCH_CHECK(scratch.numel() >= (int64_t) NR * (H / ROUTER_KCHUNK) * E && counters.numel() > CTR_ROUTER, "exl3_dec_router_rows: workspace");
@@ -3184,7 +3192,11 @@ void exl3_dec_router_rows
         scratch.data_ptr<float>(), counters.data_ptr<int>(), H, E, topk, (float) scale
     if (NR == 2) { router_rows_kernel<2><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
     else if (NR == 3) { router_rows_kernel<3><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
-    else { router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 4) { router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 5) { router_rows_kernel<5><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 6) { router_rows_kernel<6><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 7) { router_rows_kernel<7><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else { router_rows_kernel<8><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
     #undef ROUTER_ROWS_ARGS
     cuda_check(cudaPeekAtLastError());
 }

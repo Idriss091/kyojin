@@ -19,14 +19,15 @@ def rowinv():
     ROW_INV["on"] = old
 
 
-def test_router_chunks_are_2_to_4_and_sum_to_rows():
+def test_router_chunks_are_2_to_8_and_sum_to_rows():
     for bsz in range(2, 9):
         ch = R._router_row_chunks(bsz)
         assert sum(ch) == bsz
         assert all(2 <= k <= R.ROUTER_ROWS_KERNEL_MAX for k in ch), (bsz, ch)
-    assert R._router_row_chunks(6) == [3, 3]
-    assert R._router_row_chunks(8) == [4, 4]
+    assert R._router_row_chunks(6) == [6]
+    assert R._router_row_chunks(8) == [8]
     assert R._router_row_chunks(3) == [3]
+    assert R._router_row_chunks(9) == [5, 4]
 
 
 def test_row_caps_follow_the_flag(rowinv):
