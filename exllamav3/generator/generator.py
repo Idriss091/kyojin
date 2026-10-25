@@ -645,6 +645,7 @@ class Generator:
             if st["n"] == st["steps"]:
                 torch.cuda.synchronize(); wall = time.perf_counter() - st["t0"]; k_ = st["steps"]
                 st["prof"].__exit__(None, None, None)
+                if os.environ.get("EXL3_TORCH_PROF_TRACE"): st["prof"].export_chrome_trace(st["path"] + ".trace.json")
                 for _n, _f in st["orig"].items(): setattr(torch.Tensor, _n, _f)
                 with open(st["path"] + ".sites", "w") as f:
                     for site, c in st["sites"].most_common(25): f.write(f"{c / k_:7.1f}/iter  {site}\n")
