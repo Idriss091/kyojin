@@ -53,6 +53,16 @@ def _hx(h) -> str:
 PIN_PAGES = 32                      # every checkpoint of the first 8K tokens is kept: the system prompt + tools of any session resumes near its end
 
 
+def tail_page_usable(e: dict, ph, L: int) -> bool:
+    """Whether the partial page of an in-memory prompt-end checkpoint still holds its K/V: it is an unreferenced page, another job
+    may have taken it. The job refuses such an entry (Job._tail_restore); counting it as resumable here kept the deeper copy on
+    the disk from being restored (a follow-up turn re-prefilled 2-4K tokens while the disk held its prompt end)."""
+    src = e.get("page")
+    if src is None:
+        return True
+    return src.prev_hash == ph and src.kv_position >= L and torch.equal(src.sequence[:, :L], e["ids"].view(1, -1).to(src.sequence.device))
+
+
 def _pow2(d: int) -> bool:
     return d >= 8 and d & (d - 1) == 0          # 8 pages = 2048 tokens
 
@@ -254,7 +264,7 @@ class PagedPrefixDisk:
             if k < 0 or k > ram_res:
                 continue    # tail without its resident page chain is unreachable: prefill matches pages from page 0
             L = e["ids"].shape[-1]
-            if torch.equal(e["ids"].cpu().view(1, -1), ids[:, k * PAGE_SIZE:k * PAGE_SIZE + L]):
+            if torch.equal(e["ids"].cpu().view(1, -1), ids[:, k * PAGE_SIZE:k * PAGE_SIZE + L]) and tail_page_usable(e, ph, L):
                 ram_pos = max(ram_pos, k * PAGE_SIZE + L)
         # what the disk has: pages are needed from 0, so the usable chain stops at the first page it lacks
         avail = 0
