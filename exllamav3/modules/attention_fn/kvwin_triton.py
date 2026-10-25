@@ -65,18 +65,25 @@ def _ring_split_kernel(
     HD_PAD: tl.constexpr,
     scale: tl.constexpr,
     ROT_V: tl.constexpr,         # quantized V: the partial must live in the H32-rotated domain like the pool partials
-    DENSE: tl.constexpr,         # row layout: True = dense (query, head) rows (CUDA kernels), False = padded (legacy kernel)
+    LAYOUT: tl.constexpr,        # partial layout of the pool kernel: 0 = dense (query, head) rows (1.6 Triton), 1 = padded rows
+                                 # (legacy Triton), 2 = qdec_hip (rows q-major, log2-domain max, unpadded columns)
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    RPP: tl.constexpr = 0,       # LAYOUT 2: rows per program in the partial buffers (RP of qdec_hip)
 ):
     """fp16 pass over the ring: sinks (positions < S) and the window [q-W+1, q] of every query row, stored as one more
     flash-decoding partial (m, l, unnormalised acc) for the existing combine."""
     pid = tl.program_id(0)
     group_size = n_q_heads // n_kv_heads
     rows = tl.arange(0, BLOCK_ROWS)
-    if DENSE:
+    if LAYOUT == 2:
+        bh = pid
+        row_q = rows // group_size
+        row_h_local = rows % group_size
+        valid_row = rows < q_len * group_size
+    elif LAYOUT == 0:
         h_blocks = tl.cdiv(q_len * group_size, BLOCK_ROWS)
         h_block = pid % h_blocks
         bh = pid // h_blocks
@@ -142,15 +149,23 @@ def _ring_split_kernel(
         acc = tl.reshape(tl.dot(tl.reshape(acc, (BLOCK_ROWS * HD_PAD // 32, 32)), hm, input_precision = "ieee"),
                          (BLOCK_ROWS, HD_PAD))
     s_idx = ns_total - 1
-    po_base = (pid * ns_total + s_idx) * BLOCK_ROWS * HD_PAD
-    tl.store(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :], acc)
-    ml_base = (pid * ns_total + s_idx) * BLOCK_ROWS * 2
-    tl.store(partial_ml + ml_base + rows * 2, m)
-    tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+    if LAYOUT == 2:
+        # qdec_hip partials: RPP rows of head_dim columns, running max in the log2 domain (the sum l is domain-free)
+        pb = (pid * ns_total + s_idx) * RPP
+        st_rows = rows < RPP
+        tl.store(partial_o + (pb + rows[:, None]) * head_dim + offs_d[None, :], acc, mask = st_rows[:, None] & d_mask[None, :])
+        tl.store(partial_ml + (pb + rows) * 2, m * 1.4426950408889634, mask = st_rows)
+        tl.store(partial_ml + (pb + rows) * 2 + 1, l, mask = st_rows)
+    else:
+        po_base = (pid * ns_total + s_idx) * BLOCK_ROWS * HD_PAD
+        tl.store(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :], acc)
+        ml_base = (pid * ns_total + s_idx) * BLOCK_ROWS * 2
+        tl.store(partial_ml + ml_base + rows * 2, m)
+        tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
 def ring_split(ctx: KVWinCtx, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
-               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, scale, rot_v, dense, block_m, block_h, block_rows):
+               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, scale, rot_v, layout, block_m, block_h, block_rows, rpp = 0):
     cfg = ctx.cfg
     st = ctx.state
     with torch.cuda.device(q.device):
@@ -158,8 +173,8 @@ def ring_split(ctx: KVWinCtx, q, cache_seqlens, h32, partial_o, partial_ml, ns_t
             q, st.ov_k, st.ov_v, ctx.slots, cache_seqlens, h32,
             partial_o, partial_ml,
             ns_total, cfg.S, cfg.W, cfg.Rc, cfg.R,
-            q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, float(scale), bool(rot_v), bool(dense),
-            block_m, block_h, block_rows, 64,
+            q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, float(scale), bool(rot_v), int(layout),
+            block_m, block_h, block_rows, 64, int(rpp),
             num_warps = 4, num_stages = 1,
         )
 

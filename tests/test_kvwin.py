@@ -42,11 +42,15 @@ def cpu_env(monkeypatch):
     monkeypatch.setattr(triton_paged_cu, "pick_config", lambda device, name, key, candidates, probe: candidates[0])
 
 
-@pytest.fixture(autouse = True, params = ["legacy", "cu"])
+@pytest.fixture(autouse = True, params = ["legacy", "cu", "hip"])
 def impl(request, monkeypatch):
-    """Both decode wrappers: the pre-1.6 kernels (ROCm default) and the 1.6 ones (CUDA default; run here on whatever GPU)."""
+    """Decode wrappers: the pre-1.6 Triton kernels (ROCm default without qdec_hip), the 1.6 ones (CUDA default; run here on
+    whatever GPU) and qdec_hip (ROCm default; skipped without a ROCm GPU)."""
     from exllamav3.modules.attention_fn import triton_paged
+    if request.param == "hip" and (CPU or not triton_paged._QDEC_HIP):
+        pytest.skip("qdec_hip needs a ROCm GPU")
     monkeypatch.setattr(triton_paged, "ATTN16", request.param == "cu")
+    monkeypatch.setattr(triton_paged, "_QDEC_HIP", request.param == "hip")
     return request.param
 
 
@@ -186,9 +190,12 @@ def test_ring_write_matches_reference(cfg):
 @pytest.mark.parametrize("cfg", CFGS)
 @pytest.mark.parametrize("bits", [(4, 4), (6, 6), (8, 8)])
 @pytest.mark.parametrize("q_len", [1, 5, 16])
-def test_merge_equals_mix(cfg, bits, q_len):
+@pytest.mark.parametrize("hd", [128, 256])
+def test_merge_equals_mix(cfg, bits, q_len, hd):
+    if hd == 256 and CPU and (cfg is not CFGS[0] or bits != (4, 4)):
+        pytest.skip("interpreter is slow: one hd 256 cell on CPU")
     for L0 in (3, 30, 150, 600):             # shorter than S+W, around the window, page crossing
-        rig = Rig(cfg, hd = 128, kb = bits[0], vb = bits[1], pages = 8, slots = (2, 0), seed = L0)
+        rig = Rig(cfg, hd = hd, kb = bits[0], vb = bits[1], pages = 8, slots = (2, 0), seed = L0)
         b = 0
         rig.append(b, L0)
         k, v = rig.append(b, q_len)            # the verify rows

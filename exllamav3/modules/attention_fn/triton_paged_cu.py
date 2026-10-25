@@ -887,7 +887,7 @@ def paged_attn_triton_decode_cu(
             from .kvwin_triton import ring_split
             ns_total = num_splits + 1
             ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
-                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0, True,
+                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0, 0,
                        1, 1, block_rows)
 
         if ns_total > 1:

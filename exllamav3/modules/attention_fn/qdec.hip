@@ -49,6 +49,9 @@ typedef u32 v8u __attribute__((ext_vector_type(8)));
 #ifndef HAS_SINKS
 #define HAS_SINKS 0
 #endif
+#ifndef KEY_LO
+#define KEY_LO 0                      // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
+#endif
 
 __device__ __forceinline__ u32 hsub2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) - __builtin_bit_cast(v2h, b)); }
 __device__ __forceinline__ u32 hmul2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) * __builtin_bit_cast(v2h, b)); }
@@ -284,7 +287,7 @@ qdec_split(
         if (!active) continue;
 
         // ---- online softmax (log2 domain); lane owns q row n of every tile and tokens 2r + half, r = 0..7
-        const bool full = (n0 + 15 < n_end) && (!CAUSAL || (float)(n0 + 15) <= qmin);
+        const bool full = (n0 + 15 < n_end) && (n0 >= KEY_LO) && (!CAUSAL || (float)(n0 + 15) <= qmin);
         u32 pa[NT][8];
         #pragma unroll
         for (int j = 0; j < NT; j++) {
@@ -296,7 +299,7 @@ qdec_split(
                 #pragma unroll
                 for (int r = 0; r < 8; r++) {
                     int tk = n0 + 2 * r + half;
-                    bool ok = rvalid[j] && tk < n_end && (!CAUSAL || (float) tk <= qabs[j]);
+                    bool ok = rvalid[j] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float) tk <= qabs[j]);
                     if (!ok) s[r] = NEG_INF;
                 }
             }
