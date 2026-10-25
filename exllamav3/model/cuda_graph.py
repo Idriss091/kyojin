@@ -83,6 +83,7 @@ set_multi(os.environ.get("EXL3_CUDA_GRAPH_MULTI", "0") == "1")
 CUDA_GRAPH_CLONE = os.environ.get("EXL3_CUDA_GRAPH_CLONE", "1") != "0"
 CUDA_GRAPH_FALLBACK = os.environ.get("EXL3_CUDA_GRAPH_FALLBACK", "closed")
 CUDA_GRAPH_DEBUG = os.environ.get("EXL3_CUDA_GRAPH_DEBUG", "0") == "1"
+CUDA_GRAPH_LOG_CAPTURES = os.environ.get("EXL3_CUDA_GRAPH_LOG_CAPTURES", "0") == "1"
 # EXL3_CUDA_GRAPH_DIAG=1: event-time 300 replays and print the mean GPU time per graph step and the replay-to-replay median
 _DIAG = [None] if os.environ.get("EXL3_CUDA_GRAPH_DIAG") else None
 
@@ -378,7 +379,12 @@ class CudaGraphRunner:
                 if "export_states" in p:
                     params["export_states"] = p["export_states"]
                 return y
-            if not self._capture(key, e, tail, x, params):
+            t_cap = time.perf_counter()
+            ok = self._capture(key, e, tail, x, params)
+            if CUDA_GRAPH_LOG_CAPTURES:   # EXL3_CUDA_GRAPH_LOG_CAPTURES=1: one line per capture, with the time the decode of every job waited
+                print(f"[cudagraph] capture {time.perf_counter() - t_cap:.2f} s key={key[1:5]} captures={self.stats['captures']} "
+                      f"evictions={self.stats.get('evictions', 0)} entries={len(self.entries)}", flush = True)
+            if not ok:
                 return self._run_tail(tail, x, params)   # FALLBACK=eager decline
         try:
             with torch.cuda.device(dev):
