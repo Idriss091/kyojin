@@ -697,7 +697,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         if st["mode"] == "mtp" and not getattr(rule, "needs_p", True):
             return ids
         if st["mode"] == "mtp":
-            if dp is not None: pt = dp.reshape(())
+            if dp is not None: pt = dp.reshape(-1).max()      # one value per row of a multi-request step: the max, as softmax(cap["lg"]).max() below
             else: pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
             i = st["i"]
             if fixed is not None:
