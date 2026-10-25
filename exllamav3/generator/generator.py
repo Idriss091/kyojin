@@ -1323,6 +1323,7 @@ class Generator:
         t0 = time.perf_counter()
         _PROF_CUR.clear()
         draft_tokens = draft_fn(results)
+        _PROF_CUR["t_draft_h"] = time.perf_counter() - t0
         self.iterate_gen(results, draft_tokens)
         cuda_sync_active()
         _PROF_CUR.update(t_step = time.perf_counter() - t0, jobs = len(gen_jobs), spec = draft_tokens is not None,
@@ -1567,6 +1568,7 @@ class Generator:
         return torch.cat(logits, dim = 0)
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
+        _HP0[0] = time.perf_counter()
 
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
@@ -1684,6 +1686,7 @@ class Generator:
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         _tv0 = _pt()
+        _PROF_CUR["t_pre_h"] = time.perf_counter() - _HP0[0] if SPEC_PROF else 0
         groups = None
         if len(batch_jobs) > 1 and ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups") and not active_embeddings:
             groups = self._row_groups(batch_jobs, batch_ids.shape[-1])
@@ -1695,6 +1698,7 @@ class Generator:
         else:
             batch_logits = self._forward_groups(batch_ids, params, batch_jobs, groups, own_pages)
         _tv1 = _pt()
+        _HP0[1] = time.perf_counter()
         if SPEC_PROF:
             _PROF_CUR["t_verify"] = _tv1 - _tv0
             _PROF_CUR["R"] = batch_ids.shape[-1]
@@ -1742,7 +1746,9 @@ class Generator:
 
             # Rewind recurrent states
             if batch_states_ is not None:
+                _hr = time.perf_counter()
                 batch_states_[j_].rewind(num_rejected)
+                _hacc("t_rew_h", _hr)
 
             # Rewind cache position (draft model cache layout is always the same as target)
             for seq_ in job_.sequences:
@@ -1836,6 +1842,7 @@ class Generator:
                              None, None, None) for pi in range(npos - 1)]
                 pre = None
                 if draft_tokens is not None and _host_lean() and _lean_verify_job(job, b - a):
+                    _hs = time.perf_counter()
                     launched = []
                     for pi in range(npos):
                         launched.append(spec[pi] if spec is not None and pi < npos - 1 else
@@ -1852,6 +1859,7 @@ class Generator:
                         pre = [(stage[k:k + 1].clone(),) + s[1:] for k, s in enumerate(launched)]
                     else:
                         pre = None
+                    _hacc("t_samp_h", _hs)
                 for i in range(batch_logits.shape[1]):
                     token_logits = job_logits[:, i:i + 1, :]
                     if pre is not None:
@@ -1955,7 +1963,9 @@ class Generator:
 
                 # Make sure outgoing state is valid if entire draft was accepted
                 if batch_states and draft_tokens is not None and rejected == 0:
+                    _hr = time.perf_counter()
                     batch_states[j].rewind(0)
+                    _hacc("t_rew_h", _hr)
 
                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
@@ -1998,6 +2008,8 @@ class Generator:
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         _tk0 = _pt()
+        if SPEC_PROF: _PROF_CUR["t_post_h"] = time.perf_counter() - _HP0[1]
+        _hm = time.perf_counter()
         if self.dflash_draft and self._try_defer_dkv(
                 draft_tokens, batch_jobs, p_export_states, p_cache_seqlens, block_index,
                 accepted_lengths, completed_jobs, requeuing_jobs, rewound_jobs):
@@ -2067,6 +2079,7 @@ class Generator:
                     a_idx:b_idx, accepted_length - 1:accepted_length, :
                 ].clone()
 
+        _hacc("t_mtp_h", _hm)
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
         # recurrent state.
@@ -2408,6 +2421,10 @@ SPEC_PROF = os.environ.get("EXL3_SPEC_PROF") == "1"
 SPEC_PROF_REC: list = []
 SPEC_PROF_FILE = os.environ.get("EXL3_SPEC_PROF_FILE", "")   # multi-job step records, one JSON line each
 _PROF_CUR: dict = {}
+# host-side phase stamps for EXL3_SPEC_PROF records (t_pre_h / t_post_h / t_rew_h / t_samp_h / t_mtp_h / t_draft_h, wall ms of the host code, no device sync)
+_HP0 = [0.0, 0.0]
+def _hacc(k, t0):
+    if SPEC_PROF: _PROF_CUR[k] = _PROF_CUR.get(k, 0.0) + time.perf_counter() - t0
 
 
 def _pt():
