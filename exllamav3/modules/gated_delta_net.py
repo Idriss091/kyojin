@@ -103,6 +103,23 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     return jobs_by_device
 
 
+# Rewind batching across the jobs of one speculative round (Generator.iterate_gen): while a round collects, GDNState.rewind() parks its
+# job descriptors here instead of launching them, and rewind_batch_end() launches ONE batched conv rewind (and state rewind) for every
+# user. The jobs touch disjoint slots and nothing reads a slot between its rewind and the end of the round's sampling loop.
+_rw_defer = None
+def rewind_batch_begin():
+    global _rw_defer
+    _rw_defer = {}
+
+def rewind_batch_end():
+    global _rw_defer
+    d, _rw_defer = _rw_defer, None
+    if d: _dispatch_rewind_jobs(d)
+
+# Bumped whenever a layer state (re)allocates or frees its tensors: the memoized rewind job pointers below belong to one allocation
+_alloc_epoch = 0
+
+
 def _dispatch_rewind_jobs(jobs_by_device):
     for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
         if conv_jobs:
@@ -167,11 +184,39 @@ class GDNState:
         self.cache.release_state(self)
 
 
+    def _rewind_jobs(self, num_tokens: int):
+        """The jobs of rewind(num_tokens) for this slot. A cache of GDN layers only has pointer-only job descriptors that depend on
+        (slot, last_history, num_tokens, rebase) and the allocation, so they are built once per key and reused (48 layers x 2 tensor
+        views x every user and round otherwise); the shared state_base index is still set on every call. Other state classes in the
+        cache (and the first call of a key) go through _collect_rewind_jobs."""
+        layers = self.cache.get_all_recurrent_layers()
+        rebase = _state_rebase()
+        key = (self.slot, self.last_history, num_tokens, rebase)
+        memo = self.cache.__dict__.setdefault("_rewind_memo", {})
+        ent = memo.get(key)
+        if ent is not None and ent[0] == _alloc_epoch:
+            for l in ent[2]:
+                if rebase:
+                    l._set_base(self.slot, (self.last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+                elif _base_value.get((l.cache_id, self.slot), 0) != 0:
+                    l._set_base(self.slot, 0)
+            return ent[1]
+        jobs = _collect_rewind_jobs(layers.values(), self.slot, self.last_history, num_tokens)
+        if all(isinstance(l, GDNLayerState) for l in layers.values()):
+            reps = {}
+            for l in layers.values(): reps.setdefault(l.cache_id, l)
+            memo[key] = (_alloc_epoch, jobs, list(reps.values()))
+        return jobs
+
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            _dispatch_rewind_jobs(_collect_rewind_jobs(
-                self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-            ))
+            jobs = self._rewind_jobs(num_tokens)
+            if _rw_defer is None:
+                _dispatch_rewind_jobs(jobs)
+            else:
+                for dev, (cj, sj) in jobs.items():
+                    d = _rw_defer.setdefault(dev, ([], []))
+                    d[0].extend(cj); d[1].extend(sj)
         else:
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens
@@ -284,6 +329,8 @@ class GDNLayerState:
 
 
     def alloc(self, device):
+        global _alloc_epoch
+        _alloc_epoch += 1
         self.conv_state = torch.empty_like(self.conv_state, device = device)
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
         self.state_base = _shared_base(self.cache_id, self.max_batch_size, device)
@@ -293,6 +340,8 @@ class GDNLayerState:
 
 
     def free(self):
+        global _alloc_epoch
+        _alloc_epoch += 1
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
         self.state_base = torch.empty_like(self.state_base, device = "meta")
