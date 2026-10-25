@@ -1832,6 +1832,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except BadRequest as exc:                                     # e.g. an image that does not decode (loaded by the worker)
             return err(400, str(exc))
         except Exception as exc:                                      # noqa: BLE001
+            lifecycle.request_failed(exc)
             return web.json_response({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}},
                                      status=500)
         text, _ = stop_text(full, job["stop"])
@@ -1942,6 +1943,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         while True:
             item = await out.get()
             if isinstance(item, Exception):
+                lifecycle.request_failed(item)
                 return web.json_response({"error": {"message": f"{type(item).__name__}: {item}", "type": "server_error"}},
                                          status=500)
             if isinstance(item, tuple):
@@ -2118,6 +2120,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except BadRequest as exc:
             return err(400, str(exc))
         except Exception as exc:                                      # noqa: BLE001
+            lifecycle.request_failed(exc)
             return web.json_response({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}}, status=500)
         text, _ = stop_text(full, job["stop"])
         reason, usage = reason_usage(stats, text)

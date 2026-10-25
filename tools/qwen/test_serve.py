@@ -711,6 +711,20 @@ class HttpTests(unittest.TestCase):
         self.assertIn("kaput", [e for e in ev if "error" in e][0]["error"]["message"])
         self.assertEqual(ev[-1]["choices"][0]["finish_reason"], "error")
 
+    def test_failed_requests_are_logged_on_stderr(self):
+        # the request log is off by default: an OOM on a long prompt left no server line at all (only the client saw the error event)
+        import contextlib, io
+        class Boom(FakeEngine):
+            async def generate(self, prompt, **kw):
+                raise RuntimeError("CUDA out of memory")
+                yield ""
+        for stream in (False, True):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.chat(Boom(""), {"messages": [{"role": "user", "content": "hi"}]}, stream=stream)
+            self.assertIn("request failed", err.getvalue())
+            self.assertIn("CUDA out of memory", err.getvalue())
+
 
 class LogprobsTests(unittest.TestCase):
     ENTRIES = [(-0.5, [(1, -0.5), (9, -1.5)]), (-2.0, [(2, -0.25), (3, -2.0)]), None]
