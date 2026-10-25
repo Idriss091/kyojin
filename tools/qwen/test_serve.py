@@ -1253,5 +1253,21 @@ class PrefixDiskConcurrencyTests(unittest.TestCase):
         self.assertEqual(calls, [("save", "ids-a"), ("save", "ids-b")])
 
 
+class VramHeadroomTests(unittest.TestCase):
+    def test_enough_is_none(self):
+        self.assertIsNone(serve.vram_headroom_problem(2200, 262144, 0.0182, 1))
+
+    def test_three_sessions_262144_names_a_context_that_fits(self):
+        msg = serve.vram_headroom_problem(468, 262144, 0.0182, 3)   # measured on the 24 GB 3090: Qwen3.8-27B K4V4, sessions 3
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertEqual(fits % 256, 0)
+        self.assertLessEqual(fits, 262144 - (1024 - 468) / 0.0182)
+        self.assertGreater(fits, 200000)
+
+    def test_override(self):
+        self.assertIsNone(serve.vram_headroom_problem(468, 262144, 0.0182, 3, min_free_mib=256))
+
+
 if __name__ == "__main__":
     unittest.main()

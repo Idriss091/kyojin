@@ -2169,6 +2169,19 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 # ---------------------------------------------------------------------------- main
 
 
+MIN_FREE_MIB = 1024   # VRAM that must stay free after load: a 2048-row prefill chunk and the multi-row graph pools come on top of the resident state
+
+
+def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, sessions: int, min_free_mib: float = MIN_FREE_MIB) -> str | None:
+    """None when the memory left after load covers the first real request, else the start-up error with the context that fits.
+    3090, Qwen3.8-27B K4V4: sessions 3 at -c 262144 left 0.47 GiB and every cold prefill died with CUDA out of memory while /health said ok."""
+    if free_mib >= min_free_mib:
+        return None
+    fits = max(0, int(ctx - (min_free_mib - free_mib) / kv_mib_per_token) // 256 * 256) if kv_mib_per_token > 0 else 0
+    return (f"only {free_mib:.0f} MiB of VRAM left after load (ctx={ctx}, sessions={sessions}; {min_free_mib:.0f} MiB needed for the first prefill): "
+            f"every long prompt would end in CUDA out of memory. Start with -c {fits} or fewer --sessions (each session holds its recurrent slots, about 1.1 GiB)")
+
+
 def load_all(args: argparse.Namespace):
     """Everything before the port opens: template, defaults, engine, slot store, warm-up."""
     model_dir = str(Path(args.model).expanduser())
@@ -2194,6 +2207,13 @@ def load_all(args: argparse.Namespace):
     startup_health.stage("warm-up")
     with Heartbeat("warm-up (first decode steps)"):
         engine.warmup()
+    if engine.torch.cuda.is_available() and not engine.torch.version.hip and os.environ.get("EXL3_MIN_FREE_MIB", "") != "0":
+        free, _ = engine.torch.cuda.mem_get_info()
+        free_mib = (free + engine.torch.cuda.memory_reserved() - engine.torch.cuda.memory_allocated()) / 2**20   # torch's cached blocks are reusable
+        kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
+        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB))
+        if bad:
+            raise RuntimeError(bad)
     if os.environ.get("EXL3_SWAP_IN", "1") != "0":
         from exllamav3.util.memory import swap_in_process
         print(f"qserve: process pages swapped out during the load, read back before READY: {swap_in_process()}", flush=True)
