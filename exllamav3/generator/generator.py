@@ -663,6 +663,49 @@ class Generator:
                 st["prof"] = None; st["done"] = True
         return results
 
+    def _prefill_profiled(self, job, results):
+        """EXL3_PF_PROF=PATH:CALL (diagnostic): torch-profile the CALL-th (0-based) job.prefill() call that ran at least EXL3_PF_PROF_MINROWS (1024) rows
+        and write the per-kernel table (with the idle gaps between kernels) to PATH, the Chrome trace to PATH.trace.json."""
+        st = _PF_PROF
+        k0 = job.sequences[0].kv_position
+        if st["done"]:
+            return job.prefill(results)
+        from torch.profiler import profile, ProfilerActivity
+        torch.cuda.synchronize()
+        prof = profile(activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes = True); prof.__enter__()
+        from ..ext import exllamav3_ext as _ext
+        _shapes = []; _orig = _ext.hgemm_recon
+        def _rec(a, b, c):
+            _shapes.append((a.numel() // a.shape[-1], a.shape[-1], b.shape[-1], str(c.dtype)))
+            return _orig(a, b, c)
+        _ext.hgemm_recon = _rec
+        t0 = time.perf_counter()
+        try:
+            job.prefill(results)
+        finally:
+            _ext.hgemm_recon = _orig
+        torch.cuda.synchronize(); wall = time.perf_counter() - t0
+        prof.__exit__(None, None, None)
+        rows = job.sequences[0].kv_position - k0
+        if rows < int(os.environ.get("EXL3_PF_PROF_MINROWS", "1024")):
+            return
+        st["seen"] += 1
+        if st["seen"] - 1 != st["call"]:
+            return
+        st["done"] = True
+        prof.export_chrome_trace(st["path"] + ".trace.json")
+        json.dump(_shapes, open(st["path"] + ".shapes.json", "w"))
+        import collections
+        g = collections.defaultdict(lambda: [0, 0.0]); ev = []
+        for e in prof.events():
+            if e.device_type == torch.autograd.DeviceType.CUDA:
+                g[e.name[:150]][0] += 1; g[e.name[:150]][1] += e.device_time
+        busy = sum(v[1] for v in g.values())
+        with open(st["path"], "w") as f:
+            f.write(f"rows={rows} kv_start={k0} wall {wall * 1000:.1f} ms, kernel-sum {busy / 1000:.1f} ms, launches {sum(v[0] for v in g.values())}\n")
+            for name, (c, t) in sorted(g.items(), key = lambda kv: -kv[1][1])[:80]:
+                f.write(f"{t / 1000:9.3f} ms {c:6d}  {name}\n")
+
     def _cil_views(self) -> list:
         views = []
         for job in self.active_jobs:
@@ -754,7 +797,10 @@ class Generator:
                 continue
             was_done = job.is_prefill_done()
             try:
-                job.prefill(results)
+                if _PF_PROF is not None:
+                    self._prefill_profiled(job, results)
+                else:
+                    job.prefill(results)
             except Exception as e:
                 if os.environ.get("KYO_TURN_TRACE"):
                     import traceback; traceback.print_exc()
@@ -2418,6 +2464,10 @@ class Generator:
             return completions
 
 
+_PF_PROF = None
+if os.environ.get("EXL3_PF_PROF"):
+    _pa = os.environ["EXL3_PF_PROF"].rsplit(":", 1)
+    _PF_PROF = dict(path = _pa[0], call = int(_pa[1]), seen = 0, done = False)
 _TORCH_PROF = None
 if os.environ.get("EXL3_TORCH_PROF"):
     _a = os.environ["EXL3_TORCH_PROF"].split(":", 3)
