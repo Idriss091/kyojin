@@ -726,6 +726,12 @@ class QwenEngine:
             if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 4 x 8 shapes
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MAX", "32")
+                # several users: a big prompt prefills in 768-row steps beside the decoding users, which decode between two of its
+                # chunks (3090, 3 users, 110K prompt: running streams waited 0.8-1.6 s at most instead of 4-7 s, then the whole
+                # prefill; the prompt takes 1.7x its solo time)
+                os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
+                os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
+                os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
         if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
             # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
             os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
