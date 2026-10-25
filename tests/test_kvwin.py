@@ -543,6 +543,24 @@ def test_midchunk_checkpoint_keeps_working_with_a_ring():
     assert Job.stash_midchunk(fake, {PAGE: {}}, 0) == 0                       # still skipped when a GDN layer is missing
 
 
+def test_per_sequence_params_keep_their_ring_state():
+    """The row-invariant multi-job step runs attention per sequence on split params: each keeps its own state / slot."""
+    from exllamav3.modules.attn import split_params_by_sequence
+    from exllamav3.cache.kvwin import make_ctx
+    st = KVWinLayerState(_FakeAttn(), 4, 0, 0)
+    st.cfg = parse_spec("4:32"); st.alloc(torch.device(DEV))
+    rs = [types.SimpleNamespace(slot = 3), types.SimpleNamespace(slot = 1)]
+    params = {"block_table": torch.zeros((2, 4), dtype = torch.int32), "cache_seqlens": torch.tensor([5, 9], dtype = torch.int32),
+              "recurrent_states": rs, "recurrent_slots": torch.tensor([3, 1], dtype = torch.int32)}
+    parts = split_params_by_sequence(params, 2)
+    for b in range(2):
+        ctx = make_ctx(st, parts[b], torch.device(DEV), 1)
+        assert ctx is not None and int(ctx.slots[0]) == rs[b].slot
+    with pytest.raises(RuntimeError):                 # a state / batch mismatch must not silently skip the ring
+        make_ctx(st, params, torch.device(DEV), 1)
+    assert make_ctx(st, {}, torch.device(DEV), 2) is None
+
+
 def test_off_is_bitwise_today():
     """EXL3_KVWIN unset: attn_dispatch outputs (prefill / decode / verify rows, 4/6/8 bit) equal the tree before KVWIN bit for bit.
     KVWIN_BASE_TREE = checkout of the parent commit (default: the sibling worktree wt_empty27)."""

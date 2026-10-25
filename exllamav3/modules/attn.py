@@ -148,6 +148,12 @@ def split_params_by_sequence(params: dict, bsz: int) -> list[dict]:
         p.pop("dev_cache", None)
         p["block_table"] = params["block_table"][b:b + 1]
         p["cache_seqlens"] = params["cache_seqlens"][b:b + 1]
+        # the sequence's own recurrent state (and slot): the KVWIN ring of the attention layer lives in it
+        rs = params.get("recurrent_states")
+        if rs and len(rs) == bsz:
+            p["recurrent_states"] = rs[b:b + 1]
+            if torch.is_tensor(params.get("recurrent_slots")):
+                p["recurrent_slots"] = params["recurrent_slots"][b:b + 1]
         if positions is not None:
             p["positions"] = p["cache_seqlens"] if positions is params["cache_seqlens"] else positions[b:b + 1]
         out.append(p)

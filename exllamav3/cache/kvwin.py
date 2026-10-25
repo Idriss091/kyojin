@@ -231,8 +231,11 @@ def make_ctx(cache_layer_state: KVWinLayerState | None, params: dict, device, bs
     if st is None or not st.active:
         return None
     rs = params.get("recurrent_states")
-    if not rs or len(rs) != bsz or "recurrent_slots" not in params:
-        return None
+    if not rs or "recurrent_slots" not in params:
+        return None        # plain batched forward without job states: the pool alone
+    if len(rs) != bsz:
+        # a call that writes the pool without the ring would leave the window stale for the next steps
+        raise RuntimeError(f"EXL3_KVWIN: {len(rs)} recurrent states for a batch of {bsz} sequences")
     from ..util.tensor import get_for_device
     return KVWinCtx(st, get_for_device(params, "recurrent_slots", device))
 
