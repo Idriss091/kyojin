@@ -36,6 +36,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from . import chunk_il
+from . import prefill_share
 from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 # EXL3_REPLY_FIRST=1 (default off): a job that finishes inside iterate() is released (deallocate_pages: reply-end tail
 # stash, draft flush, page / slot release) by flush_deferred() AFTER its last results are returned, not before. The server calls it
@@ -2104,6 +2105,14 @@ class Generator:
         })
 
 
+    def _prefill_leader(self, job):
+        """The active job that is still prefilling the leading pages `job` shares with it (prefill_share), or None."""
+        if not prefill_share.share_enabled() or len(job.sequences) != 1 or not job.sequences[0].page_hashes:
+            return None
+        busy = [(a.sequences[0].page_hashes, a.sequences[0].kv_position, id(a)) for a in self.active_jobs
+                if len(a.sequences) == 1 and a.sequences[0].page_hashes and not a.is_prefill_done()]
+        return prefill_share.find_leader(job.sequences[0].page_hashes, busy, PAGE_SIZE)
+
     def iterate_start_jobs(self, results: list):
         """
         Move pending jobs into the active set when batch and cache capacity allow.
@@ -2131,6 +2140,11 @@ class Generator:
                 if (len(job.sequences) + current_max_batch > self.max_batch_size or
                         job.current_new_pages_required() > self.pagetable.num_unreferenced_pages()):
                     skipped_jobs.append(job)
+                    continue
+
+                # A job on a prefix another active job is still prefilling waits for it instead of prefilling the same pages
+                # again (not a skip: the wait ends when the leader passes the shared run, and it holds no one else back)
+                if self._prefill_leader(job) is not None:
                     continue
 
                 # Make sure the job we're about to add doesn't skip a job that's been skipped too many times
