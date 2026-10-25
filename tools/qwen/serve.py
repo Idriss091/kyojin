@@ -537,7 +537,8 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # of a 5.2 s prefill); bitwise (first-token + tail-resume logits equal, base vs on). 0 = the synchronous stash.
              ("EXL3_NC2_ASYNC_STASH", "1"),
              # a speculative rewind records the accepted recurrent-state history index in a per-slot base instead of copying
-             # it back to index 0: bit-exact (ids equal off vs on, Qwen GDN ndt 7). 0 = copy.
+             # it back to index 0: bit-exact (ids equal off vs on, Qwen GDN ndt 7). 0 = copy. On the 3090 (Qwen27, 4 users, prose):
+             # round 41.30 -> 40.14 ms (-2.8 %, host post 3.28 -> 2.09 ms), served text identical on 54 of 54 streams.
              ("EXL3_STATE_REBASE", "1"),
              # a turn that resumes mid-page (tail checkpoint) and adds 1024..4095 tokens in one chunk no longer pays a separate
              # last-page forward: follow-up after a 12K conversation 1.47 -> 1.26 s (+1536 tokens), 2.37 -> 2.11 s (+3072), first-token
@@ -602,7 +603,7 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
 # SERVE_ENV entries tuned on gfx1151 for conversation resume and HIP kernels, not validated on NVIDIA (the 3090 numbers were
 # measured without them): CUDA starts without them, the environment still wins.
 HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
-                                "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_STATE_REBASE", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
+                                "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
                                 "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
 CUDA_SERVE_ENV = (("EXL3_CUDA_GRAPH", "1"), ("EXL3_DRAFT_VOCAB", "98304"), ("QWSPEC_THF", "0.3"), ("QWSPEC_THV", "0.1"), ("QWSPEC_THFD", "0.6"), ("QWSPEC_THVD", "0.4"))
 
