@@ -12,7 +12,7 @@ alternates with the queued short work of other jobs:
 Decode priority (EXL3_CIL_DECODE_PRIO=1, for GPUs that decode several users in one batch): while another job is decode-ready the
 deferral budget does not apply and a leader chunk is not exclusive. The leader takes EXL3_CIL_DPRIO_CHUNK rows (default 768, about
 0.75 s on a 3090) per step and shares the step with the decode round of every ready job; between two leader chunks the ready jobs
-decode, all of them in one batch, for up to EXL3_CIL_SLICE_S. A running stream waits one chunk, not the whole big prefill; the
+decode, all of them in one batch, for up to EXL3_CIL_SLICE_S (a short prefill beside a decoding job takes the same short chunks). A running stream waits one chunk, not the whole big prefill; the
 leader keeps about two thirds of the GPU time. Without a decode-ready job the leader runs at full chunk size as before.
 
 Hard bound: the leader's deferral (wall time of steps in which it did not run) is capped per leader by
@@ -135,7 +135,8 @@ class ChunkPlanner:
         if ld is None:
             bigs = sorted((v for v in live if v.remaining > self.short_tok), key=lambda v: v.order)
             if not bigs:
-                return Plan(set(), None, None)
+                # decode priority also for the short prefills (a 2-3K-row tool result): they take the short chunk while someone decodes
+                return Plan(set(), None, None, self.dprio_chunk if self.dprio and live and any(v.done for v in views) else 0)
             lv = bigs[0]
             ld = self._lead = _Leader(lv.key, lv.kv, now)
             ld.rows = lv.remaining

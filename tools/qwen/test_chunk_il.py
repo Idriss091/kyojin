@@ -191,6 +191,28 @@ class DecodePriorityTests(unittest.TestCase):
         self.assertLess(t1_, 1.7 * solo)                            # the big prefill keeps about 60 % of the GPU
         self.assertGreater(rate1, 10)                               # rounds per second of a stream during the big prefill (full speed 29: about 40 %)
 
+    def test_short_prefill_beside_a_stream_takes_short_chunks(self):
+        def gap(prio):
+            if prio:
+                os.environ["EXL3_CIL_DECODE_PRIO"] = "1"
+            try:
+                s = Sim(True)
+                s.add("u1", 900, out=2000)
+                arrived = []
+
+                def refill(sim):
+                    if not arrived and sim.clk.t >= 3.0:
+                        arrived.append(sim.add("u2", 3500, out=30))   # a tool result of 3.5K rows: a short prefill (below the 4096 big threshold)
+                    if arrived and arrived[0].time_first_token is not None:
+                        sim.g.active_jobs.clear()
+                s.run(60, refill=refill)
+                ends = [t1 for (t0, t1, pre, dec) in s.log if "u1" in dec and 2.5 <= t0 <= arrived[0].t_prefill_done]
+                return max(b - a for a, b in zip(ends, ends[1:]))
+            finally:
+                os.environ.pop("EXL3_CIL_DECODE_PRIO", None)
+        self.assertGreater(gap(False), 2.0)    # one 3.5K-row chunk (4096 cap) stops the stream
+        self.assertLess(gap(True), 1.1)        # 768-row chunks with a decode round between them (the last chunk merges the tail: <= 1792 rows)
+
     def test_chunk_size_restored_when_nobody_decodes(self):
         os.environ["EXL3_CIL_DECODE_PRIO"] = "1"
         try:
