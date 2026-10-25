@@ -719,6 +719,28 @@ __device__ __forceinline__ float sum_coherent(const float* p, size_t stride, int
     for (; b < n; ++b) s += ld_coherent(p + (size_t) b * stride);
     return s;
 }
+// the same for 4 adjacent columns (4 independent sums, each in index order)
+__device__ __forceinline__ void sum_coherent4(const float* p, size_t stride, int n, float (&t)[4])
+{
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) t[i] = 0.0f;
+    int b = 0;
+    for (; b + 4 <= n; b += 4)
+    {
+        float v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) v[j][i] = ld_coherent(p + (size_t) (b + j) * stride + i);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) t[i] += v[j][i];
+    }
+    for (; b < n; ++b)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) t[i] += ld_coherent(p + (size_t) b * stride + i);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Dense GEMV, up to 4 matrices sharing x (and K bits), one launch.
@@ -814,9 +836,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
         if (!arrive(z, part, ncols, counters + job.ctr_base + strip, jobs.kbs, tid)) return;
         for (int col = tid; col < ncols; col += THREADS)
         {
-            float s = 0.0f;
-            for (int b = 0; b < jobs.kbs; ++b) s += ld_coherent(scratch + job.part_base + (size_t) b * job.N + col0 + col);
-            z[col] = s;
+            z[col] = sum_coherent(scratch + job.part_base + col0 + col, job.N, jobs.kbs);
         }
         __syncthreads();
     }
@@ -963,7 +983,7 @@ void moe_gu_kernel(const half* __restrict__ x, MoeArgs a, int kbs)
         const int p = col / STRIP;
         const int c = col % STRIP;
         float s = 0.0f;
-        for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+        s = sum_coherent(part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, a.I, kbs);
         z[col] = s;
     }
     __syncthreads();
@@ -1088,13 +1108,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
             const int64_t es = a.sel[s];
             if (es < 0 || es >= a.experts) continue;
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) s * kbs + b) * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) s * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = reinterpret_cast<const half*>(a.dv[es]) + col;
             const float w = __half2float(a.wts[s]);
@@ -1104,13 +1118,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
         if constexpr (KB2S > 0)
         {
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) a.topk * kbs + b) * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) a.topk * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = a.shv[2] + col;
             #pragma unroll
@@ -1271,7 +1279,7 @@ void moe_gu_kernel_r(MoeArgsR a, int kbs)
             const int p = col / STRIP;
             const int c = col % STRIP;
             float s = 0.0f;
-            for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+            s = sum_coherent(part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, a.I, kbs);
             z[col] = s;
         }
         __syncthreads();
@@ -1394,13 +1402,7 @@ void moe_down_kernel_r(MoeArgsR a, int kbs, int ctr_b_off)
         {
             const int col = col0 + wave * 128 + lane * 4;
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + (size_t) slot * kbs * a.H + (size_t) b * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) slot * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = reinterpret_cast<const half*>(a.dv[e]) + col;
             float o[4];
@@ -2526,10 +2528,7 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
             if (!last) continue;
             for (int col = tid; col < ncols; col += THREADS)
             {
-                float s = 0.0f;
-                for (int b = 0; b < jobs.kbs; ++b)
-                    s += ld_coherent(scratch + job.part_base + (size_t) row * jobs.kbs * job.N + (size_t) b * job.N + col0 + col);
-                z[col] = s;
+                z[col] = sum_coherent(scratch + job.part_base + (size_t) row * jobs.kbs * job.N + col0 + col, job.N, jobs.kbs);
             }
             __syncthreads();
         }
