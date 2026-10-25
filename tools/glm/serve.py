@@ -513,6 +513,18 @@ def guard_stats(hit: dict, n_new: int) -> dict:
     return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
 
 
+def held_tail(text: str, markers: list[str]) -> int:
+    """Characters at the end of `text` that could still become one of `markers` (a proper prefix of one). A stream holds back only
+    these: holding a marker-length tail delayed the first visible text by several tokens, which under load is several seconds."""
+    best = 0
+    for m in markers:
+        for k in range(min(len(m) - 1, len(text)), best, -1):
+            if text.endswith(m[:k]):
+                best = k
+                break
+    return best
+
+
 def opens_thinking(prompt: str) -> bool:
     """The GLM generation prompt ends in <think>, so the model output starts inside the block."""
     return prompt.rstrip().endswith("<think>")
@@ -1665,7 +1677,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
-            hold = max([len("</think>"), len(TOOL_OPEN)] + [len(x) for x in body["_stop"]]) - 1
+            holds = ["</think>", "<think>", TOOL_OPEN] + [x for x in body["_stop"] if x]
             visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
 
             async def flush(final: bool) -> None:
@@ -1673,7 +1685,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 while mode != "tool":
                     tags = ["</think>"] if mode == "reasoning" else ["<think>", TOOL_OPEN]
                     hits = [(text.find(t, done), t) for t in tags if text.find(t, done) >= 0]
-                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - hold))
+                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - held_tail(text, holds)))
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
                         if not visible:
