@@ -2176,7 +2176,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 # ---------------------------------------------------------------------------- main
 
 
-MIN_FREE_MIB = 1024   # VRAM that must stay free after load: a 2048-row prefill chunk and the multi-row graph pools come on top of the resident state
+MIN_FREE_MIB = 1536   # VRAM that must stay free after load: a 2048-row prefill chunk and the multi-row graph pools come on top of the resident state (measured 3090 Qwen3.8-27B: the first prefills raise the use by 1.3-1.4 GiB; 1024 let -c 262144 sessions 3, 1369 MiB free, start and then die with CUDA out of memory on the third distinct prompt)
 
 
 def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, sessions: int, min_free_mib: float = MIN_FREE_MIB) -> str | None:
@@ -2187,6 +2187,12 @@ def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, se
     fits = max(0, int(ctx - (min_free_mib - free_mib) / kv_mib_per_token) // 256 * 256) if kv_mib_per_token > 0 else 0
     return (f"only {free_mib:.0f} MiB of VRAM left after load (ctx={ctx}, sessions={sessions}; {min_free_mib:.0f} MiB needed for the first prefill): "
             f"every long prompt would end in CUDA out of memory. Start with -c {fits} or fewer --sessions (each session holds its recurrent slots, about 1.1 GiB)")
+
+
+def free_vram_mib(torch: Any) -> float:
+    """VRAM the device has left once torch's cache is returned (the number the first prefill really competes for)."""
+    torch.cuda.empty_cache()
+    return torch.cuda.mem_get_info()[0] / 2**20
 
 
 def load_all(args: argparse.Namespace):
@@ -2215,9 +2221,9 @@ def load_all(args: argparse.Namespace):
     with Heartbeat("warm-up (first decode steps)"):
         engine.warmup()
     if engine.torch.cuda.is_available() and not engine.torch.version.hip and os.environ.get("EXL3_MIN_FREE_MIB", "") != "0":
-        free, _ = engine.torch.cuda.mem_get_info()
-        free_mib = (free + engine.torch.cuda.memory_reserved() - engine.torch.cuda.memory_allocated()) / 2**20   # torch's cached blocks are reusable
+        free_mib = free_vram_mib(engine.torch)
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
+        print(f"qserve: VRAM left after load: {free_mib:.0f} MiB (ctx={args.ctx}, sessions={args.sessions})", flush=True)
         bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB))
         if bad:
             raise RuntimeError(bad)

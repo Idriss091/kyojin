@@ -1268,6 +1268,21 @@ class VramHeadroomTests(unittest.TestCase):
     def test_override(self):
         self.assertIsNone(serve.vram_headroom_problem(468, 262144, 0.0182, 3, min_free_mib=256))
 
+    def test_free_vram_is_the_device_figure_after_the_cache_is_returned(self):
+        calls = []
+        cuda = types.SimpleNamespace(empty_cache=lambda: calls.append("empty"), mem_get_info=lambda: (1369 * 2**20, 24124 * 2**20))
+        self.assertEqual(serve.free_vram_mib(types.SimpleNamespace(cuda=cuda)), 1369)
+        self.assertEqual(calls, ["empty"])
+
+    def test_1369_mib_left_at_262144_sessions_3_is_refused(self):
+        # measured on the 24 GB 3090: this start was accepted (limit 1024), then the third distinct 50K prompt died with CUDA OOM
+        msg = serve.vram_headroom_problem(1369, 262144, 0.0182, 3)
+        self.assertIn("-c ", msg)
+        self.assertLess(int(msg.split("-c ")[1].split()[0]), 262144)
+
+    def test_196608_sessions_3_is_accepted(self):
+        self.assertIsNone(serve.vram_headroom_problem(2600, 196608, 0.0182, 3))   # measured: ~2.6 GiB left, 50 calls clean in realA
+
 
 if __name__ == "__main__":
     unittest.main()
