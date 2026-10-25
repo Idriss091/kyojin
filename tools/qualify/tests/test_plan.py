@@ -33,7 +33,7 @@ def fake_pack(d: Path, arch="LlamaForCausalLM", mtp=0, template=True, quant="exl
 
 
 def args(**kw):
-    a = dict(backend="cuda", sessions=[1, 4], ref=None, kv_kl_max=0.02, smoke_tasks="", ctx_cap=None, out="/tmp/x", seq=None)
+    a = dict(backend="cuda", sessions=[1, 4], ref=None, kv_kl_max=0.02, kv_bits=[8, 6, 4], smoke_tasks="", ctx_cap=None, out="/tmp/x", seq=None)
     a.update(kw)
     return a
 
@@ -108,6 +108,8 @@ class PlanTests(unittest.TestCase):
         st = {"maxctx": dict(status="done", key=key, wall_s=12.0, data={})}
         self.assertEqual(self.names(planmod.build_plan(m, args(), st), "done"), ["maxctx"])
         self.assertEqual(self.names(planmod.build_plan(m, args(sessions=[1]), st), "done"), [])      # changed input -> stale
+        km = dict(status="done", key=planmod.fingerprint("meta", m, args()), wall_s=0, data={})
+        self.assertEqual(self.names(planmod.build_plan(m, args(sessions=[1]), {"meta": km}), "done"), ["meta"])   # unrelated arg keeps meta
         self.assertEqual(self.names(planmod.build_plan(m, args(), st, redo=["maxctx"]), "done"), [])
 
     def test_stage_selector_blocks_missing_dependency(self):

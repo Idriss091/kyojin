@@ -45,3 +45,14 @@ sha self-equal, smoke >= 80 % of the tasks, no OOM. Verdict is advisory; numbers
 ## Not in v1 (explicit)
 GDN/MoE/MLA reference adapters (only dense Llama), MLX profile, Strix real run, day-0 autotune (q2 will write into the pack cache; `serve` has a hook
 `--tuning-cache DIR` reserved), automatic HF fetch of gated repos.
+
+## Findings while building it (feed the converter / serve owners)
+- `serve.py` loads the MTP drafter for every `--draft-policy` but `off`: a head-less pack (Nanbeige) must be served `off`; `pack.draft_policy` derives it from
+  `mtp_num_hidden_layers`. n-gram lookup without an MTP head needs a server flag (drill-0 gap 8 stays open).
+- The per-layer SQNR is only in the converter log, not in the pack: the converter should write `convert.log` into the pack (`parity` reads `<pack>/convert.log`
+  or `--conv-log`).
+- Servers run with `PYTHONPATH=<engine checkout>` (the built extension lives there): `--repo` is that checkout, not the qualify tree.
+- `standard_cal_data` is also the quantizer's calibration source: the domain docs use late offsets (held-out in practice, not by construction). A truly
+  held-out set is a v2 item.
+- The hermes_opt/eval copy under duel_src lacks `lib/taskdefs.py`; the duel's copy (pr_bundles/duel/harness/eval) is complete and is found automatically
+  (`QUALIFY_EVAL_DIR` overrides).

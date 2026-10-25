@@ -13,7 +13,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-EVAL_DIRS = [Path.home() / "hermes-work/hermes_opt/eval", Path.home() / "hermes-work/duel_src/hermes_opt/eval"]
+EVAL_DIRS = ([Path(os.environ["QUALIFY_EVAL_DIR"])] if os.environ.get("QUALIFY_EVAL_DIR") else []) + [
+    Path.home() / "hermes-work/hermes_opt/eval", Path.home() / "hermes-work/duel_src/hermes_opt/eval",
+    Path.home() / "hermes-work/leadk/fleet/pr_bundles/duel/harness/eval"]      # the duel's copy is the complete one (44 tasks, lib/taskdefs.py)
 DEFAULT_TASKS = ""        # filled by pick_tasks from the suite's own task list
 
 

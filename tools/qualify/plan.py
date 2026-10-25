@@ -36,9 +36,13 @@ class Stage:
     cmd: list = field(default_factory=list)
 
 
+RELEVANT = {"fetch": ("ref",), "meta": (), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits"), "maxctx": ("sessions", "ctx_cap"),
+            "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
+
+
 def fingerprint(stage: str, meta: dict, args: dict) -> str:
-    """Input key of a stage: pack index sha + the arguments that change its result. A done-file with another key is stale."""
-    rel = {k: args.get(k) for k in ("backend", "sessions", "kv_kl_max", "ref", "smoke_tasks", "seq", "ctx_cap")}
+    """Input key of a stage: pack index sha, backend + the arguments that change THIS stage's result. A done-file with another key is stale."""
+    rel = {k: args.get(k) for k in ("backend",) + RELEVANT[stage]}
     return hashlib.sha1(json.dumps([stage, meta.get("index_sha"), rel], sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 

@@ -113,7 +113,7 @@ def main(argv=None) -> int:
             c.data[name] = d
             results[name] = dict(status="done", wall_s=round(wall, 1), data=d)
         log(f"stage {s.name} done in {wall:.0f} s")
-    if "report" in {x.name for x in plan if x.status in ("todo",)} or not only:
+    if True:     # the report is cheap: always rebuilt from the stage files
         results = planmod.load_state(out)
         j = report.assemble(meta, a, results, Path(a["repo"]))
         report.write(out, j)
