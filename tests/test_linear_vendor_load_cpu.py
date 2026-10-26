@@ -139,3 +139,17 @@ def test_mxfp8_u8_scale_inv(tmp_path):
     cfg = {"quantization_config": {"quant_method": "mxfp8", "weight_block_size": [1, 32]}}
     w = make_linear(tmp_path, {"l.weight": H.t("F8_E4M3", wb), "l.weight_scale_inv": H.t("U8", sb)}, cfg, "l", 48, 128)
     check(w, vi.dequant_fp8(wb, "F8_E4M3", vi.e8m0_to_f32(sb), (1, 32)))
+
+
+def test_fp8_per_channel_1d_scale_square_layer(tmp_path):
+    """[out] scale on a square layer: must scale output channels (rows of the checkpoint matrix), not input columns."""
+    wb, s = H.e4m3_bytes((64, 64), 0, 0x60), H.f32_scale((64,), -3, 1)
+    w = make_linear(tmp_path, {"l.weight": H.t("F8_E4M3", wb), "l.weight_scale": H.t("F32", s)}, {}, "l", 64, 64)
+    check(w, vi.dequant_fp8(wb, "F8_E4M3", s))
+
+
+def test_fp8_with_e8m0_scale_grid_deepseek_v4(tmp_path):
+    wb = H.e4m3_bytes((64, 96), 0, 0x70)
+    sb = H.rng.integers(118, 134, size=(2, 3)).astype(np.uint8)
+    w = make_linear(tmp_path, {"l.weight": H.t("F8_E4M3", wb), "l.scale": H.t("F8_E8M0", sb)}, {}, "l", 64, 96)
+    check(w, vi.dequant_fp8(wb, "F8_E4M3", vi.e8m0_to_f32(sb)))

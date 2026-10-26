@@ -192,11 +192,13 @@ class Linear(Module):
     # FP8 scales: per-tensor, per-channel or a block grid (ceil-div), always MULTIPLIED, whether the tensor is
     # called weight_scale or weight_scale_inv (DeepSeek / Qwen3-FP8 / GLM / MiniMax name the multiplier "inv")
     def apply_fp8_scales_(self, weight: torch.Tensor, scale: torch.Tensor):
+        if scale.dim() == 1 and scale.numel() > 1:
+            scale = scale.reshape(1, -1) if self.transposed_load else scale.reshape(-1, 1)    # per output channel, also when square
         return apply_scale_grid(weight, scale, self.quant_block_()).half()
 
 
     def apply_fp8_scales_inv_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
-        return apply_scale_grid(weight, scale_inv, self.quant_block_()).half()
+        return self.apply_fp8_scales_(weight, scale_inv)
 
 
     # NVFP4: packed e2m1 (U8 [out, in/2], low nibble first) x E4M3 scale per 16 inputs x one fp32 global scale.
