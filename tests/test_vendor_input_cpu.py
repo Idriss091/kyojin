@@ -325,3 +325,16 @@ def test_truncated_file_is_rejected(tmp_path):
     p.write_bytes(p.read_bytes()[:-4])
     with pytest.raises(ValueError):
         vi.SafetensorsFile(str(p))
+
+
+def test_mxfp8_u8_weight_scale_inv_is_e8m0(tmp_path):
+    """MiniMax-M3-MXFP8 / nvidia MiniMax-M3-NVFP4 attention: F8_E4M3 weight + U8 weight_scale_inv [out, in/32] (block [1,32])."""
+    wb = e4m3_bytes((48, 128), 0, 0x70)
+    sb = rng.integers(118, 134, size=(48, 4)).astype(np.uint8)
+    T = {"a.q.weight": t("F8_E4M3", wb), "a.q.weight_scale_inv": t("U8", sb)}
+    ck = vi.Checkpoint(make_ckpt(tmp_path, T, {"quantization_config": {"quant_method": "mxfp8", "weight_block_size": [1, 32]}}))
+    assert vi.detect_checkpoint(ck.info(), ck.config)["block_size"] == (1, 32)
+    w = torch.from_numpy(wb).view(torch.float8_e4m3fn).float()
+    s = torch.from_numpy(sb.view(ml_dtypes.float8_e8m0fnu).astype(np.float32)).repeat_interleave(32, 1)
+    assert same(vi.load_linear(ck, "a.q"), (w * s).numpy())
+    ck.close()

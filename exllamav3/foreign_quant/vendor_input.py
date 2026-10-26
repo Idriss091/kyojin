@@ -12,6 +12,7 @@ Formats (value = decoded payload x scale, all in float32):
             `P.weight_scale_inv`  DeepSeek / Qwen3-FP8 / GLM / MiniMax: 2D grid, block 128x128, ceil-div
             `P.weight_scale`      per-tensor ([] or [1]), per-channel ([out] / [out,1]) or 2D grid
             `P.scale`             DeepSeek-V4: F8_E8M0 grid (32x32 in that checkpoint)
+          a U8 / F8_E8M0 scale on FP8 weights is MXFP8 (MiniMax-M3): E8M0 exponent per 32 inputs, [out, in/32]
           no scale tensor -> scale 1 (plain cast).
   mxfp4   OCP microscaling E2M1 + E8M0 per 32 inputs, two nibbles per byte, LOW nibble first:
             linear:  `P.weight` I8/U8 [out,in/2] + `P.scale` F8_E8M0 or `P.weight_scale` U8/E8M0 [out,in/32]
@@ -160,6 +161,11 @@ class SafetensorsFile:
         return m["dtype"], tuple(m["shape"]), a.reshape(m["shape"])
 
 
+def scale_to_f32(tag, a):
+    """Decode a scale tensor: U8 scales (MXFP8 `weight_scale_inv`, MXFP4 `weight_scale`) are E8M0 exponent bytes."""
+    return e8m0_to_f32(a) if tag == "U8" else to_f32(tag, a)
+
+
 def to_f32(tag, a):
     """Decode a raw storage array of safetensors dtype `tag` to float32."""
     if tag == "F32":
@@ -204,6 +210,10 @@ class Checkpoint:
     def f32(self, name):
         tag, _, a = self.raw(name)
         return to_f32(tag, a)
+
+    def scale_f32(self, name):
+        tag, _, a = self.raw(name)
+        return scale_to_f32(tag, a)
 
     def close(self):
         for st in self.files.values():
@@ -405,10 +415,10 @@ def load_linear(ck, prefix, block=None):
     if fmt == "mxfp4_blocks":
         return dequant_mxfp4_blocks(w, ck.raw(c["scale"])[2])
     if fmt.startswith("fp8_"):
-        s = None if fmt == "fp8_noscale" else ck.f32(c["scale"])
+        s = None if fmt == "fp8_noscale" else ck.scale_f32(c["scale"])
         return dequant_fp8(w, tag, s, block)
     if fmt == "mxfp4":
-        return dequant_mxfp4_linear(w, e8m0_to_f32(ck.raw(c["scale"])[2]))   # U8 scales are E8M0 bytes
+        return dequant_mxfp4_linear(w, ck.scale_f32(c["scale"]))
     if fmt == "nvfp4":
         if c["scale2"] is None:
             raise ValueError(f"{prefix}: NVFP4 without a global scale tensor")

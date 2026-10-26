@@ -294,6 +294,11 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
+                    # MXFP8 (MiniMax-M3): FP8 weights with a U8 weight_scale_inv of E8M0 exponent bytes, one per 32 inputs
+                    if scale_inv is not None and scale_inv.dtype == torch.uint8:
+                        scale_inv = (scale_inv.float() - 127.0).exp2()
+                    if scale is not None and scale.dtype == torch.uint8:
+                        scale = (scale.float() - 127.0).exp2()
                     no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)

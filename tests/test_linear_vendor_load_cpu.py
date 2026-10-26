@@ -131,3 +131,11 @@ def test_gpt_oss_fused_mxfp4_experts(tmp_path, interleaved):
         lin.load(torch.device("cpu"))
         rows = full[e, 0::2] if interleaved and lo == 0 else full[e, 1::2] if interleaved else full[e, lo:hi]
         check(lin.inner.weight, np.ascontiguousarray(rows))
+
+
+def test_mxfp8_u8_scale_inv(tmp_path):
+    wb = H.e4m3_bytes((48, 128), 0, 0x70)
+    sb = H.rng.integers(118, 134, size=(48, 4)).astype(np.uint8)
+    cfg = {"quantization_config": {"quant_method": "mxfp8", "weight_block_size": [1, 32]}}
+    w = make_linear(tmp_path, {"l.weight": H.t("F8_E4M3", wb), "l.weight_scale_inv": H.t("U8", sb)}, cfg, "l", 48, 128)
+    check(w, vi.dequant_fp8(wb, "F8_E4M3", vi.e8m0_to_f32(sb), (1, 32)))
