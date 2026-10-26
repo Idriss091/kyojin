@@ -81,7 +81,8 @@ def kv(pack, docs, ref, out, bits):
 
 def kvmode(pack, docs, out, n=256):
     """Prefill ids[:T-n] in 2048-row chunks (quantize-on-write, the KVWIN ring bound for the tq formats), then n teacher-forced decode steps
-    through the engine's own decode path, once per KV format; KL of each format's log-probs against k8v8's. No BF16 reference needed."""
+    through the engine's own decode path, once per KV format; KL of each format's log-probs against k8v8's. No BF16 reference needed.
+    One model load per format: a 33B pack on a 24 GB card has no room for several 32K caches at once."""
     import os
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
     from exllamav3.cache import tq
@@ -89,26 +90,23 @@ def kvmode(pack, docs, out, n=256):
     T = len(ids)
     e = T - n
     cfg = Config.from_directory(pack)
-    m = Model.from_config(cfg)
     hd = cfg.head_dim
     fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
-    caches = {}
-    for name, kind, b in fmts:
-        os.environ.pop("EXL3_KVWIN", None)
-        if kind == "tq":
-            caches[name] = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=tq.CacheLayer_tq, k_bits=b, v_bits=b)
-        else:
-            os.environ["EXL3_KVWIN"] = "0"       # the production formats at >= 6 bits run without the window
-            caches[name] = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
-            os.environ.pop("EXL3_KVWIN")
-    m.load(progressbar=False)
     x = torch.tensor([ids])
     npg = (T + 256) // 256
     bt = torch.arange(npg, dtype=torch.int32)[None]
     res, lps = {}, {}
-    with torch.inference_mode():
-        for name, kind, b in fmts:
-            cache = caches[name]
+    for name, kind, b in fmts:
+        m = Model.from_config(Config.from_directory(pack))
+        os.environ.pop("EXL3_KVWIN", None)
+        if kind == "tq":
+            cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=tq.CacheLayer_tq, k_bits=b, v_bits=b)
+        else:
+            os.environ["EXL3_KVWIN"] = "0"       # the production formats at >= 6 bits run without the window
+            cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
+            os.environ.pop("EXL3_KVWIN")
+        m.load(progressbar=False)
+        with torch.inference_mode():
             st = cache.get_new_state() if cache.recurrent_state_cls is not None else None
             def par(pos, t):
                 p = {"attn_mode": "flash_attn", "cache": cache, "block_table": bt[:, : (pos + t + 255) // 256], "cache_seqlens": torch.tensor([pos], dtype=torch.int32)}
@@ -123,14 +121,14 @@ def kvmode(pack, docs, out, n=256):
                 rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).half().cpu())
             if st is not None:
                 st.free()
-            lps[name] = torch.stack(rows).float()
-            if name != "k8v8":
-                r8 = lps["k8v8"]
-                kl = (r8.exp() * (r8 - lps[name]).nan_to_num(0)).sum(-1)
-                res[name] = dict(kl_vs_k8=kl.mean().item(), top1_vs_k8=(r8.argmax(-1) == lps[name].argmax(-1)).float().mean().item(),
-                                 bits_per_val=(b + 0.5) if kind == "quant" else b + 16 / hd)
-                print(name, res[name], flush=True)
-    free(m, None)
+        lps[name] = torch.stack(rows).float()
+        free(m, cache)
+        if name != "k8v8":
+            r8 = lps["k8v8"]
+            kl = (r8.exp() * (r8 - lps[name]).nan_to_num(0)).sum(-1)
+            res[name] = dict(kl_vs_k8=kl.mean().item(), top1_vs_k8=(r8.argmax(-1) == lps[name].argmax(-1)).float().mean().item(),
+                             bits_per_val=(b + 0.5) if kind == "quant" else b + 16 / hd)
+            print(name, res[name], flush=True)
     json.dump(res, open(out, "w"), indent=1)
 
 
