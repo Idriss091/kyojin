@@ -774,7 +774,8 @@ class QwenEngine:
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
-        from exllamav3.util import jit_log, kernel_seed
+        from exllamav3.util import jit_log, kernel_seed, tune_cache
+        tune_cache.install_pack(model_path)   # <pack>/tuning: GEMM autotune winners from qualify --stage autotune
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
