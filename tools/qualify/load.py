@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -92,13 +93,14 @@ class Client:
 
     def near_full(self, ctx: int, slot: int, fill: float = 0.97, reply: int = 32) -> dict:
         """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx). Corpora differ in chars/token (code and CJK are denser), so a
-        refused prompt (HTTP 400 context overflow) is shrunk and a short one is topped up, up to 3 times, from the server's own usage.prompt_tokens."""
+        refused prompt (HTTP 400 context overflow) is shrunk and a short one is topped up, up to 4 times, from the server's own usage.prompt_tokens."""
         want = int(ctx * fill) - reply
         n = want
-        for _ in range(3):
+        for _ in range(4):
             r = self.stream(self.prompt(n, slot), reply)
             if r["err"] and "400" in r["err"] and n > 256:
-                n = int(n * 0.9)
+                m = re.search(r"prompt is (\d+) tokens", r["err"])
+                n = int(n * want / int(m.group(1)) * 0.99) if m else int(n * 0.9)      # the server states the real count: rescale at once
             elif not r["err"] and r["ptok"] and r["ptok"] < 0.9 * want:
                 n = int(n * want / r["ptok"])
             else:
