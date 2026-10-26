@@ -30,6 +30,10 @@ The default (`--kv-mode quant` or nothing) is unchanged. A pack that went throug
   per-vector scale is folded into the scores (K) and the probabilities (V) instead of multiplying every dequantized pair. Prefill: the
   existing staging, with `tq_dequant_window` filling the fp16 scratch (rotated domain) before the fp16 attention kernel. The BC graph
   attention declines tq layers.
+  On ROCm the 5/6-bit fast path (`TQF`, `-DTQF_OFF=1` switches it off) never rebuilds fp16 values from the bit planes: for every 8 values it
+  forms two index words whose bytes are the LDS byte addresses of the codebook entries (nibble plane masked and shifted, low plane spread to
+  one field per byte), then reads each value with one `ds_load_u16_d16` / `_d16_hi`; the next slab's K and V are fetched while the current
+  one is computed. Output is bit-identical to the generic path.
 * `tools/qualify` (kv stage) measures the decode-faithful 32K KL against k8v8 of k6v6, kw6 (k6v6 + the fp16 sink-4 / window-128 ring) and
   tq6 / tq5 once per model. The default format is kw6 when its KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on
   k6v6), written to `kv_cache.json` as `kvwin: "4:128"` (`serve.py --kvwin`, sets `EXL3_KVWIN` before the model is built). tq6 / tq5 are
