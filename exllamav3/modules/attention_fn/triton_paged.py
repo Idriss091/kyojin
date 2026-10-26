@@ -722,6 +722,9 @@ _pf_fa2_rows = int(os.environ.get("EXL3_PF_FA2_ROWS", "1024"))
 # runs 10 TFLOPS at 120K, 256-row slices 21). Default on for ROCm only (CUDA not measured)
 _pf_row_slice = int(os.environ.get("EXL3_PF_ROW_SLICE", "256" if torch.version.hip else "0"))
 
+# ROCm waves_per_eu launch hint of the fp16 prefill kernel (hd <= 256); 0 = compiler default
+_pf_waves_per_eu = int(os.environ.get("EXL3_PF_WAVES_PER_EU", "2"))
+
 def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     from torch.nn.attention import sdpa_kernel, SDPBackend
     from torch.nn.attention.bias import causal_lower_right
@@ -2165,6 +2168,13 @@ def paged_attn_triton_prefill(
         _maxnreg = int(os.environ.get("EXL3_QC_PF_MAXNREG", "255" if qc is not None and qck + qcv >= 16 else "0"))
         # the ROCm Triton backend has no maxnreg launch option (it raises on the unknown keyword)
         _launch_opts = {"maxnreg": _maxnreg} if _maxnreg and not torch.version.hip else {}
+        if torch.version.hip and qc is None and hd_pad <= 256:
+            # gfx1151: the 128-row tile sits at the 256-VGPR cap and spills; waves_per_eu=2 changes the allocation, not the math
+            # (bit-identical): hd256 24q/4kv 4096-row chunk +7 % (21 -> 22.8 TFLOPS at 32K past), hd128 32q/4kv +45 % (19.7 -> 28.5)
+            _launch_opts["waves_per_eu"] = _pf_waves_per_eu
+        # EXL3_ATTN_PREFILL_OPTS="matrix_instr_nonkdim=16,...": extra ROCm Triton launch options (A/B), applied last
+        for _kv in filter(None, os.environ.get("EXL3_ATTN_PREFILL_OPTS", "").split(",")):
+            _launch_opts[_kv.split("=")[0]] = int(_kv.split("=")[1])
         grid = (q_blocks, bsz * n_q_heads, num_splits)
         slice_blocks = 0
         if num_splits == 1 and _pf_row_slice > 0:
