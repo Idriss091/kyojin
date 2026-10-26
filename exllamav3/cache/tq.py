@@ -22,6 +22,7 @@ from ..constants import PAGE_SIZE
 from .quant import CacheLayer_quant
 
 TQ_SEED = 20240611
+_REF_ROT = os.environ.get("EXL3_TQ_REF_ROT") == "1"           # torch GEMM rotation (A/B and debugging)
 _REF_WRITE = os.environ.get("EXL3_TQ_REF_WRITE") == "1"     # torch reference writer (A/B and debugging)
 
 
@@ -76,11 +77,18 @@ class TQState:
         self.midv = ((self.cbv[1:] + self.cbv[:-1]) / 2).contiguous()
         self.eye32 = torch.eye(32, dtype = torch.float16, device = device)   # the kernels' H32 slot: rotation is already outside
 
-    def rotate(self, x: torch.Tensor) -> torch.Tensor:
-        """x [..., dim] fp16 -> R x"""
-        return (x.reshape(-1, self.dim) @ self.rot_t).view(x.shape)
+    def rotate(self, *xs: torch.Tensor):
+        """fp16 tensors [..., dim] -> R x, same shapes (one Triton launch for all of them on a GPU)."""
+        if xs[0].is_cuda and not _REF_ROT:
+            from ..modules.attention_fn.tq_triton import tq_rotate
+            return tq_rotate(self.rot_t, *xs) if len(xs) > 1 else tq_rotate(self.rot_t, *xs)[0]
+        out = [(x.reshape(-1, self.dim) @ self.rot_t).view(x.shape) for x in xs]
+        return out if len(xs) > 1 else out[0]
 
     def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        if y.is_cuda and not _REF_ROT:
+            from ..modules.attention_fn.tq_triton import tq_rotate
+            return tq_rotate(self.rot, y)[0]
         return (y.reshape(-1, self.dim) @ self.rot).view(y.shape)
 
 

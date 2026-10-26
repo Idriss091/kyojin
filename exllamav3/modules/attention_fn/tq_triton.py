@@ -135,3 +135,50 @@ def tq_write(x, words, scales, cb, mid, cache_seqlens, block_table, bits, n_kv_h
             bits, page_size, n_kv_heads, head_dim,
             num_warps = 2, num_stages = 1,
         )
+
+
+@triton.jit
+def _tq_rotate_kernel(
+    x0, x1, x2, y0, y1, y2, rot_t,
+    n0, n1, n2,
+    D: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """y = x @ rot_t (rows of D fp16) for up to three tensors in one launch: program (row block over the concatenated rows,
+    BN-wide column slice). Replaces three tiny GEMMs per attention call."""
+    pid = tl.program_id(0)
+    cb = tl.program_id(1)
+    nb0 = tl.cdiv(n0, BM)
+    nb1 = tl.cdiv(n1, BM)
+    if pid < nb0:
+        xp, yp, nr, blk = x0, y0, n0, pid
+    elif pid < nb0 + nb1:
+        xp, yp, nr, blk = x1, y1, n1, pid - nb0
+    else:
+        xp, yp, nr, blk = x2, y2, n2, pid - nb0 - nb1
+    rows = blk * BM + tl.arange(0, BM)
+    rmask = rows < nr
+    ks = tl.arange(0, D)
+    cols = cb * BN + tl.arange(0, BN)
+    xt = tl.load(xp + rows[:, None].to(tl.int64) * D + ks[None, :], mask = rmask[:, None], other = 0.0)
+    rt = tl.load(rot_t + ks[:, None] * D + cols[None, :])
+    acc = tl.dot(xt, rt)
+    tl.store(yp + rows[:, None].to(tl.int64) * D + cols[None, :], acc.to(tl.float16), mask = rmask[:, None])
+
+
+def tq_rotate(rot_t, *xs):
+    """Rotate each fp16 tensor (any leading shape, last dim = head_dim) with one launch; returns the rotated tensors (same shapes)."""
+    D = rot_t.shape[0]
+    cnt = len(xs)
+    xs = [x.contiguous() for x in xs]
+    ys = [torch.empty_like(x) for x in xs]
+    ns = [x.numel() // D for x in xs]
+    while len(xs) < 3:
+        xs.append(xs[0]); ys.append(ys[0]); ns.append(0)
+    bm = 16
+    nblk = sum(triton.cdiv(n, bm) for n in ns)
+    with torch.cuda.device(rot_t.device):
+        _tq_rotate_kernel[(nblk, D // 64)](xs[0], xs[1], xs[2], ys[0], ys[1], ys[2], rot_t, ns[0], ns[1], ns[2], D, bm, 64,
+                                           num_warps = 4, num_stages = 1)
+    return ys[:cnt]

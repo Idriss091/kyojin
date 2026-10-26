@@ -133,7 +133,7 @@ def attn_dispatch(
             tq = layer.get_tq() if getattr(layer, "tq", False) else None
             if tq is not None:
                 # TurboQuant: the pool, the ring and the kernels live in the rotated domain (see cache/tq.py)
-                q, k, v = tq.rotate(q), tq.rotate(k), tq.rotate(v)
+                q, k, v = tq.rotate(q, k, v)
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None

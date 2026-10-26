@@ -19,6 +19,16 @@ PAGE = 256
 needs_gpu = pytest.mark.skipif(not CPU and not torch.cuda.is_available(), reason = "needs a GPU (or TQ_TEST_CPU=1)")
 
 
+@pytest.fixture(autouse = True, params = ["legacy", "hip"])
+def impl(request, monkeypatch):
+    """Decode path: the Triton split kernel (any device) or qdec_hip (ROCm GPU only, the ROCm default)."""
+    from exllamav3.modules.attention_fn import triton_paged
+    if request.param == "hip" and (CPU or not triton_paged._QDEC_HIP):
+        pytest.skip("qdec_hip needs a ROCm GPU")
+    monkeypatch.setattr(triton_paged, "_QDEC_HIP", request.param == "hip")
+    return request.param
+
+
 @pytest.fixture(autouse = True)
 def cpu_env(monkeypatch):
     if not CPU:
@@ -142,3 +152,17 @@ def test_dispatch_matches_dequantized_reference(hd, bits):
         r = rig.ref(q, L)
         err = ((o.float() - r).norm() / r.norm()).item()
         assert err < 6e-3, (hd, bits, n, L, err)
+
+
+@needs_gpu
+@pytest.mark.parametrize("D", [128, 256])
+def test_fused_rotation_matches_gemm(D):
+    from exllamav3.modules.attention_fn.tq_triton import _tq_rotate_kernel
+    st = tq.TQState.get(D, 6, 6, DEV)
+    xs = [torch.randn(n, D, device = DEV).half() for n in (24, 4, 37)]
+    ys = [torch.empty_like(x) for x in xs]
+    nblk = sum(-(-x.shape[0] // 16) for x in xs)
+    _tq_rotate_kernel[(nblk, D // 64)](xs[0], xs[1], xs[2], ys[0], ys[1], ys[2], st.rot_t, 24, 4, 37, D, 16, 64)
+    for x, y in zip(xs, ys):
+        ref = x.float() @ st.rot_t.float()
+        assert ((y.float() - ref).norm() / ref.norm()) < 1e-3
