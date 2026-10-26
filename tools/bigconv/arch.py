@@ -56,6 +56,8 @@ class Cls:
     expert: Optional[Expert] = None
     role: Optional[str] = None
     slices: Optional[list] = None
+    fmt: Optional[str] = None       # source storage format (vendor_input.classify_linear): fp8_block, nvfp4, mxfp4, dense_bf16 ...
+    scale2: Optional[str] = None    # NVFP4 global scale tensor
 
 
 class ArchAdapter:
@@ -168,11 +170,25 @@ class TableAdapter(ArchAdapter):
             return None
         return Expert(lp, li, int(m.group(3)), m.group(4))
 
+    _SCALE_SFX = (".weight_scale_inv", ".weight_scale", ".scale", ".weight_scale_2", ".weight_global_scale",
+                  ".input_scale", ".input_global_scale")
+
+    def _src_info(self, T):
+        """{name: (dtype, shape)} of the tensor map, cached per map (vendor_input.classify_linear works on it)."""
+        c = getattr(self, "_info_cache", None)
+        if c is None or c[0] is not T:
+            from .formats import info_from_map
+            c = self._info_cache = (T, info_from_map({"tensors": T}))
+        return c[1]
+
     def classify(self, name, T):
         t = T[name]
         if self.scale_suffix and name.endswith(self.scale_suffix) and name[:-len(self.scale_suffix)] + ".weight" in T:
             return Cls("skip")
-        if not name.endswith(".weight") or len(t.get("shape") or [0, 0]) != 2:
+        sfx = next((x for x in self._SCALE_SFX if name.endswith(x)), None)
+        if sfx and (name[:-len(sfx)] + ".weight" in T or name[:-len(sfx)] + ".weight_packed" in T):
+            return Cls("skip")           # scale / global scale / activation scale consumed with its weight (any vendor layout)
+        if not name.endswith((".weight", ".weight_packed")) or len(t.get("shape") or [0, 0]) != 2:
             return Cls("copy")
         if self.lang_prefixes and not name.startswith(self.lang_prefixes):
             return Cls("copy")
@@ -184,8 +200,18 @@ class TableAdapter(ArchAdapter):
             sname = name[:-7] + self.scale_suffix if self.scale_suffix else None
             if sname not in T:
                 sname = None
-            c = dict(action="quant", weight=name, scale=sname, out_f=t["shape"][0], in_f=t["shape"][1], base=name[:-7],
-                     role=role)
+            src = None
+            if name.endswith(".weight") or name.endswith(".weight_packed"):
+                from .formats import vendor_input
+                base = name.rsplit(".", 1)[0]
+                src = vendor_input().classify_linear(self._src_info(T), base)
+            in_f = t["shape"][1]
+            if src and src["fmt"] in ("nvfp4", "mxfp4"):
+                in_f *= 2                # two e2m1 nibbles per stored byte
+            if sname is None and src and src.get("scale"):
+                sname = src["scale"]
+            c = dict(action="quant", weight=name, scale=sname, out_f=t["shape"][0], in_f=in_f, base=name.rsplit(".", 1)[0],
+                     role=role, fmt=src["fmt"] if src else None, scale2=(src or {}).get("scale2"))
             if kind == "routed":
                 ex = self.expert_of(name)
                 if ex is not None:

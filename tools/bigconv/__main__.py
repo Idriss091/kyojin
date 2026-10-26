@@ -55,6 +55,16 @@ def main(argv=None):
     f.add_argument("--scratch", help="capture memmap scratch dir (must be tmpfs)")
     f.add_argument("--memmap-gb", type=float, default=0.0, help="sheet: capture disk (row state + X + Y)")
 
+    f.add_argument("--src", help="source checkpoint dir: report the detected input format (BF16 / FP8 / MXFP4 / NVFP4)")
+    f.add_argument("--map", help="tensor_map.json instead of --src (remote model)")
+    f.add_argument("--config", help="config.json next to --map")
+
+    o = sub.add_parser("formats", help="detect the source checkpoint format from headers only")
+    o.add_argument("--src", help="checkpoint dir (config.json + *.safetensors)")
+    o.add_argument("--map", help="tensor_map.json instead of --src")
+    o.add_argument("--config", help="config.json next to --map")
+    o.add_argument("--json", action="store_true")
+
     k = sub.add_parser("check", help="release-day arch check: new config.json + index.json against an adapter")
     k.add_argument("--arch", required=True, choices=sorted(ADAPTERS))
     k.add_argument("--config", required=True)
@@ -65,6 +75,9 @@ def main(argv=None):
     if a.cmd == "preflight":
         from . import preflight
         preflight.cli(a)
+    elif a.cmd == "formats":
+        from . import formats
+        formats.cli(a)
     elif a.cmd == "check":
         from . import archcheck
         archcheck.cli(a)

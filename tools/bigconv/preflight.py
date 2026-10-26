@@ -119,13 +119,16 @@ def check_gpurun_exempt(gpurun_path, who):
 
 
 def run(root, spool_gb, capture_min_per_layer=None, rows=None, row_len=None, gpurun=None, who=None, qlc=True, floor_gb=None,
-        scratch=None, memmap_gb=0.0):
+        scratch=None, memmap_gb=0.0, src=None, tmap=None, config=None):
     os.makedirs(root, exist_ok=True)
     free = shutil.disk_usage(root).free / 1e9
     res = [check_dirty(), check_disk(root, floor_gb, 0.0), check_spool(free, spool_gb, capture_min_per_layer, qlc, floor_gb),
            check_fstrim(), check_calib(rows or DEFAULTS["rows"], row_len or DEFAULTS["row_len"])]
     if scratch:
         res.append(check_scratch(scratch, memmap_gb))
+    if src or tmap:
+        from .formats import check_input_format, load_source
+        res.append(check_input_format(*load_source(src, tmap, config)))
     if gpurun:
         res.append(check_gpurun_exempt(gpurun, who or DEFAULTS["quantizer_who_prefix"] + "0"))
     return res
@@ -133,7 +136,7 @@ def run(root, spool_gb, capture_min_per_layer=None, rows=None, row_len=None, gpu
 
 def cli(a):
     res = run(a.root, a.spool_gb, a.capture_min_per_layer, a.rows, a.row_len, a.gpurun, a.who, not a.no_qlc, a.floor_gb,
-              a.scratch, a.memmap_gb)
+              a.scratch, a.memmap_gb, a.src, a.map, a.config)
     for n, s, m in res:
         print(f"{s:5s} {n:12s} {m}")
     raise SystemExit(1 if any(s == "FAIL" for _, s, _ in res) else 0)
