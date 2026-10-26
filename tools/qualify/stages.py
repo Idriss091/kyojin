@@ -112,6 +112,8 @@ def job_autotune(c: Ctx) -> dict:
                                   "EXL3_DENSE_GEMM_TUNE_FILE": str(scratch / "dense_gemm_tune.txt")}}
     k, v = chosen_kv(c)
     argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v)
+    if "--no-vision" not in argv:
+        argv.append("--no-vision")                   # the tower is another model (no GEMM autotune keys of the text path) and costs VRAM
     log = c.out / "srv_autotune.log"
     with c.locks():
         sig = json.loads(c.py("autotune.py", "--signature").strip().splitlines()[-1])

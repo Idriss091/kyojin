@@ -41,12 +41,15 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=16384)
     ap.add_argument("--sessions", type=int, default=4)
     ap.add_argument("--port", type=int, default=8591)
+    ap.add_argument("--draft", help="override the derived --draft-policy (off = plain decode)")
     a = ap.parse_args()
     meta = packmod.read_pack(a.pack)
     prof = backends.profile(a.backend, a.repo)
     cache = Path(tempfile.mkdtemp(prefix=f"at0_{a.arm}_"))
     prof["env"] = {**prof["env"], "EXLLAMAV3_TUNE_CACHE": str(cache), "EXL3_PACK_TUNE": "0" if a.arm == "cold" else "1"}
-    argv = packmod.serve_flags(meta, port=a.port, ctx=a.ctx, sessions=a.sessions, k_bits=4, v_bits=4)
+    argv = packmod.serve_flags(meta, port=a.port, ctx=a.ctx, sessions=a.sessions, k_bits=4, v_bits=4, draft=a.draft)
+    if "--no-vision" not in argv:
+        argv.append("--no-vision")                           # text path only: the vision tower is another model and costs VRAM
     log = Path(a.out).with_suffix(".srv.log")
     res = dict(arm=a.arm, pack=a.pack, ctx=a.ctx, sessions=a.sessions, cmd=argv, cache_dir=str(cache), seq=[])
     t0 = time.time()
