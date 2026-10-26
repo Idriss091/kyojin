@@ -151,20 +151,25 @@ def _tq_rotate_kernel(
     cb = tl.program_id(1)
     nb0 = tl.cdiv(n0, BM)
     nb1 = tl.cdiv(n1, BM)
-    if pid < nb0:
-        xp, yp, nr, blk = x0, y0, n0, pid
-    elif pid < nb0 + nb1:
-        xp, yp, nr, blk = x1, y1, n1, pid - nb0
-    else:
-        xp, yp, nr, blk = x2, y2, n2, pid - nb0 - nb1
+    is0 = pid < nb0
+    is1 = (pid >= nb0) & (pid < nb0 + nb1)
+    is2 = pid >= nb0 + nb1
+    blk = tl.where(is0, pid, tl.where(is1, pid - nb0, pid - nb0 - nb1))
     rows = blk * BM + tl.arange(0, BM)
-    rmask = rows < nr
+    m0 = (rows < n0) & is0
+    m1 = (rows < n1) & is1
+    m2 = (rows < n2) & is2
     ks = tl.arange(0, D)
     cols = cb * BN + tl.arange(0, BN)
-    xt = tl.load(xp + rows[:, None].to(tl.int64) * D + ks[None, :], mask = rmask[:, None], other = 0.0)
+    ro = rows[:, None].to(tl.int64) * D
+    xt = tl.load(x0 + ro + ks[None, :], mask = m0[:, None], other = 0.0)
+    xt += tl.load(x1 + ro + ks[None, :], mask = m1[:, None], other = 0.0)
+    xt += tl.load(x2 + ro + ks[None, :], mask = m2[:, None], other = 0.0)
     rt = tl.load(rot_t + ks[:, None] * D + cols[None, :])
-    acc = tl.dot(xt, rt)
-    tl.store(yp + rows[:, None].to(tl.int64) * D + cols[None, :], acc.to(tl.float16), mask = rmask[:, None])
+    acc = tl.dot(xt, rt).to(tl.float16)
+    tl.store(y0 + ro + cols[None, :], acc, mask = m0[:, None])
+    tl.store(y1 + ro + cols[None, :], acc, mask = m1[:, None])
+    tl.store(y2 + ro + cols[None, :], acc, mask = m2[:, None])
 
 
 def tq_rotate(rot_t, *xs):

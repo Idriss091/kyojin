@@ -102,10 +102,17 @@ template<int B> __device__ __forceinline__ u32 dequant2(u32 raw_m, u32 s2, u32 s
 }
 
 // TurboQuant: two raw values (fp16 pair 1024 + raw) -> half2 (codebook[raw] * scale); the codebook sits in LDS as fp16 bits
-__device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, const u16* cb)
+#ifndef TQ_NOLUT
+#define TQ_NOLUT 0                    // experiment: uniform grid instead of the codebook (timing only, wrong values)
+#endif
+template<int B> __device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, const u16* cb)
 {
+#if TQ_NOLUT
+    return hmul2(hsub2(raw_m, c2<B>()), s2);
+#else
     u32 lo = cb[raw_m & 0x3FFu], hi = cb[(raw_m >> 16) & 0x3FFu];
     return hmul2(lo | (hi << 16), s2);
+#endif
 }
 
 // K group plane offsets (words)
@@ -281,7 +288,7 @@ qdec_split(
                     v8u a;
                     #pragma unroll
                     for (int i = 0; i < 8; i++)
-                        a[i] = TQ ? dequant2_tq(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, cbk_s)
+                        a[i] = TQ ? dequant2_tq<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, cbk_s)
                                   : dequant2<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, sch);
                     v16h af = __builtin_bit_cast(v16h, a);
                     #pragma unroll
@@ -389,7 +396,7 @@ qdec_split(
             #pragma unroll
             for (int e = 0; e < 16; e++) {
                 u32 sh = hmul2(vsc[e], 0x38003800u);
-                dq[e] = TQ ? dequant2_tq(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], cbv_s)
+                dq[e] = TQ ? dequant2_tq<VB>(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], cbv_s)
                              : dequant2<VB>(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], sh);
             }
             v8u b0, b1;
