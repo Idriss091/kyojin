@@ -716,6 +716,12 @@ _pf_fa2 = os.environ.get("EXL3_PF_FA2", "1") == "1" and torch.version.hip is Non
 # 0 = one call
 _pf_fa2_rows = int(os.environ.get("EXL3_PF_FA2_ROWS", "1024"))
 
+# Query rows per slice of the prefill grid (single-split launches): the programs run slice by slice, each slice's rows over all heads
+# before the next slice's. 0 = one wide q-block axis (the order before this knob). Same math per program, so bit-identical output.
+# gfx1151, Qwen3.8-27B geometry (24 q / 4 kv heads, hd 256, 4096-row chunk): 1.26x at 4K past, 1.8x at 32K, 2.2x at 120K (the wide axis
+# runs 10 TFLOPS at 120K, 256-row slices 21). Default on for ROCm only (CUDA not measured)
+_pf_row_slice = int(os.environ.get("EXL3_PF_ROW_SLICE", "256" if torch.version.hip else "0"))
+
 def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     from torch.nn.attention import sdpa_kernel, SDPBackend
     from torch.nn.attention.bias import causal_lower_right
@@ -1614,6 +1620,7 @@ def _paged_attn_prefill_kernel(
     WIDE_INDEX: tl.constexpr,  # int64 q/out/partial index math (element offsets past 2^31)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SLICE_BLOCKS,        # runtime: row-sliced grid (num_splits == 1), q blocks per slice, 0 = one q-block axis
 ):
     """FA2-style prefill over the paged cache: BLOCK_M query rows of one head per program;
     unmasked interior kv tiles take a maskless fast path, only the causal boundary and the
@@ -1621,6 +1628,13 @@ def _paged_attn_prefill_kernel(
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     split = tl.program_id(2)
+    if SLICE_BLOCKS > 0:
+        # grid (SLICE_BLOCKS, heads, slices): the programs launch in the order of sequential sub-calls over SLICE_BLOCKS * BLOCK_M
+        # rows each (every program computes what it computes in one wide launch, bit for bit)
+        pid_m = pid_m + split * SLICE_BLOCKS
+        split = 0
+        if pid_m * BLOCK_M >= q_len:
+            return
     batch = bh // n_q_heads
     q_head = bh - batch * n_q_heads
     group_size = n_q_heads // n_kv_heads
@@ -2125,6 +2139,13 @@ def paged_attn_triton_prefill(
         # the ROCm Triton backend has no maxnreg launch option (it raises on the unknown keyword)
         _launch_opts = {"maxnreg": _maxnreg} if _maxnreg and not torch.version.hip else {}
         grid = (q_blocks, bsz * n_q_heads, num_splits)
+        slice_blocks = 0
+        if num_splits == 1 and _pf_row_slice > 0:
+            slice_blocks = max(1, _pf_row_slice // block_m)
+            if q_blocks > slice_blocks:
+                grid = (slice_blocks, bsz * n_q_heads, triton.cdiv(q_blocks, slice_blocks))
+            else:
+                slice_blocks = 0
         # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
         # fp32 partial buffer); common geometries keep pure int32 codegen
         wide_index = max(
@@ -2141,7 +2162,7 @@ def paged_attn_triton_prefill(
                 num_pages_per_seq, page_size, head_dim, hd_pad, vd_pad, v_dim, float(softmax_scale),
                 bool(causal), int(window_left), int(window_right),
                 window_left >= 0, window_right >= 0, float(softcap or 0.0),
-                has_sinks, wide_index, block_m, block_n,
+                has_sinks, wide_index, block_m, block_n, slice_blocks,
                 num_warps=num_warps, num_stages=ns, **_launch_opts,
             )
 
