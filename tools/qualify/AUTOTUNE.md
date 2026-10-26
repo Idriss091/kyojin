@@ -47,3 +47,38 @@ Keyed per (device, kernel version): the file name carries the device signature, 
 
 Not in v1: tuning the env-knob thresholds above; MLX; MoE packs were not run (replay covers them by construction, see the Flint/Qwen3.8-Flash
 follow-up in the log).
+
+## 3. Proof (26/10, RTX 3090 sm_86, 82 SMs, lock held per job; logs fleet/autotune0.log, raw JSON scratch_autotune0/{ab,ab2,ab3})
+
+Cold = fresh empty `EXLLAMAV3_TUNE_CACHE` and `EXL3_PACK_TUNE=0` (what a new model does today); tuned = same fresh live cache, the pack's
+`tuning/` merged at serve start. Same flags (K4V4, 4 sessions, ctx 16384, text only), same request sequence (`ab_autotune.py`), plain decode.
+Nanbeige 4.3 33B (dense Llama, hd128, 52 layers, hidden 7168, K4 + lm_head K6): medians of 3 cold / 2 tuned runs. Qwen3.8-27B (hybrid GDN,
+the hand-tuned reference path): 1 run per arm.
+
+| | Nanbeige cold | Nanbeige tuned | Qwen27 cold | Qwen27 tuned |
+|---|---|---|---|---|
+| stage autotune: wall on the device / records | - | 61 s (load 18 s) / 39 | - | 96 s (load 30 s) / 163 |
+| server load (s) | 27.1 | 18.0 | 21.1 | 15.2 |
+| records tuned during load (graph capture) / during requests | 22 / 17 | 39 / **0** | 47 / 87 | 163 / **0** |
+| 11 first requests of unseen row classes, total wall (s) | 14.04 | **7.13** | 31.95 | **6.17** |
+| ... slowest of them (s) | 2.77 | 1.72 | 9.08 | 1.51 |
+| steady decode (tok/s) | 37.9 | 38.1 | 44.3 | 44.9 |
+| prefill 4K / 8K (tok/s) | 1351 / 1337 | 1344 / 1342 | 1709 / 1711 | 1660 / 1701 |
+| N=4 aggregate decode (tok/s) | 59.4 | 61.5 | 55.6 | 55.9 |
+
+- Steady state is identical (within the +-2 % run noise): the shipped cache holds what the runtime tuner would have found, so there is no
+  loss and no gain at steady state; the gain is the first minutes: no tuning inside user requests (Nanbeige -6.9 s over 10 requests,
+  Qwen27 -25.8 s, worst single request 9.1 s -> 1.5 s) and a shorter load (-6..9 s).
+- Hand-tuned reference: Nanbeige tuned reads 16.28 GB/token (pack minus the CPU-side embedding) at 38.1 tok/s = 620 GB/s = 66.3 % of the
+  936 GB/s roof; Qwen27 (same harness) reads at most 13.81 GB/token (pack minus embedding; includes vision/MTP tensors it does not read) at
+  44.9 tok/s = at most 66.2 %. Nanbeige is at the same fraction of the memory roof as the hand-tuned path, with no hand work.
+- Reproducibility: of the 163 Qwen27 keys the replay produced, 152 (93 %) are identical (kernel, SMs, concurrency) to the long-lived global cache
+  from earlier runs, 155 (95 %) the same tile shape. The remaining differences are near-ties of the 1-shot timing.
+- Oracle (`oracle_gemm.py`, Nanbeige cache vs an L2-warm grid of forced tile shapes x {82, 41} SMs, 45 points): median tuned/oracle 1.032
+  (decode rows 1-2: 0.90-1.05), worst 1.217 at 4-16 and 48 rows of 100-200 us kernels where the grid lacks the tuner's 8x9 launch geometry
+  and the loop is not L2-cold. Median within the 3 % plateau, so no deeper offline sweep was built.
+- Found on the way: the first request after the calibration chat request waited 2.8-6 s on both arms (not tuning; a settle of 12 s before the
+  new-shape phase removes it, diag run: the same 20-token prompt as the very first request takes 0.30 s).
+
+Not done: ROCm run (iGPU locks held by other workers all night; the ROCm path is written -- dense-GEMM tune lines -- and unit-tested, not run on
+the GPU); MoE pack (replay covers expert GEMMs by construction, not run); the env-knob thresholds; Mac.
