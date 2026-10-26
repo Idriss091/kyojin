@@ -914,6 +914,26 @@ class QwenEngine:
             while self.generator.num_remaining_jobs():
                 list(self.generator.iterate())
             self.torch.cuda.synchronize()
+        self.warm_peak_mib = self.warmup_concurrent_peak() if self.draft_policy == "dflash" and self.torch.cuda.is_available() else None
+
+    def warmup_concurrent_peak(self) -> float:
+        """Transient VRAM (MiB, above what stays allocated) of one decode round of every session at once, each still prefilling a full
+        chunk: the drafter's block forward and the multi-row verify come on top of the target's prefill scratch. Measured, not modelled:
+        the post-load free figure misses all of it (Nanbeige 33B + DFlash2 at -c 45056 x 2: 2113 MiB left, 28 CUDA OOM under load)."""
+        cuda = self.torch.cuda
+        chunk = int(self.generator.max_chunk_size)
+        cuda.empty_cache()
+        cuda.reset_peak_memory_stats()
+        base = cuda.memory_allocated()
+        for i in range(self.sessions):
+            text = f"<|im_start|>user\n{i} " + "The quick brown fox jumps over the lazy dog near the river bank. " * (chunk // 6 + 64)
+            ids = self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True)[:, :chunk + 64].contiguous()
+            self.generator.enqueue(self.Job(input_ids=ids, max_new_tokens=16, sampler=self._sampler({"temperature": 0.0}),
+                                            stop_conditions=self.eos))
+        while self.generator.num_remaining_jobs():
+            list(self.generator.iterate())
+        cuda.synchronize()
+        return (cuda.max_memory_allocated() - base) / 2**20
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
@@ -1587,6 +1607,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                           f"new={int(done.get('new_tokens') or 0)} prefill_s={float(done.get('time_prefill') or 0):.3f} "
                           f"generate_s={float(done.get('time_generate') or 0):.3f} stop={done.get('eos_reason')}",
                           file=sys.stderr, flush=True)
+                    if os.environ.get("QSERVE_LOG_VRAM") and getattr(engine, "torch", None) is not None:
+                        t = engine.torch.cuda
+                        print(f"qserve: vram alloc={t.memory_allocated() >> 20} MiB peak={t.max_memory_allocated() >> 20} MiB reserved={t.memory_reserved() >> 20} MiB",
+                              file=sys.stderr, flush=True)
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
                     if getattr(engine, "prefix_disk", None) is not None:
@@ -2206,6 +2230,12 @@ def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, se
             f"every long prompt would end in CUDA out of memory. Start with -c {fits} or fewer --sessions (each session holds its recurrent slots, about 1.1 GiB)")
 
 
+def dflash_min_free_mib(warm_peak_mib: float, ctx: int) -> float:
+    """VRAM that must stay free after load with a DFlash2 drafter: the measured concurrent warm-up peak, 256 MiB of slack and the
+    attention scratch that grows with the context (Nanbeige 33B, k6v6: +64 MiB peak from 9.7K to 19K tokens, about 8 MiB per 1K)."""
+    return warm_peak_mib + 256 + 8 * ctx / 1024
+
+
 def free_vram_mib(torch: Any) -> float:
     """VRAM the device has left once torch's cache is returned (the number the first prefill really competes for)."""
     torch.cuda.empty_cache()
@@ -2242,7 +2272,13 @@ def load_all(args: argparse.Namespace):
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
         lazy = getattr(engine.draft_model, "lazy_vram_bytes", lambda: 0)() / 2**20 if engine.draft_model is not None else 0.0
         print(f"qserve: VRAM left after load: {free_mib:.0f} MiB, {lazy:.0f} MiB of it taken later by the draft-head subset (ctx={args.ctx}, sessions={args.sessions})", flush=True)
-        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB), lazy)
+        min_free = float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB)
+        warm_peak = getattr(engine, "warm_peak_mib", None)
+        if warm_peak is not None:
+            min_free = max(min_free, dflash_min_free_mib(warm_peak, args.ctx))
+            print(f"qserve: DFlash2 warm-up peak above the resident state: {warm_peak:.0f} MiB with {args.sessions} concurrent sessions; "
+                  f"{min_free:.0f} MiB must stay free (EXL3_MIN_FREE_MIB={os.environ.get('EXL3_MIN_FREE_MIB') or MIN_FREE_MIB} floor)", flush=True)
+        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, min_free, lazy)
         if bad:
             raise RuntimeError(bad)
     if os.environ.get("EXL3_SWAP_IN", "1") != "0":

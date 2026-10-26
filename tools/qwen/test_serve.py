@@ -1374,6 +1374,29 @@ class DflashFlagTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class DflashVramGuardTests(unittest.TestCase):
+    def test_min_free_is_the_measured_peak_plus_slack_and_context_scratch(self):
+        self.assertAlmostEqual(serve.dflash_min_free_mib(1900, 45056), 1900 + 256 + 352)
+        self.assertGreater(serve.dflash_min_free_mib(1900, 131072), serve.dflash_min_free_mib(1900, 45056))
+
+    def test_nanbeige_45056_x2_with_2113_mib_left_is_refused_with_a_context_that_fits(self):
+        # measured on the 24 GB 3090: 2113 MiB left after load passed the 1536 floor, then 28 CUDA OOM under two parallel streams
+        need = serve.dflash_min_free_mib(1900, 45056)
+        msg = serve.vram_headroom_problem(2113, 45056, 0.19, 2, need)
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertEqual(fits % 256, 0)
+        self.assertLess(fits, 45056)
+        # the suggested context leaves the needed headroom (the context scratch term shrinks with it)
+        self.assertIsNone(serve.vram_headroom_problem(2113 + (45056 - fits) * 0.19, fits, 0.19, 2, serve.dflash_min_free_mib(1900, fits)))
+
+    def test_enough_headroom_passes(self):
+        self.assertIsNone(serve.vram_headroom_problem(3000, 45056, 0.19, 2, serve.dflash_min_free_mib(1900, 45056)))
+
+    def test_guard_floor_is_kept_when_the_measured_peak_is_small(self):
+        self.assertEqual(max(serve.MIN_FREE_MIB, serve.dflash_min_free_mib(100, 4096)), serve.MIN_FREE_MIB)
+
+
 class DraftDepthTests(unittest.TestCase):
     """exllamav3/generator/draft_depth.py (pure Python, loaded by path so no torch import)."""
 
