@@ -16,6 +16,13 @@ def choose_kv(kl_vs_k8: dict[int, float], kl_max: float = KV_KL_MAX) -> tuple[in
     return 8, 8
 
 
+def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: str = "k6v6") -> str:
+    """Q6 rule for the KV format: any candidate (e.g. tq6, tq5) whose decode-faithful KL vs k8v8 is <= the k6v6 baseline's qualifies;
+    the one with the fewest bytes per value wins (ties: lower KL), else k6v6. kl / bits_per_val: {format: value}, both holding `base`."""
+    ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= kl[base]]
+    return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base
+
+
 def verdict(q: dict, gates: dict | None = None) -> dict:
     """q: assembled qualify data. Returns {pass, reasons[], unmeasured[]}. Missing measurements are listed, never counted as pass."""
     g = dict(kl_mean=0.15, top1_min=0.75, ctx_min=32768, smoke_min=0.8)
@@ -32,7 +39,7 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
         unmeasured.append("parity")
     kv = q.get("kv")
     if kv:
-        if min(kv["chosen"]) < KV_MIN_BITS:
+        if min(kv["chosen"]) < KV_MIN_BITS and not kv.get("q6_equivalent"):
             reasons.append(f"KV below Q6: {kv['chosen']}")
     else:
         unmeasured.append("kv")

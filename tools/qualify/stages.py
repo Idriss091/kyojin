@@ -215,7 +215,36 @@ def job_kv(c: Ctx) -> dict:
         c.py("gpu_eval.py", "kv", c.meta["path"], d, refdir, c.out / "kv_raw.json", *bits)
     raw = json.loads((c.out / "kv_raw.json").read_text())
     kl8 = {int(b): v["kl_vs_k8"] for b, v in raw.items() if "kl_vs_k8" in v}
-    return dict(table=raw, chosen=list(rules.choose_kv(kl8, c.args["kv_kl_max"])), kl_max=c.args["kv_kl_max"], rule="smallest symmetric bits >= Q6 with KL vs k8v8 <= kl_max, else k8v8")
+    out = dict(table=raw, chosen=list(rules.choose_kv(kl8, c.args["kv_kl_max"])), kl_max=c.args["kv_kl_max"], rule="smallest symmetric bits >= Q6 with KL vs k8v8 <= kl_max, else k8v8", mode="quant")
+    if c.args.get("kv_modes", True) and tuple(out["chosen"]) == (6, 6):
+        out.update(job_kvmode(c, d))
+    write_kv_choice(c, out)
+    return out
+
+
+def job_kvmode(c: Ctx, docs) -> dict:
+    """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), tq6, tq5 (TurboQuant + sink/window ring).
+    Q6 rule (rules.choose_kv_mode): any tq format with KL <= k6v6's, then the fewest bytes per value; else k6v6."""
+    with c.locks():
+        c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), timeout=14400)
+    raw = json.loads((c.out / "kvmode_raw.json").read_text())
+    kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
+    bpv = {n: v["bits_per_val"] for n, v in raw.items()}
+    win = rules.choose_kv_mode(kl, bpv)
+    if win == "k6v6":
+        return dict(modes=raw, mode="quant")
+    b = int(win[2:])
+    return dict(modes=raw, mode="tq", chosen=[b, b], q6_equivalent=True, rule="Q6 rule: tq format with KL vs k8v8 <= k6v6's, fewest bytes per value")
+
+
+def write_kv_choice(c: Ctx, kv: dict) -> None:
+    """The lane preset: <pack>/kv_cache.json, read by tools/qwen/serve.py when no --k-bits / --v-bits / --kv-mode is given."""
+    k, v = kv["chosen"]
+    doc = dict(schema=1, kv_mode=kv.get("mode", "quant"), k_bits=k, v_bits=v, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"),
+               kl_vs_k8=({n: x["kl_vs_k8"] for n, x in kv["modes"].items()} if kv.get("modes") else None))
+    tmp = Path(c.meta["path"]) / "kv_cache.json.tmp"
+    tmp.write_text(json.dumps(doc, indent=1))
+    tmp.replace(Path(c.meta["path"]) / "kv_cache.json")
 
 
 def chosen_kv(c: Ctx) -> tuple:
@@ -223,10 +252,14 @@ def chosen_kv(c: Ctx) -> tuple:
     return tuple(kv["chosen"]) if kv else (6, 6)     # no reference: owner's Q6 minimum
 
 
+def chosen_kv_mode(c: Ctx) -> str:
+    return (c.data.get("kv") or {}).get("mode", "quant")
+
+
 # ---------------------------------------------------------------- max ctx
 def start_args(c: Ctx, ctx: int, sessions: int) -> list:
     k, v = chosen_kv(c)
-    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v)
+    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c))
 
 
 def probe_factory(c: Ctx, sessions: int):
@@ -262,7 +295,7 @@ def job_maxctx(c: Ctx) -> dict:
     with c.locks():
         free = backends.gpu_free_mib(c.args["backend"])
         for s in c.args["sessions"]:
-            bpt = packmod.kv_bytes_per_token(c.meta, k, v)
+            bpt = packmod.kv_bytes_per_token(c.meta, k, v, chosen_kv_mode(c))
             free_b = (free * 2**20 if free else 24 * 2**30) - c.meta["weights_bytes"]
             hi = search.upper_bound(free_b, bpt, 2.5 * 2**30, c.args.get("ctx_cap") or c.meta["max_pos"])
             lo = min(hi, 8192)

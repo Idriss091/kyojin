@@ -235,5 +235,26 @@ class CliTests(unittest.TestCase):
             self.assertEqual([p.name for p in (Path(t) / "o").iterdir()], [])
 
 
+
+class KvModeRule(unittest.TestCase):
+    def test_choose_kv_mode(self):
+        bpv = {"k6v6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
+        # tq5 and tq6 both at or below k6v6's KL: the cheaper one wins
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.004, "tq5": 0.009}, bpv), "tq5")
+        # only tq6 qualifies
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.008, "tq5": 0.020}, bpv), "tq6")
+        # none qualifies: the production format stays
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "tq6": 0.004, "tq5": 0.010}, bpv), "k6v6")
+        # a model without tq support (head_dim not a power of two): only the baseline was measured
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")
+
+    def test_serve_flags_kv_mode(self):
+        meta = dict(serve_entry="tools/qwen/serve.py", path="/p", vision=False, template=None, mtp_layers=0, kv_layers=16, kv_heads=4, head_dim=256)
+        f = packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=5, v_bits=5, kv_mode="tq")
+        self.assertEqual(f[f.index("--kv-mode") + 1], "tq")
+        self.assertNotIn("--kv-mode", packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
+        self.assertLess(packmod.kv_bytes_per_token(meta, 5, 5, "tq"), packmod.kv_bytes_per_token(meta, 6, 6))
+
+
 if __name__ == "__main__":
     unittest.main()

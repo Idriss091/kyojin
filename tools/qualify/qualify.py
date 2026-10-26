@@ -36,6 +36,8 @@ def parse(argv=None) -> dict:
     ap.add_argument("--sessions", default="1,4", help="session counts for the max-ctx search; the largest is the served config (N=1..max matrix)")
     ap.add_argument("--kv-bits", default="8,6,4", help="symmetric KV bits measured by the kv stage (8 is the baseline)")
     ap.add_argument("--kv-kl-max", type=float, default=0.02)
+    ap.add_argument("--no-kv-modes", dest="kv_modes", action="store_false", help="skip the KV format auto-select (k6v6 vs tq6 vs tq5, decode-faithful 32K KL vs k8v8) in the kv stage")
+    ap.add_argument("--kvmode-steps", type=int, default=256, help="teacher-forced decode steps scored by the KV format auto-select")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
     ap.add_argument("--hf", help="HF repo to download into --pack first (license/size/disk-floor checked)")

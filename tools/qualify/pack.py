@@ -35,9 +35,10 @@ def kv_layers(t: dict) -> int:
     return n // iv if iv else n
 
 
-def kv_bytes_per_token(meta: dict, k_bits: int, v_bits: int) -> float:
+def kv_bytes_per_token(meta: dict, k_bits: int, v_bits: int, kv_mode: str = "quant") -> float:
     elems_k = meta["kv_layers"] * meta["kv_heads"] * meta["head_dim"]
-    return elems_k * ((k_bits + KV_SCALE_OVERHEAD_BITS) + (v_bits + KV_SCALE_OVERHEAD_BITS)) / 8
+    ovh = 16 / meta["head_dim"] if kv_mode == "tq" else KV_SCALE_OVERHEAD_BITS     # tq: one fp16 norm per head vector
+    return elems_k * ((k_bits + ovh) + (v_bits + ovh)) / 8
 
 
 def weights_dir_bytes(p: Path) -> int:
@@ -103,11 +104,13 @@ def draft_policy(meta: dict) -> str:
 
 
 def serve_flags(meta: dict, *, port: int, ctx: int, sessions: int, k_bits: int, v_bits: int, model_id: str = "qual",
-                draft: str | None = None) -> list[str]:
+                draft: str | None = None, kv_mode: str = "quant") -> list[str]:
     """argv of the server (after the python executable) for this pack. No hand flags: every value is derived."""
     f = [meta["serve_entry"], "--model", meta["path"], "--port", str(port), "--model-id", model_id, "-c", str(ctx),
          "--sessions", str(sessions), "--k-bits", str(k_bits), "--v-bits", str(v_bits),
          "--draft-policy", draft or draft_policy(meta)]
+    if kv_mode != "quant":
+        f += ["--kv-mode", kv_mode]
     if not meta["vision"]:
         f.append("--no-vision")
     if meta["template"]:

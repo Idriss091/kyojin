@@ -61,6 +61,10 @@ def render_md(j: dict) -> str:
     if kv:
         L += ["", f"## KV (chosen k{kv['chosen'][0]}v{kv['chosen'][1]}; {kv['rule']}, kl_max {kv['kl_max']})", "| bits | KL vs ref | top-1 vs ref | KL vs k8v8 |", "|---|---|---|---|"]
         L += [f"| k{b}v{b} | {x['kl_ref']:.4f} | {x['top1_ref']:.4f} | {fmt(x.get('kl_vs_k8'), 4)} |" for b, x in kv["table"].items()]
+        if kv.get("modes"):
+            L += ["", f"KV format (decode-faithful 32K, KL vs k8v8; Q6 rule: KL <= k6v6, then fewest bytes): **{kv.get('mode', 'quant')}**",
+                  "| format | KL vs k8v8 | top-1 vs k8v8 | bits/value |", "|---|---|---|---|"]
+            L += [f"| {n} | {x['kl_vs_k8']:.5f} | {x['top1_vs_k8']:.4f} | {x['bits_per_val']:.2f} |" for n, x in kv["modes"].items()]
     if j["serve"]["ctx"]:
         L += ["", "## Max context (k%dv%d, no OOM on 2 distinct near-full prompts)" % tuple(j["serve"]["kv"]), "| sessions | max -c |", "|---|---|"] + [f"| {s} | {c} |" for s, c in j["serve"]["ctx"].items()]
     sp = j["speed"]

@@ -2257,6 +2257,15 @@ def load_all(args: argparse.Namespace):
     model_dir = str(Path(args.model).expanduser())
     template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
     defaults = load_defaults(model_dir, args)
+    kvp = Path(model_dir) / "kv_cache.json"      # lane preset written by tools/qualify (kv stage): used only when no KV flag is given
+    if kvp.is_file() and not (args.k_bits or args.v_bits or args.cache_bits or args.kv_mode):
+        try:
+            kvj = json.loads(kvp.read_text())
+            args.k_bits, args.v_bits, args.kv_mode = int(kvj["k_bits"]), int(kvj["v_bits"]), kvj.get("kv_mode", "quant")
+            print(f"qserve: KV cache from {kvp.name}: {args.kv_mode} k{args.k_bits}v{args.v_bits}", flush=True)
+        except (ValueError, KeyError, OSError) as e:
+            print(f"qserve: ignoring {kvp}: {e}", flush=True)
+    args.kv_mode = args.kv_mode or "quant"
     t0 = time.time()
     print(f"qserve: starting, model={model_dir} ctx={args.ctx} sessions={args.sessions} draft_policy={args.draft_policy} "
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
@@ -2309,7 +2318,7 @@ def main() -> None:
                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
-    parser.add_argument("--kv-mode", choices=("quant", "tq"), default="quant",
+    parser.add_argument("--kv-mode", choices=("quant", "tq"), default=None,
                         help="KV cache format with --k-bits / --v-bits: quant = per-32 scale pages (default); tq = TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector, 4..6 bits) with the fp16 sink-4 + window-128 ring")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
