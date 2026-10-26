@@ -62,7 +62,7 @@ __device__ __forceinline__ u32 bytesel(int b) { return (u32)b | ((u32)(4 + b) <<
 __device__ __forceinline__ u32 lut2(u32 x, u32 s2, const u16* cb)
 {
     u32 lo = cb[x & 0x3FFu], hi = cb[(x >> 16) & 0x3FFu];
-    return hmul2(lo | (hi << 16), s2);
+    return prmt(lo, hi, 0x5410u);       // the per-vector scale is folded into the scores (K) / the probabilities (V)
 }
 
 struct DqK { u32 sel8, sh4, sh2, sel2[2], sh1, mu8, mu4, mu2; };
@@ -275,8 +275,8 @@ qdec_split(
 #if FASTDQ
         #pragma unroll
         for (int gi = 0; gi < G; gi++) {
-            u32 sc0 = TQ ? (u32)ksc[g * 2 + (kvh & 1)] * 0x10001u : scale2<KB>(ksc[g * G + gi], ksc[g * G + gi]);
-            u32 sc1 = TQ ? (u32)ksc[(g + 8) * 2 + (kvh & 1)] * 0x10001u : scale2<KB>(ksc[(g + 8) * G + gi], ksc[(g + 8) * G + gi]);
+            u32 sc0 = TQ ? 0u : scale2<KB>(ksc[g * G + gi], ksc[g * G + gi]);
+            u32 sc1 = TQ ? 0u : scale2<KB>(ksc[(g + 8) * G + gi], ksc[(g + 8) * G + gi]);
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int ks = gi * 2 + h;
@@ -321,6 +321,10 @@ qdec_split(
 
         // ---- online softmax (log2 domain), rows 2t / 2t+1 of every n-tile
         u32 plo[NT], phi[NT];
+#if TQ
+        const float kf0 = h2f(ksc[g * 2 + (kvh & 1)]) * sl, kf1 = h2f(ksc[(g + 8) * 2 + (kvh & 1)]) * sl;
+        const float vf0 = h2f(vsc[g * 2 + (kvh & 1)]), vf1 = h2f(vsc[(g + 8) * 2 + (kvh & 1)]);
+#endif
         #pragma unroll
         for (int j = 0; j < NT; j++) {
             float s[4]; bool ok[4];
@@ -329,7 +333,11 @@ qdec_split(
                 int tk = n0 + g + ((e >> 1) << 3);
                 int ri = e & 1;
                 ok[e] = rvalid[j][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[j][ri]);
+#if TQ
+                s[e] = ok[e] ? S[j][e] * ((e >> 1) ? kf1 : kf0) : -INFINITY;
+#else
                 s[e] = ok[e] ? S[j][e] * sl : -INFINITY;
+#endif
             }
             float alpha[2];
             #pragma unroll
@@ -351,6 +359,9 @@ qdec_split(
             for (int i = 0; i < NSL; i++) {
                 O[i][j][0] *= alpha[0]; O[i][j][1] *= alpha[1]; O[i][j][2] *= alpha[0]; O[i][j][3] *= alpha[1];
             }
+#if TQ
+            s[0] *= vf0; s[1] *= vf0; s[2] *= vf1; s[3] *= vf1;       // V scale rides on P (token g / g+8 of this lane's rows)
+#endif
             plo[j] = movtrans(pack_h2(s[0], s[1]));
             phi[j] = movtrans(pack_h2(s[2], s[3]));
         }
