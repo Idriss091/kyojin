@@ -122,7 +122,7 @@ class _Kernel:
         assert r == driver.CUresult.CUDA_SUCCESS, r
         r, self.fn = driver.cuModuleGetFunction(self.mod, b"qdec_split_rows" if cfg.get("rows_kernel") else b"qdec_split")
         assert r == driver.CUresult.CUDA_SUCCESS, r
-        if self.shared > 48 * 1024:
+        if self.shared + static_smem(cfg) > 48 * 1024:       # the opt-in covers static + dynamic
             r, = driver.cuFuncSetAttribute(self.fn, driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, self.shared)
             assert r == driver.CUresult.CUDA_SUCCESS, r
 
@@ -160,6 +160,11 @@ def rows_nw(hd):
     return int(os.environ.get("EXL3_QDEC_RNW", "0")) or (4 if (hd // 32) % 4 == 0 else 2)
 
 
+def static_smem(cfg) -> int:
+    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V)"""
+    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") and not cfg.get("rows_kernel") else 0
+
+
 def pick_nw_st(cfg):
     """(warps per CTA, ring depth), measured on a 3090 at 128K context (K/V bits 4/4, 6/6, 8/8): 8 x 2 for hd128 with
     narrow codes, 4 x 2 otherwise; shrinks until the shared memory fits the opt-in limit"""
@@ -174,7 +179,7 @@ def pick_nw_st(cfg):
     narrow = cfg["hd"] == 128 and cfg["kb"] + cfg["vb"] <= 8
     for nw, st in (((8, 2), (4, 2), (4, 1), (2, 2), (2, 1)) if narrow else ((4, 2), (4, 1), (2, 2), (2, 1))):
         c.update(nw=nw, st=st)
-        if geometry(c)["shared"] <= 99 * 1024 - (1024 if cfg.get("tq") else 0):     # + the static codebooks
+        if geometry(c)["shared"] <= 99 * 1024 - static_smem(cfg):
             return nw, st
     raise QdecUnsupported("no ring configuration fits")
 

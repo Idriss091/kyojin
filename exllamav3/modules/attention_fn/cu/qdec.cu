@@ -59,10 +59,10 @@ template<int B> __device__ __forceinline__ u32 negbias2() { return (u32)(0x8000 
 __device__ __forceinline__ u32 bytesel(int b) { return (u32)b | ((u32)(4 + b) << 8); }
 
 // TurboQuant: packed raw pair (1024 + raw in each half) -> half2 (codebook[raw] * scale); the codebook sits in smem as fp16 bits
-__device__ __forceinline__ u32 lut2(u32 x, u32 s2, const u16* cb)
+template<int B> __device__ __forceinline__ u32 lut2(u32 x, u32 s2, const u32* cb)
 {
-    u32 lo = cb[x & 0x3FFu], hi = cb[(x >> 16) & 0x3FFu];
-    return prmt(lo, hi, 0x5410u);       // the per-vector scale is folded into the scores (K) / the probabilities (V)
+    // pair table: index = raw(lo half) | raw(hi half) << B, one 32-bit smem load gives the half2
+    return cb[(x & ((1u << B) - 1)) | ((x >> (16 - B)) & (((1u << B) - 1) << B))];       // the per-vector scale is folded into the scores (K) / the probabilities (V)
 }
 
 struct DqK { u32 sel8, sh4, sh2, sel2[2], sh1, mu8, mu4, mu2; };
@@ -76,14 +76,14 @@ template<int B> __device__ __forceinline__ DqK make_dqk(int t)
 // K pair register: dims (16U + 8S + t, 16U + 8S + t + 4) of one token row (kr = row words of this 32-dim group). The pair stays
 // inside the 8-dim half (slots 0-7 / 8-15) of the mma k range it belongs to: permuting k inside a half is bit-neutral on
 // the tensor core (tested), so the scores stay bit-identical to the plain dim order
-template<int B, int U, int S> __device__ __forceinline__ u32 kdq(const u32* kr, const DqK& c, u32 sc, const u16* cb)
+template<int B, int U, int S> __device__ __forceinline__ u32 kdq(const u32* kr, const DqK& c, u32 sc, const u32* cb)
 {
     u32 x = TQ ? 0x64006400u : negbias2<B>();     // TQ: 1024 + raw in both halves, the low 10 bits are the codebook index
     if constexpr (B & 1) { u32 y = (kr[B & ~1] >> (c.sh1 + 16 * U + 8 * S)) & 0x11u; x = hfma2(magic_mask(y * 0x1001u, 0x00010001u), 0x3C003C00u, x); }
     if constexpr (B & 2) { u32 w = kr[(B & ~3) + U] >> c.sh2; x = hfma2(magic_mask(prmt(w, w, c.sel2[S]), 0x00030003u), c.mu2, x); }
     if constexpr (B & 4) { x = hfma2(magic_mask(kr[(B & ~7) + 2 * U + S] >> c.sh4, 0x000F000Fu), c.mu4, x); }
     if constexpr (B & 8) { x = hfma2(magic_mask(prmt(kr[4 * U + 2 * S], kr[4 * U + 2 * S + 1], c.sel8), 0x00FF00FFu), c.mu8, x); }
-    if (TQ) return lut2(x, sc, cb);
+    if (TQ) return lut2<B>(x, sc, cb);
     return hfma2(x, sc, hmul2(sc, 0x38003800u));
 }
 
@@ -106,14 +106,14 @@ template<int B> __device__ __forceinline__ DqV make_dqv(int g)
     return c;
 }
 // V pair register: dim 16 il + g + 8 rh of two tokens (wA, wB = their row words of this 32-dim group)
-template<int B, int IL, int RH> __device__ __forceinline__ u32 vdq(const u32* wA, const u32* wB, const DqV& c, u32 sc, const u16* cb)
+template<int B, int IL, int RH> __device__ __forceinline__ u32 vdq(const u32* wA, const u32* wB, const DqV& c, u32 sc, const u32* cb)
 {
     u32 x = TQ ? 0x64006400u : negbias2<B>();
     if constexpr (B & 1) { const int o = B & ~1; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel1[IL][RH]), c.m1), c.mu1, x); }
     if constexpr (B & 2) { const int o = (B & ~3) + IL; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel2[RH]), c.m2), c.mu2, x); }
     if constexpr (B & 4) { const int o = (B & ~7) + 2 * IL + RH; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel4), c.m4), c.mu4, x); }
     if constexpr (B & 8) { const int o = 4 * IL + 2 * RH; x = hfma2(magic_mask(prmt(wA[o + c.gq], wB[o + c.gq], c.sel8), c.m8), c.mu8, x); }
-    if (TQ) return lut2(x, sc, cb);
+    if (TQ) return lut2<B>(x, sc, cb);
     return hfma2(x, sc, hmul2(sc, 0x38003800u));
 }
 #endif
@@ -126,8 +126,8 @@ qdec_split(
     int split_len, int num_pages_per_seq, int num_splits, const float* sinks_unused,
     const u16* __restrict__ cbk, const u16* __restrict__ cbv)
 {
-    __shared__ u16 cbk_s[TQ ? (1 << KB) : 1];
-    __shared__ u16 cbv_s[TQ ? (1 << VB) : 1];
+    __shared__ __align__(16) u32 cbk_s[TQ ? (1 << (2 * KB)) : 1];
+    __shared__ __align__(16) u32 cbv_s[TQ ? (1 << (2 * VB)) : 1];
     extern __shared__ __align__(16) unsigned char smem[];
     u16* Qs = (u16*)smem;
     unsigned char* ring = smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16;
@@ -144,8 +144,8 @@ qdec_split(
 
     // ---- q rows -> rotated (h32) fp16 in smem
     if (TQ) {                                            // q arrives already rotated: plain copy (K dim order permuted like below)
-        for (int i = tid; i < (1 << KB); i += NTHREADS) cbk_s[i] = cbk[i];
-        for (int i = tid; i < (1 << VB); i += NTHREADS) cbv_s[i] = cbv[i];
+        for (int i = tid; i < (1 << (2 * KB)); i += NTHREADS) cbk_s[i] = (u32)cbk[i & ((1 << KB) - 1)] | ((u32)cbk[i >> KB] << 16);
+        for (int i = tid; i < (1 << (2 * VB)); i += NTHREADS) cbv_s[i] = (u32)cbv[i & ((1 << VB) - 1)] | ((u32)cbv[i >> VB] << 16);
         for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
             int r = idx / HD, d = idx % HD;
             u16 x = 0;
