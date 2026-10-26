@@ -1338,6 +1338,161 @@ class DflashFlagTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--dflash-dir", err.getvalue())
 
+    def _adapt_env(self, *extra, env=None):
+        """EXL3_DFLASH_ADAPT as main() leaves it for the engine (load_all stubbed out)."""
+        argv = ["serve.py", "--model", "m", "--draft-policy", "dflash", "--dflash-dir", "d", *extra]
+        seen = {}
+
+        def fake_load(args):
+            seen["adapt"] = os.environ.get("EXL3_DFLASH_ADAPT")
+            raise RuntimeError("stop")
+        sh = serve.startup_health
+        with unittest.mock.patch.dict(os.environ, env or {}), unittest.mock.patch.object(sys, "argv", argv), \
+                unittest.mock.patch.object(serve, "load_all", fake_load), \
+                unittest.mock.patch.object(sh, "check_model_dir"), unittest.mock.patch.object(sh, "start"), \
+                unittest.mock.patch.object(sh, "report_compiler"), unittest.mock.patch.object(sh, "abort"), \
+                self.assertRaises(RuntimeError):
+            if not env:
+                os.environ.pop("EXL3_DFLASH_ADAPT", None)
+            serve.main()
+        return seen["adapt"]
+
+    def test_adaptive_depth_is_on_by_default(self):
+        self.assertEqual(self._adapt_env(), "1")
+
+    def test_adapt_off_flag_selects_the_fixed_block(self):
+        self.assertEqual(self._adapt_env("--dflash-adapt", "off"), "0")
+
+    def test_environment_wins_over_the_flag(self):
+        self.assertEqual(self._adapt_env("--dflash-adapt", "on", env={"EXL3_DFLASH_ADAPT": "0"}), "0")
+
+    def test_adapt_flag_rejects_other_values(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["serve.py", "--model", "m", "--dflash-adapt", "maybe"]), \
+                unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
+            serve.main()
+        self.assertEqual(cm.exception.code, 2)
+
+
+class DflashVramGuardTests(unittest.TestCase):
+    def test_min_free_is_the_measured_peak_plus_slack_and_context_scratch(self):
+        self.assertAlmostEqual(serve.dflash_min_free_mib(1900, 45056), 1900 + 256 + 352)
+        self.assertGreater(serve.dflash_min_free_mib(1900, 131072), serve.dflash_min_free_mib(1900, 45056))
+
+    def test_nanbeige_45056_x2_with_2113_mib_left_is_refused_with_a_context_that_fits(self):
+        # measured on the 24 GB 3090: 2113 MiB left after load passed the 1536 floor, then 28 CUDA OOM under two parallel streams
+        need = serve.dflash_min_free_mib(1900, 45056)
+        msg = serve.vram_headroom_problem(2113, 45056, 0.19, 2, need)
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertEqual(fits % 256, 0)
+        self.assertLess(fits, 45056)
+        # the suggested context leaves the needed headroom (the context scratch term shrinks with it)
+        self.assertIsNone(serve.vram_headroom_problem(2113 + (45056 - fits) * 0.19, fits, 0.19, 2, serve.dflash_min_free_mib(1900, fits)))
+
+    def test_enough_headroom_passes(self):
+        self.assertIsNone(serve.vram_headroom_problem(3000, 45056, 0.19, 2, serve.dflash_min_free_mib(1900, 45056)))
+
+    def test_guard_floor_is_kept_when_the_measured_peak_is_small(self):
+        self.assertEqual(max(serve.MIN_FREE_MIB, serve.dflash_min_free_mib(100, 4096)), serve.MIN_FREE_MIB)
+
+
+class DraftDepthTests(unittest.TestCase):
+    """exllamav3/generator/draft_depth.py (pure Python, loaded by path so no torch import)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = Path(__file__).resolve().parents[2] / "exllamav3" / "generator" / "draft_depth.py"
+        spec = importlib.util.spec_from_file_location("draft_depth_t", path)
+        cls.M = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.M)
+
+    def ctl(self, **kw):
+        return self.M.DraftDepth(7, **kw)
+
+    def run_rounds(self, c, accepted, n):
+        """n steps; `accepted` is a number or a repeating pattern of accepted counts per speculative round."""
+        pat = accepted if isinstance(accepted, (list, tuple)) else (accepted,)
+        for i in range(n):
+            d = c.want()
+            c.record(d, min(pat[i % len(pat)], d) if d else 0)
+
+    def switch_off(self, c):
+        while c.depth:
+            self.run_rounds(c, 0, 1)
+
+    def test_starts_at_full_depth(self):
+        self.assertEqual(self.ctl().want(), 7)
+
+    def test_warm_up_never_cuts(self):
+        c = self.ctl()
+        self.run_rounds(c, 0, 2)
+        self.assertEqual(c.want(), 7)
+
+    def test_high_acceptance_stays_full(self):
+        c = self.ctl()
+        self.run_rounds(c, 3, 50)
+        self.assertEqual(c.want(), 7)
+
+    def test_chat_like_acceptance_switches_off(self):
+        c = self.ctl()
+        self.run_rounds(c, 0, 8)
+        self.assertEqual(c.depth, 0)
+        self.assertEqual(c.want(), 0)
+
+    def test_middle_acceptance_gets_the_short_block(self):
+        c = self.ctl()
+        self.run_rounds(c, (1, 2, 1, 0), 20)
+        self.assertEqual(c.depth, 3)
+        self.assertEqual(c.want(), 3)
+
+    def test_short_block_returns_to_full_when_acceptance_climbs(self):
+        c = self.ctl()
+        self.run_rounds(c, (1, 2, 1, 0), 20)
+        self.assertEqual(c.depth, 3)
+        self.run_rounds(c, 3, 12)
+        self.assertEqual(c.depth, 7)
+
+    def test_off_probes_with_a_doubling_interval(self):
+        c = self.ctl()
+        self.switch_off(c)
+        plain = 0
+        while c.want() == 0:
+            c.record(0, 0)
+            plain += 1
+        self.assertEqual(plain, 4)                      # first probe after probe_min plain steps
+        c.record(c.want(), 0)                           # failed probe
+        self.assertEqual(c.depth, 0)
+        plain = 0
+        while c.want() == 0:
+            c.record(0, 0)
+            plain += 1
+        self.assertEqual(plain, 8)                      # doubled
+        for _ in range(10):                             # capped at probe_max
+            c.record(c.want() or 0, 0) if c.want() else None
+            while c.want() == 0:
+                c.record(0, 0)
+            c.record(c.want(), 0)
+        self.assertLessEqual(c.probe, 32)
+
+    def test_good_probe_switches_speculation_back_on(self):
+        c = self.ctl()
+        self.switch_off(c)
+        while c.want() == 0:
+            c.record(0, 0)
+        for _ in range(4):                              # a request that turned agentic: probes accept the whole block
+            c.record(c.want() or 7, 7)
+            while c.want() == 0:
+                c.record(0, 0)
+        self.assertGreater(c.depth, 0)
+
+    def test_env_overrides_the_thresholds(self):
+        with unittest.mock.patch.dict(os.environ, {"EXL3_DFLASH_ADAPT_OFF": "5", "EXL3_DFLASH_ADAPT_WARM": "1"}):
+            c = self.ctl()
+        self.run_rounds(c, 3, 3)
+        self.assertEqual(c.depth, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
