@@ -61,9 +61,12 @@ def default_platform() -> bool:
 
 def env_capable() -> bool:
     """Attention modules are built before any cache exists, so they cannot know the cache bits yet: unless the switch
-    is off, they declare the ring state (inert until a cache layer binds it, see KVWinLayerState.bind)."""
+    is off (or unset on a backend where the default is off), they declare the ring state (inert until a cache layer
+    binds it, see KVWinLayerState.bind)."""
     spec = os.environ.get("EXL3_KVWIN")
-    return spec is None or parse_spec(spec) is not None
+    if spec is None:
+        return default_platform()   # CUDA, default off: no ring state declared, the model builds exactly as before KVWIN
+    return parse_spec(spec) is not None
 
 
 def env_cfg(k_bits: int | None = None, v_bits: int | None = None) -> KVWinCfg | None:

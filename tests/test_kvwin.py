@@ -526,12 +526,15 @@ def test_default_is_rocm_only_until_cuda_is_cleared(monkeypatch, env, hip, expec
     model = _FakeModel()
     Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = 4, v_bits = 4)
     assert model.attn.recurrent_layers[0].cfg == (parse_spec(expect) if expect else None)
+    assert kvwin.env_capable() is (hip if env is None else env not in ("0", "off", ""))
 
 
 @pytest.mark.parametrize("env, capable", [(None, True), ("4:128", True), ("2:64", True), ("0", False), ("off", False), ("", False)])
 def test_attention_declares_ring_state_unless_switched_off(monkeypatch, env, capable):
     """Attention modules are built before the cache (and its bits) exist: unless the switch is off they declare the ring state."""
+    from exllamav3.cache import kvwin
     from exllamav3.cache.kvwin import env_capable
+    monkeypatch.setattr(kvwin, "default_platform", lambda: True)
     if env is None: monkeypatch.delenv("EXL3_KVWIN", raising = False)
     else: monkeypatch.setenv("EXL3_KVWIN", env)
     assert env_capable() is capable
