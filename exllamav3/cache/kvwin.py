@@ -138,6 +138,8 @@ class KVWinLayerState:
         from .quant import CacheLayer_quant
         from .qsa import QSAPlanes
         cfg = env_cfg(getattr(cache_layer, "k_bits", None), getattr(cache_layer, "v_bits", None))
+        if cfg is None and getattr(cache_layer, "tq", False) and os.environ.get("EXL3_KVWIN") is None:
+            cfg = parse_spec(DEFAULT_SPEC)      # the tq modes are the windowed ones (tq5w / tq6w) on every platform
         m = self.module
         if (cfg is None or not isinstance(cache_layer, CacheLayer_quant) or isinstance(cache_layer, QSAPlanes) or
                 cache_layer.compand_a != 0.0 or
@@ -267,6 +269,10 @@ class KVWinLayerState:
         dim = m.num_kv_heads * m.head_dim
         G = dim // 32
         rows = ring_rows(pos, cfg)
+        if getattr(cl, "tq", False):
+            for dst, x in zip((self.ov_k, self.ov_v), cl.read_rot(tok)):      # the ring holds rotated vectors
+                dst[slot].index_copy_(0, rows, x)
+            return
         for q, s, bits, dst in ((cl.qk, cl.sk, cl.k_bits, self.ov_k), (cl.qv, cl.sv, cl.v_bits, self.ov_v)):
             qr = q.reshape(-1, G * bits).index_select(0, tok).contiguous()
             sr = s.reshape(-1, G).index_select(0, tok).contiguous()

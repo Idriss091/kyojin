@@ -798,7 +798,8 @@ def _qc_plane_v(qwords_head, row_words, mask_n, pbase,
 
 @triton.jit
 def _qc_load_kt(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
-                BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+                BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr,
+                cb = None, TQ: tl.constexpr = 0):
     """(HD_PAD, BLOCK_N) fp16 tile from the packed cache, linear midpoint grid, values stay
     in the rotated domain. The cache packs each group into power-of-two bit planes (BITS = sum
     of its set bits), so every width expands with vectorized shifts; no gathers, no straddling.
@@ -829,22 +830,29 @@ def _qc_load_kt(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
     if BITS & 1:
         p = _qc_plane_kt(qh, row_words, mask_n, pbase, 1, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 1) | p
-    sgb = kv_head * G
-    garr = tl.arange(0, G_PAD)
-    if G_PAD > G:
-        sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None],
-                     mask = mask_n[None, :] & (garr < G)[:, None], other = 0.0)
+    if TQ:
+        # TurboQuant: Lloyd-Max codebook gather, one fp16 scale (norm / ||centroids||) per head vector
+        sc1 = tl.load(scales + tok_rows[None, :] * n_kv_heads + kv_head, mask = mask_n[None, :], other = 0.0)
+        res = (tl.load(cb + raw) * sc1.to(tl.float32)).to(tl.float16)
     else:
-        sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None], mask = mask_n[None, :], other = 0.0)
-    scx = tl.reshape(tl.broadcast_to(sc[:, None, :], (G_PAD, 32, sc.shape[1])), (HD_PAD, sc.shape[1]))
-    mh = (1 << (BITS - 1)) - 0.5
-    inv_m = 1.0 / (1 << (BITS - 1))
-    return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+        sgb = kv_head * G
+        garr = tl.arange(0, G_PAD)
+        if G_PAD > G:
+            sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None],
+                         mask = mask_n[None, :] & (garr < G)[:, None], other = 0.0)
+        else:
+            sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None], mask = mask_n[None, :], other = 0.0)
+        scx = tl.reshape(tl.broadcast_to(sc[:, None, :], (G_PAD, 32, sc.shape[1])), (HD_PAD, sc.shape[1]))
+        mh = (1 << (BITS - 1)) - 0.5
+        inv_m = 1.0 / (1 << (BITS - 1))
+        res = ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+    return res
 
 
 @triton.jit
 def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
-               BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+               BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr,
+               cb = None, TQ: tl.constexpr = 0):
     """(BLOCK_N, HD_PAD) fp16 tile, transposed orientation of _qc_load_kt."""
     GPT: tl.constexpr = n_kv_heads * head_dim // 32
     G: tl.constexpr = head_dim // 32
@@ -872,17 +880,22 @@ def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
     if BITS & 1:
         p = _qc_plane_v(qh, row_words, mask_n, pbase, 1, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 1) | p
-    sgb = kv_head * G
-    garr = tl.arange(0, G_PAD)
-    if G_PAD > G:
-        sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :],
-                     mask = mask_n[:, None] & (garr < G)[None, :], other = 0.0)
+    if TQ:
+        sc1 = tl.load(scales + tok_rows[:, None] * n_kv_heads + kv_head, mask = mask_n[:, None], other = 0.0)
+        res = (tl.load(cb + raw) * sc1.to(tl.float32)).to(tl.float16)
     else:
-        sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :], mask = mask_n[:, None], other = 0.0)
-    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], G_PAD, 32)), (sc.shape[0], HD_PAD))
-    mh = (1 << (BITS - 1)) - 0.5
-    inv_m = 1.0 / (1 << (BITS - 1))
-    return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+        sgb = kv_head * G
+        garr = tl.arange(0, G_PAD)
+        if G_PAD > G:
+            sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :],
+                         mask = mask_n[:, None] & (garr < G)[None, :], other = 0.0)
+        else:
+            sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :], mask = mask_n[:, None], other = 0.0)
+        scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], G_PAD, 32)), (sc.shape[0], HD_PAD))
+        mh = (1 << (BITS - 1)) - 0.5
+        inv_m = 1.0 / (1 << (BITS - 1))
+        res = ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+    return res
 
 
 @triton.jit
@@ -923,6 +936,9 @@ def _paged_attn_decode_split_kernel(
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KEY_LO: tl.constexpr = 0,   # KVWIN: the pool pass skips the sink positions < KEY_LO (the ring serves them)
+    k_cb = None,                # TurboQuant codebooks (fp32) and flag: rotation is outside the kernel, H32 slot unused
+    v_cb = None,
+    TQ: tl.constexpr = 0,
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, h_block, kv split). GQA sibling
     q heads and query positions share the row axis so K/V tiles are read once per group."""
@@ -946,7 +962,7 @@ def _paged_attn_decode_split_kernel(
     d_mask = offs_d < head_dim
     q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
     q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None] & d_mask[None, :], other=0.0)
-    if QCK > 0:
+    if QCK > 0 and TQ == 0:
         q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
@@ -971,7 +987,7 @@ def _paged_attn_decode_split_kernel(
 
         if QCK > 0:
             tok_rows = phys * page_size + page_off
-            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD)
+            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD, k_cb, TQ)
         else:
             k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
             if HD_PAD > head_dim:
@@ -1003,7 +1019,7 @@ def _paged_attn_decode_split_kernel(
 
         if QCV > 0:
             tok_rows_v = phys * page_size + page_off
-            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD)
+            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD, v_cb, TQ)
         else:
             v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
             if HD_PAD > head_dim:
@@ -1022,7 +1038,7 @@ def _paged_attn_decode_split_kernel(
             acc = acc * alpha_s[:, None]
             l = l * alpha_s + tl.exp(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-        if QCV > 0:
+        if QCV > 0 and TQ == 0:
             out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, HD_PAD)
         out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
         tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
@@ -1197,6 +1213,7 @@ def paged_attn_triton_decode(
     num_stages: int = 2,
     split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
     ring = None,                        # KVWIN: KVWinCtx; pool pass over [S, q-W], fp16 ring partial for the sinks + window
+    tq = None,                          # TurboQuant (cache.tq.TQState): q / ring already rotated, codes read through the codebook
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1218,12 +1235,12 @@ def paged_attn_triton_decode(
         _k = (tuple(q.shape), tuple(k_cache.shape), str(window_size), qc is not None, split_batch)
         if _k not in _ATTN16_SEEN:
             _ATTN16_SEEN.add(_k); print(" -- attn16 eager decode", _k, "new" if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0) else "old", flush = True)
-    if qc is not None and _QDEC_HIP and k is None:
+    if qc is not None and _QDEC_HIP and k is None and tq is None:
         out_hip = _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap,
                                    sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override, ring)
         if out_hip is not None:
             return out_hip
-    if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0):
+    if ATTN16 and tq is None and (qc is not None or _normalize_window(window_size)[0] >= 0):
         from .triton_paged_cu import paged_attn_triton_decode_cu, NoFittingConfig
         try:
             return paged_attn_triton_decode_cu(
@@ -1283,7 +1300,7 @@ def paged_attn_triton_decode(
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
-        h32 = _get_h32(q.device)
+        h32 = tq.eye32 if tq is not None else _get_h32(q.device)
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
@@ -1346,19 +1363,20 @@ def paged_attn_triton_decode(
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
             ns_total == 1, has_sinks, block_m, block_h, block_rows, block_n, key_lo,
+            *((tq.cbk, tq.cbv, 1) if tq is not None else ()),
             num_warps=num_warps, num_stages=num_stages,
         )
 
         if ring is not None:
             from .kvwin_triton import ring_split
             ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
-                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0, 1,
+                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0 and tq is None, 1,
                        block_m, block_h, block_rows)
 
         if ns_total > 1:
             _paged_attn_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, out, h32,
-                ns_total, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
+                ns_total, sinks, 0 if tq is not None else qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
                 block_m, block_h, block_rows,
                 num_warps=4, num_stages=1,
             )
@@ -1915,6 +1933,7 @@ def paged_attn_triton_prefill(
     v_new: torch.Tensor | None = None,
     v_dim: int | None = None,
     ring = None,                        # KVWIN: KVWinCtx; the staged scratch gets exact sinks / window / chunk rows
+    tq = None,                          # TurboQuant (cache.tq.TQState): always staged, the scratch is the rotated domain
 ) -> torch.Tensor:
     """Prefill (large q_len) attention over the paged cache.
 
@@ -2016,8 +2035,10 @@ def paged_attn_triton_prefill(
         # the allocator sees a handful of distinct sizes. Context-shaped workspaces are not
         # kept as statics: the old pool-sized static held a full fp16 copy of the cache
         # (1 GiB per 512k tokens on Qwen3.8) for the life of the process
-        if (_qc_staging == 1 and q_len >= (_qc_prefill_two_pass_min_q if ring is None else min(_qc_prefill_two_pass_min_q, 17))
-                and new_kv_mode == 0 and k is None and causal):
+        if tq is not None and not (new_kv_mode == 0 and k is None and causal):
+            raise ValueError("TurboQuant cache: prefill is causal, staged, without appended k/v only")
+        if (tq is not None or (_qc_staging == 1 and q_len >= (_qc_prefill_two_pass_min_q if ring is None else min(_qc_prefill_two_pass_min_q, 17))
+                and new_kv_mode == 0 and k is None and causal)):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
             if max_kv_len is not None:
@@ -2027,10 +2048,15 @@ def paged_attn_triton_prefill(
             pages_alloc = max(1, 1 << (bsz * npps_w - 1).bit_length())
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
-            ext.dequant_cache_paged_window(
-                k_cache, k_scales, kd, v_cache, v_scales, vd,
-                cache_seqlens, block_table, page_size, kv_append_len, 0.0,
-            )
+            if tq is not None:
+                from .tq_triton import tq_dequant_window
+                tq_dequant_window(k_cache, k_scales, tq.cbk, kd, cache_seqlens, block_table, page_size, kv_append_len, qck, n_kvh, head_dim)
+                tq_dequant_window(v_cache, v_scales, tq.cbv, vd, cache_seqlens, block_table, page_size, kv_append_len, qcv, n_kvh, head_dim)
+            else:
+                ext.dequant_cache_paged_window(
+                    k_cache, k_scales, kd, v_cache, v_scales, vd,
+                    cache_seqlens, block_table, page_size, kv_append_len, 0.0,
+                )
             if ring is not None:
                 from .kvwin_triton import stage_patch
                 stage_patch(ring, kd, vd, cache_seqlens, npps_w * page_size, q_len)
@@ -2488,6 +2514,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
         ring=args.ov,
+        tq=args.tq,
     )
 
 
@@ -2504,6 +2531,8 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     # Span chunks of any length expand into per-span reads over the packed cache (the decode
     # qc fn declines spans, so short span chunks land here too)
     if args.non_causal_spans:
+        if args.tq is not None:
+            raise NotImplementedError("TurboQuant KV cache with non-causal spans (VLM image chunks)")
         arglist = get_non_causal_span_arglist(args)
         return torch.cat([paged_attn_triton_prefill(**a) for a in arglist], dim=1)
 
@@ -2523,4 +2552,5 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
         ring=args.ov,
+        tq=args.tq,
     )
