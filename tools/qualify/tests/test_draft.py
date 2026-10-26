@@ -116,6 +116,9 @@ class LaneTests(unittest.TestCase):
             ctxs = {"1": 65536, "3": 49152}
             d = {"draft": dict(policy="dflash", dflash_dir="/d"), "kv": dict(mode="quant", kvwin="4:128")}
             ln = report.lane(m, a, ctxs, [6, 6], d)
+            self.assertEqual((ln["sessions"], ln["ctx"]), (1, 65536))                   # 49152/3 = 16K < 24K share: ship one session
+            a = args(sessions=[1, 3], min_share=8192)
+            ln = report.lane(m, a, ctxs, [6, 6], d)
             self.assertEqual((ln["sessions"], ln["ctx"]), (3, 49152))
             self.assertIn("--dflash-dir /d", ln["cmd"]); self.assertIn("--kvwin 4:128", ln["cmd"]); self.assertIn("EXL3_PREFIX_DISK_DIR", ln["cmd"])
             h = report.hermes(a, ctxs)

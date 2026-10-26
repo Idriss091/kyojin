@@ -42,6 +42,7 @@ def parse(argv=None) -> dict:
     ap.add_argument("--drafter", help="DFlash drafter directory (default: <pack>/dflash, ~/models/drafters/*, else a HF search '<model stem> dflash')")
     ap.add_argument("--no-hf-drafter", action="store_true", help="never search / download a drafter from HF")
     ap.add_argument("--soak-s", type=float, default=360, help="seconds of mixed agent-shaped load per session count at the max-ctx result (soak stage); on any error -c steps down 8 %% and the soak reruns")
+    ap.add_argument("--min-share", type=int, default=24576, help="tokens one session must get for the shipped session count (default 24,576: Hermes' live preamble is 15-30K)")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
     ap.add_argument("--convert-from", help="BF16 checkpoint directory: convert it into --pack first when the pack is missing/incomplete (own-PID memory guard, resume, convert.log + chat template carried into the pack)")

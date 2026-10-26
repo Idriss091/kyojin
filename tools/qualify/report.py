@@ -44,12 +44,19 @@ LANE_ENV_CUDA = {"EXL3_CUDA_GRAPH": "1"}
 LANE_MAX_TOKENS = 32768        # lane recipe (rtx1/SERVE.md): a reply budget so a runaway think cannot hold a session forever
 
 
+MIN_SHARE = 24576      # tokens one Hermes session needs: the live preamble (SOUL + skills + toolsets) is 15-30K before any work (duel 25/10)
+
+
 def served_config(args: dict, ctxs: dict) -> tuple:
-    """(sessions, -c) of the lane: the largest requested session count that has a validated -c, else the best single-session one."""
-    for s in sorted((int(k) for k, v in ctxs.items() if v), reverse=True):
-        if s in args["sessions"]:
-            return s, ctxs[str(s)]
-    return None, None
+    """(sessions, -c) of the lane: the largest measured session count whose share of -c holds a Hermes session (--min-share), else a single session
+    at its max -c. Drill 0 picked this by hand (3 x 24K at -c 73,728, then 2 x ... after the OOMs)."""
+    share = args.get("min_share") or MIN_SHARE
+    ok = [(int(k), v) for k, v in ctxs.items() if v and int(k) in args["sessions"]]
+    for s, c in sorted(ok, reverse=True):
+        if c // s >= share:
+            return s, c
+    one = [(s, c) for s, c in ok if s == 1]
+    return one[0] if one else (None, None)
 
 
 def lane(meta: dict, args: dict, ctxs: dict, kv: list, d: dict) -> dict | None:
