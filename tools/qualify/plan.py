@@ -19,7 +19,8 @@ STAGE_TABLE = {
     "draft":   dict(job="draft",  needs=["meta", "kv"],             est=600,   gpu=True),
     "autotune": dict(job="autotune", needs=["meta", "draft"],       est=180,   gpu=True),
     "maxctx":  dict(job="maxctx", needs=["meta", "kv", "draft"],    est=1500,  gpu=True),
-    "serve":   dict(job="serve",  needs=["meta", "kv", "maxctx"],   est=1500,  gpu=True),
+    "soak":    dict(job="soak",   needs=["meta", "maxctx"],         est=900,   gpu=True),
+    "serve":   dict(job="serve",  needs=["meta", "kv", "maxctx", "soak"],   est=1500,  gpu=True),
     "smoke":   dict(job="serve",  needs=["serve"],                  est=900,   gpu=True),
     "report":  dict(job="cpu",    needs=["meta"],                   est=2,     gpu=False),
 }
@@ -39,7 +40,7 @@ class Stage:
 
 
 RELEVANT = {"fetch": ("ref",), "meta": (), "draft": ("drafter", "no_hf_drafter"), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits", "kv_modes", "kvmode_steps"), "maxctx": ("sessions", "ctx_cap"),
-            "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
+            "soak": ("sessions", "soak_s"), "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
 
 
 def fingerprint(stage: str, meta: dict, args: dict) -> str:

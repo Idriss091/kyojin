@@ -15,8 +15,10 @@ def assemble(meta: dict, args: dict, stages: dict, repo: Path) -> dict:
     """stages: name -> {status, wall_s, data}. Builds the qualify.json document."""
     d = {n: s.get("data") for n, s in stages.items() if s.get("status") == "done"}
     ctxs = {k: v for k, v in (d.get("maxctx") or {}).items() if k.isdigit()}
+    ctxs.update({k: v for k, v in ((d.get("soak") or {}).get("ctx") or {}).items()})     # the soak-validated value replaces the search result
     sv = d.get("serve") or {}
     sm = d.get("smoke")
+    dr = d.get("draft") or {}
     q = dict(autotune=d.get("autotune"), parity=d.get("parity"), kv=d.get("kv"), maxctx=ctxs or None, serve=sv or None, smoke=sm)
     kv = (d.get("kv") or {}).get("chosen") or [6, 6]
     try:
@@ -27,14 +29,52 @@ def assemble(meta: dict, args: dict, stages: dict, repo: Path) -> dict:
         schema=SCHEMA, at=time.strftime("%F %T"), git=git, backend=args["backend"],
         pack={k: meta[k] for k in ("name", "arch", "family", "layers", "kv_layers", "kv_heads", "head_dim", "quant", "bpw", "head_bits", "index_sha", "license", "mtp_layers", "vision")},
         stages={n: dict(status=s.get("status"), wall_s=s.get("wall_s")) for n, s in stages.items()},
-        serve=dict(cmd=(d.get("serve") or {}).get("cmd") or (d.get("smoke") or {}).get("cmd"), kv=kv, ctx=ctxs, draft_policy=meta.get("draft_policy"),
-                   template=meta["template"]),
+        serve=dict(cmd=(d.get("serve") or {}).get("cmd") or (d.get("smoke") or {}).get("cmd"), kv=kv, ctx=ctxs, draft_policy=dr.get("policy") or meta.get("draft_policy"),
+                   dflash_dir=dr.get("dflash_dir"), template=meta["template"], lane=lane(meta, args, ctxs, kv, d), hermes=hermes(args, ctxs)),
+        draft=dr or None, soak=d.get("soak"),
         tuning={k: (d.get("autotune") or {}).get(k) for k in ("tuning_dir", "files", "records", "plan_points", "wall_s")} if d.get("autotune") else None,
         quality=dict(parity=d.get("parity"), kv=d.get("kv")),
         speed={k: sv.get(k) for k in ("decode_tps_median", "prefill_8k_tps", "curve", "agg")} if sv else None,
         sha=sv.get("sha"), smoke=sm,
         verdict={**rules.verdict(q, args.get("gates")), "pass": rules.verdict(q, args.get("gates"))["pass_"]},
     )
+
+
+LANE_ENV_CUDA = {"EXL3_CUDA_GRAPH": "1"}
+LANE_MAX_TOKENS = 32768        # lane recipe (rtx1/SERVE.md): a reply budget so a runaway think cannot hold a session forever
+
+
+def served_config(args: dict, ctxs: dict) -> tuple:
+    """(sessions, -c) of the lane: the largest requested session count that has a validated -c, else the best single-session one."""
+    for s in sorted((int(k) for k, v in ctxs.items() if v), reverse=True):
+        if s in args["sessions"]:
+            return s, ctxs[str(s)]
+    return None, None
+
+
+def lane(meta: dict, args: dict, ctxs: dict, kv: list, d: dict) -> dict | None:
+    """The command to ship, with the lane-level choices that are not measured per pack (prefix disk, CUDA graphs, reply budget)."""
+    sess, ctx = served_config(args, ctxs)
+    if not ctx:
+        return None
+    import pack as packmod
+    dr = d.get("draft") or {}
+    kvd = d.get("kv") or {}
+    argv = packmod.serve_flags(meta, port=8000, ctx=ctx, sessions=sess, k_bits=kv[0], v_bits=kv[1], draft=dr.get("policy"), dflash_dir=dr.get("dflash_dir"),
+                               kv_mode=kvd.get("mode", "quant"), kvwin=kvd.get("kvwin")) + ["--default-max-tokens", str(LANE_MAX_TOKENS)]
+    env = {**(LANE_ENV_CUDA if args["backend"] == "cuda" else {}), "EXL3_PREFIX_DISK_DIR": f"~/cache/prefix-{meta['name']}"}
+    return dict(sessions=sess, ctx=ctx, env=env, argv=argv,
+                cmd="env " + " ".join(f"{k}={v}" for k, v in env.items()) + " python -u " + " ".join(argv))
+
+
+def hermes(args: dict, ctxs: dict) -> dict | None:
+    """Hermes provider block for the lane (drill 0: context_length = the lane's real -c, auto-compaction BEFORE the server limit)."""
+    sess, ctx = served_config(args, ctxs)
+    if not ctx:
+        return None
+    share = ctx // sess
+    return dict(model_context_length=ctx, per_session_share=share, compression_threshold=round(min(0.9, 0.8 / sess), 2),
+                note="model.context_length = -c; compression.threshold = 0.8 of one session's share of -c (0.9 max); aux models stay on cloud")
 
 
 def fmt(x, nd=3):
@@ -65,8 +105,16 @@ def render_md(j: dict) -> str:
             L += ["", f"KV format (decode-faithful 32K, KL vs k8v8; Q6 rule: kw6 if KL <= 0.9 x k6v6, tq opt-in): **{kv.get('mode', 'quant')}{' + ring ' + kv['kvwin'] if kv.get('kvwin') else ''}**",
                   "| format | KL vs k8v8 | top-1 vs k8v8 | bits/value | decode s/tok |", "|---|---|---|---|---|"]
             L += [f"| {n} | {x['kl_vs_k8']:.5f} | {x['top1_vs_k8']:.4f} | {x['bits_per_val']:.2f} | {fmt(x.get('decode_s_per_tok'), 4)} |" for n, x in kv["modes"].items()]
+    dr = j.get("draft")
+    if dr:
+        L += ["", f"## Draft path: **{dr['policy']}**" + (f" ({dr['dflash_dir']})" if dr.get("dflash_dir") else ""), f"{dr.get('reason')}" + (f"; speedup drafted/plain {dr['speedup']} (ABBA, warm-up dropped)" if dr.get("speedup") else "")]
+        if dr.get("notes"):
+            L += ["rejected candidates: " + " | ".join(dr["notes"])]
     if j["serve"]["ctx"]:
         L += ["", "## Max context (k%dv%d, no OOM on 2 distinct near-full prompts)" % tuple(j["serve"]["kv"]), "| sessions | max -c |", "|---|---|"] + [f"| {s} | {c} |" for s, c in j["serve"]["ctx"].items()]
+    sk = j.get("soak")
+    if sk:
+        L += ["", "## Soak (mixed agent-shaped load at the max-ctx result; -c steps down 8 % on any error)"] + [f"- {k}: {v}" for k, v in sk["runs"].items()]
     sp = j["speed"]
     if sp:
         L += ["", f"## Speed: decode {fmt(sp['decode_tps_median'],1)} tok/s, prefill 8K {fmt(sp['prefill_8k_tps'],0)} tok/s", "", "| prompt tok | ttft s | prefill tok/s | decode tok/s |", "|---|---|---|---|"]
@@ -76,7 +124,13 @@ def render_md(j: dict) -> str:
         L += ["", "Greedy sha: " + ", ".join(x["sha"] for x in j["sha"])]
     if j["smoke"]:
         L += ["", f"## Hermes smoke ({j['smoke']['kind']}): {j['smoke']['passed']}/{j['smoke']['total']} passed"]
-    L += ["", "## Serve command (no hand flags)", "`" + " ".join(j["serve"]["cmd"] or []) + "`"]
+    ln = j["serve"].get("lane")
+    if ln:
+        L += ["", f"## Ship this (sessions {ln['sessions']}, -c {ln['ctx']}, kv k{j['serve']['kv'][0]}v{j['serve']['kv'][1]}, draft {j['serve']['draft_policy']})", "```", ln["cmd"], "```"]
+    h = j["serve"].get("hermes")
+    if h:
+        L += ["", f"Hermes: `model.context_length: {h['model_context_length']}`, `compression.threshold: {h['compression_threshold']}` ({h['note']})"]
+    L += ["", "## Serve command as measured (qualify)", "`" + " ".join(j["serve"]["cmd"] or []) + "`"]
     return "\n".join(L) + "\n"
 
 

@@ -107,5 +107,21 @@ class PlanOrderTests(unittest.TestCase):
             self.assertNotIn("--dflash-dir", packmod.serve_flags(m, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
 
 
+class LaneTests(unittest.TestCase):
+    def test_lane_command_and_hermes_block_come_from_the_measured_config(self):
+        import report
+        with tempfile.TemporaryDirectory() as t:
+            m = packmod.read_pack(fake_pack(Path(t)))
+            a = args(sessions=[1, 3])
+            ctxs = {"1": 65536, "3": 49152}
+            d = {"draft": dict(policy="dflash", dflash_dir="/d"), "kv": dict(mode="quant", kvwin="4:128")}
+            ln = report.lane(m, a, ctxs, [6, 6], d)
+            self.assertEqual((ln["sessions"], ln["ctx"]), (3, 49152))
+            self.assertIn("--dflash-dir /d", ln["cmd"]); self.assertIn("--kvwin 4:128", ln["cmd"]); self.assertIn("EXL3_PREFIX_DISK_DIR", ln["cmd"])
+            h = report.hermes(a, ctxs)
+            self.assertEqual((h["model_context_length"], h["per_session_share"], h["compression_threshold"]), (49152, 16384, 0.27))
+            self.assertIsNone(report.lane(m, a, {"1": None}, [6, 6], {}))
+
+
 if __name__ == "__main__":
     unittest.main()

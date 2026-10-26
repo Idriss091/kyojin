@@ -397,10 +397,54 @@ def job_maxctx(c: Ctx) -> dict:
     return out
 
 
+def served_ctx(c: Ctx) -> dict:
+    """{sessions: -c} the lanes get: the soak-validated value where the soak ran, else the max-ctx search result."""
+    mc = {k: v for k, v in (c.data.get("maxctx") or {}).items() if k.isdigit()}
+    mc.update({k: v for k, v in ((c.data.get("soak") or {}).get("ctx") or {}).items() if v})
+    return mc
+
+
+def gpu_used_mib(c: Ctx):
+    f = backends.gpu_free_mib(c.args["backend"])
+    return None if f is None else round(f, 0)
+
+
+def job_soak(c: Ctx) -> dict:
+    """Mixed-load validation of each max-ctx result (drill 0 gap: synthetic probes passed, real agent load OOMed hours later). Per session count:
+    serve at the search result, run `--soak-s` seconds of load.Client.soak; any error or OOM line -> -c x 0.92 (rounded to 2048), up to 4 steps."""
+    c.need_ram()
+    out = dict(ctx={}, runs={})
+    mc = {k: v for k, v in (c.data.get("maxctx") or {}).items() if k.isdigit() and v}
+    with c.locks():
+        for s_ in c.args["sessions"]:
+            ctx = mc.get(str(s_))
+            if not ctx:
+                continue
+            for attempt in range(4):
+                log = c.out / f"srv_soak_s{s_}_c{ctx}.log"
+                with running_server(c.prof, c.repo, start_args(c, ctx, s_), c.args["port"], log, logf=c.log) as (p, ok):
+                    if not ok:
+                        r = dict(ok=False, why="no start")
+                    else:
+                        cl = load.Client(c.args["port"], "qual"); cl.calibrate()
+                        r = cl.soak(s_, ctx, c.args["soak_s"], vram=lambda: gpu_used_mib(c))
+                        r["ok"] = not r["n_errors"] and not oom_in(log) and r["requests"] > 0
+                        r["oom_log"] = oom_in(log)
+                out["runs"][f"s{s_}_c{ctx}"] = {k: v for k, v in r.items() if k != "vram_curve"} | dict(free_mib_min=min((x for x in r.get("vram_curve", []) if x is not None), default=None))
+                c.log(f"soak sessions={s_} -c {ctx}: {'ok' if r['ok'] else 'FAILED'} {out['runs'][f's{s_}_c{ctx}']}")
+                if r["ok"]:
+                    out["ctx"][str(s_)] = ctx
+                    break
+                ctx = int(ctx * 0.92) // 2048 * 2048
+            else:
+                out["ctx"][str(s_)] = None
+    return out
+
+
 # ---------------------------------------------------------------- serve + smoke (one server load)
 def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
     c.need_ram()
-    mc = c.data.get("maxctx") or {}
+    mc = served_ctx(c)
     sess = max(c.args["sessions"])
     ctx = mc.get(str(sess)) or max((v for k, v in mc.items() if k.isdigit() and v), default=None)
     if not ctx:

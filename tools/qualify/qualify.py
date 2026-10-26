@@ -40,6 +40,7 @@ def parse(argv=None) -> dict:
     ap.add_argument("--kvmode-steps", type=int, default=256, help="teacher-forced decode steps scored by the KV format auto-select")
     ap.add_argument("--drafter", help="DFlash drafter directory (default: <pack>/dflash, ~/models/drafters/*, else a HF search '<model stem> dflash')")
     ap.add_argument("--no-hf-drafter", action="store_true", help="never search / download a drafter from HF")
+    ap.add_argument("--soak-s", type=float, default=360, help="seconds of mixed agent-shaped load per session count at the max-ctx result (soak stage); on any error -c steps down 8 %% and the soak reruns")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
     ap.add_argument("--hf", help="HF repo to download into --pack first (license/size/disk-floor checked)")
@@ -101,7 +102,7 @@ def main(argv=None) -> int:
             runner = lambda: _split_serve(c, "serve" in names, "smoke" in names)
         else:
             runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "draft": lambda: st.job_draft(c), "parity": lambda: st.job_parity(c),
-                      "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "report": None}[s.name]
+                      "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "soak": lambda: st.job_soak(c), "report": None}[s.name]
         if s.name == "report":
             continue
         t0 = time.time(); log(f"stage {s.name} start")

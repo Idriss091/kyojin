@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import threading
 import time
 import urllib.request
@@ -107,6 +108,38 @@ class Client:
         span = (max(r["end"] for r in ok) - min(r["first"] for r in ok)) if ok else 0
         return dict(n=n, ptok=[r["ptok"] for r in res], ttft=[r["ttft"] for r in res], dec_tps=[r["dec_tps"] for r in res],
                     agg_dec_tps=round(sum(r["ntok"] - 1 for r in ok) / span, 1) if span > 0 else None, errors=[r["err"] for r in res if r["err"]])
+
+    def soak(self, sessions: int, ctx: int, seconds: float, seed: int = 7, vram=None) -> dict:
+        """Agent-shaped load against a running server: `sessions` workers loop for `seconds` over a mixed prompt-length distribution
+        (70 % short 200-3K, 25 % medium up to half a share, 5 % a near-full share), short replies, so every size follows every other.
+        Drill 0: the synthetic near-full probes passed, the real agent mix OOMed 1-3 h later (duel: Nanbeige -c 73,728 x3 -> 61,440 x2 -> 57,344)."""
+        share = max(1024, ctx // sessions - 512)
+        rng = random.Random(seed)
+        lock = threading.Lock()
+        res, curve = [], []
+        end = time.time() + seconds
+
+        def pick():
+            with lock:
+                u = rng.random()
+                if u < 0.70:
+                    return rng.randint(200, min(3000, share))
+                if u < 0.95:
+                    return rng.randint(min(3000, share), max(3000, share // 2))
+                return int(share * 0.95)
+
+        def worker(i):
+            while time.time() < end:
+                n = pick()
+                r = self.stream(self.prompt(n, 10 + i), 48)
+                with lock:
+                    res.append(dict(want=n, ptok=r["ptok"], err=r["err"], ttft=r["ttft"]))
+                    if vram and len(res) % 5 == 0:
+                        curve.append(vram())
+        th = [threading.Thread(target=worker, args=(i,)) for i in range(sessions)]
+        [t.start() for t in th]; [t.join() for t in th]
+        errs = [r["err"] for r in res if r["err"]]
+        return dict(requests=len(res), errors=errs[:3], n_errors=len(errs), ptok_max=max((r["ptok"] or 0) for r in res), vram_curve=curve, seconds=seconds)
 
     def sha_set(self) -> list:
         return [{k: r[k] for k in ("sha", "ntok", "dec_tps", "err")} for r in (self.stream(p, 256) for p in FR)]
