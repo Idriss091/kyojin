@@ -62,3 +62,22 @@ CPU only: `tests/test_vendor_input_cpu.py` (codebooks against torch and ml_dtype
 tensor names, bit-exact vs a float64 numpy reference and a numpy encoder round trip), `tests/test_linear_vendor_load_cpu.py` (the
 `Linear` loader on the same synthetic checkpoints, fp16 bit equality), `tests/bigconv/test_formats.py`. Mac: `tests/test_vendor_src.py`
 and `tests/test_conv_vendor_e2e.py` (tiny MoE converted from a vendor source gives the same pack as from its own float16 dequant).
+
+## Real tiny public checkpoints (26/10, all < 1.6 GB, header + dequant + 2-layer converter smoke)
+
+Reader error against the BF16 original (`Qwen/Qwen3-0.6B`), mean relative L2 over 24 linears of layers 0, 1, 13, 27; a control with the nibble order swapped gives 1.41 (garbage), so order, scale polarity and global-scale convention are checked on real data.
+Smoke: layers 0-1 of the source and of its own float16 dequant ("twin") converted with `convert.py -b 4.0 -hb 6 -cr 16 -cc 512` on the Strix iGPU; the two packs are compared tensor by tensor, then KL(twin float16 || EXL3 pack) on 8 x 512 tokens of repo text.
+
+| format | checkpoint (license) | rel. error vs BF16 | converted packs, source vs twin | KL (twin, pack) |
+|---|---|---|---|---|
+| BF16 | `Qwen/Qwen3-0.6B` (Apache-2.0) | reference | not run (unchanged path) | - |
+| FP8 block 128, BF16 scale_inv | `Qwen/Qwen3-0.6B-FP8` (Apache-2.0) | 0.0266 | 70 / 70 tensors byte-identical | 0.0395 |
+| NVFP4 compressed-tensors | `kaitchup/Qwen3-0.6B-NVFP4` (Apache-2.0) | 0.0949 | byte-identical | 0.0390 |
+| NVFP4 ModelOpt | `NVFP4/Qwen3-0.6B-FP4` (Apache-2.0) | 0.0949 | byte-identical | 0.0384 |
+| MXFP4 (`weight_packed` + U8 scale, AutoRound) | `LeaderboardModel1/Qwen3-0.6B-AutoRound-MXFP4-RTN` (no license tag; Qwen3 derivative) | 0.0585 | byte-identical | 0.0357 |
+| MXFP4 gpt-oss blocks | `tiny-random/gpt-oss-mxfp4` (no license tag, random weights, 13 MB) | n/a (random) | not converted (dims < 128) | reader equals the in-repo torch reader after the fp16 cast |
+
+KL is the 4 bpw / 2-layer quantization noise and is identical for source and twin by construction of the byte-identical packs. Real flagship
+layouts were also classified header-only (Qwen3.8-27B-FP8, Qwen3.8-Flash-Next-FP8, MiniMax-M3-MXFP8 / NVFP4 / Quark MXFP4,
+DeepSeek-V4.1-Flash, gpt-oss-20b, nvidia Qwen3.8-Flash-Next-NVFP4, RedHatAI Qwen3-32B-NVFP4): see `scan_hf` output in `fleet/convin.log`.
+The real-checkpoint runs found two loader bugs the synthetic tests had missed (fixed with tests): U8 E8M0 `weight_scale_inv` (MXFP8) and the `weight_packed` name for MXFP4.
