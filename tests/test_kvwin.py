@@ -505,13 +505,27 @@ def test_ring_inert_when_off_or_unsupported(monkeypatch):
 ])
 def test_default_on_for_q5_and_below(monkeypatch, env, bits, expect):
     """Optimized Q4: unset switch = 4:128 when k or v bits <= 5, off (no ring, today's paths) at >= 6; explicit values win."""
-    from exllamav3.cache import Cache
+    from exllamav3.cache import Cache, kvwin
+    monkeypatch.setattr(kvwin, "default_platform", lambda: True)
     if env is None: monkeypatch.delenv("EXL3_KVWIN", raising = False)
     else: monkeypatch.setenv("EXL3_KVWIN", env)
     model = _FakeModel()
     Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = bits[0], v_bits = bits[1])
     st = model.attn.recurrent_layers[0]
     assert st.cfg == (parse_spec(expect) if expect else None)
+
+
+@pytest.mark.parametrize("env, hip, expect", [(None, False, None), (None, True, "4:128"), ("4:128", False, "4:128"), ("0", True, None)])
+def test_default_is_rocm_only_until_cuda_is_cleared(monkeypatch, env, hip, expect):
+    """CUDA keeps the window off by default (DEFAULT_ON_CUDA = False); an explicit EXL3_KVWIN forces it on any backend."""
+    from exllamav3.cache import Cache, kvwin
+    monkeypatch.setattr(kvwin, "DEFAULT_ON_CUDA", False)
+    monkeypatch.setattr(kvwin.torch.version, "hip", "7.0" if hip else None)
+    if env is None: monkeypatch.delenv("EXL3_KVWIN", raising = False)
+    else: monkeypatch.setenv("EXL3_KVWIN", env)
+    model = _FakeModel()
+    Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = 4, v_bits = 4)
+    assert model.attn.recurrent_layers[0].cfg == (parse_spec(expect) if expect else None)
 
 
 @pytest.mark.parametrize("env, capable", [(None, True), ("4:128", True), ("2:64", True), ("0", False), ("off", False), ("", False)])

@@ -14,7 +14,7 @@ as "cold": the ring is rebuilt from the dequantized pool the first time the job 
 
 "Optimized Q4": with EXL3_KVWIN unset the window (4:128) is ON for CacheLayer_quant layers whose k or v bits are <= 5
 (models that have recurrent state slots) and OFF at >= 6, where every code path is bit-identical to a build without this
-file. EXL3_KVWIN=S:W forces a window at any bit width; EXL3_KVWIN=0 / off turns it off.
+file. The default applies on ROCm only for now (DEFAULT_ON_CUDA). EXL3_KVWIN=S:W forces a window at any bit width; EXL3_KVWIN=0 / off turns it off.
 """
 from __future__ import annotations
 import os
@@ -52,6 +52,11 @@ def parse_spec(spec: str | None) -> KVWinCfg | None:
 
 DEFAULT_SPEC = "4:128"
 DEFAULT_MAX_BITS = 5    # unset switch: the window is on when k_bits or v_bits <= this
+DEFAULT_ON_CUDA = False  # the unset-switch default applies on ROCm only until the CUDA served A/B clears it (EXL3_KVWIN=S:W still forces it)
+
+
+def default_platform() -> bool:
+    return DEFAULT_ON_CUDA or bool(torch.version.hip)
 
 
 def env_capable() -> bool:
@@ -65,7 +70,7 @@ def env_cfg(k_bits: int | None = None, v_bits: int | None = None) -> KVWinCfg | 
     """The EXL3_KVWIN switch; unset means DEFAULT_SPEC for a cache with k or v bits <= DEFAULT_MAX_BITS."""
     spec = os.environ.get("EXL3_KVWIN")
     if spec is None:
-        if k_bits is None or v_bits is None or min(k_bits, v_bits) > DEFAULT_MAX_BITS:
+        if k_bits is None or v_bits is None or min(k_bits, v_bits) > DEFAULT_MAX_BITS or not default_platform():
             return None
         spec = DEFAULT_SPEC
     return parse_spec(spec)
