@@ -107,7 +107,7 @@ class Model_LSMixin(ABC):
                     "batch_shape": (1, max_chunk_size),
                 })
                 prepare_for_attn(torch.zeros((1, max_chunk_size), dtype = torch.long), params)
-                rl = [m for m in self if m.caps.get("recurrent_cache")]
+                rl = self.get_recurrent_layers()   # not the raw caps: a KVWIN ring declared by a model without recurrent state slots does not count
                 if rl:
                     prepare_for_recurrence(None, params, self)
 
