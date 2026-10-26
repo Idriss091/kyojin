@@ -977,6 +977,9 @@ class Job:
                 rw = self.recurrent_state.position - target
                 if rw <= self.recurrent_state.rollback_capacity():
                     self.recurrent_state.rewind(rw)
+                elif self.generator.ring_states:
+                    self.recurrent_state.free()
+                    self.recurrent_state = self._cold_ring_state(target)   # the K/V pool is complete: only the ring is rebuilt
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.recurrent_state.free()
@@ -1824,6 +1827,8 @@ class Job:
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+            elif self.generator.ring_states:
+                self.recurrent_state = self._cold_ring_state(cached_pages * PAGE_SIZE)
 
             # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
             # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
@@ -2248,6 +2253,14 @@ class Job:
             "page": seq.allocated_pages[p0], "draft_ok": not self.mtp_defer,
         })
         return 1
+
+
+    def _cold_ring_state(self, position: int):
+        """Ring-only job state at `position`; its rings are rebuilt from the quantized pool at the first attention."""
+        cache = self.generator.cache
+        if position == 0:
+            return cache.get_new_state()
+        return cache.new_from_stashed({"position": position}, position)
 
 
     def find_recurrent_stash(self, target_pos: int):

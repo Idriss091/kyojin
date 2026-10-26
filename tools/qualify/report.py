@@ -61,6 +61,10 @@ def render_md(j: dict) -> str:
     if kv:
         L += ["", f"## KV (chosen k{kv['chosen'][0]}v{kv['chosen'][1]}; {kv['rule']}, kl_max {kv['kl_max']})", "| bits | KL vs ref | top-1 vs ref | KL vs k8v8 |", "|---|---|---|---|"]
         L += [f"| k{b}v{b} | {x['kl_ref']:.4f} | {x['top1_ref']:.4f} | {fmt(x.get('kl_vs_k8'), 4)} |" for b, x in kv["table"].items()]
+        if kv.get("modes"):
+            L += ["", f"KV format (decode-faithful 32K, KL vs k8v8; Q6 rule: kw6 if KL <= 0.9 x k6v6, tq opt-in): **{kv.get('mode', 'quant')}{' + ring ' + kv['kvwin'] if kv.get('kvwin') else ''}**",
+                  "| format | KL vs k8v8 | top-1 vs k8v8 | bits/value | decode s/tok |", "|---|---|---|---|---|"]
+            L += [f"| {n} | {x['kl_vs_k8']:.5f} | {x['top1_vs_k8']:.4f} | {x['bits_per_val']:.2f} | {fmt(x.get('decode_s_per_tok'), 4)} |" for n, x in kv["modes"].items()]
     if j["serve"]["ctx"]:
         L += ["", "## Max context (k%dv%d, no OOM on 2 distinct near-full prompts)" % tuple(j["serve"]["kv"]), "| sessions | max -c |", "|---|---|"] + [f"| {s} | {c} |" for s, c in j["serve"]["ctx"].items()]
     sp = j["speed"]

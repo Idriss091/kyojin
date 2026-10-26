@@ -117,6 +117,7 @@ def attn_dispatch(
     # materialized as full fp16 cache-sized temporaries
     q_cache = None
     ov_attend = False
+    tq = None
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
@@ -129,6 +130,10 @@ def attn_dispatch(
             dim <= 512 and dim % 32 == 0 and   # packed groups of 32; non-pow2 dims run zero-padded
             cu_seqlens is None
         ):
+            tq = layer.get_tq() if getattr(layer, "tq", False) else None
+            if tq is not None:
+                # TurboQuant: the pool, the ring and the kernels live in the rotated domain (see cache/tq.py)
+                q, k, v = tq.rotate(q, k, v)
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
@@ -172,6 +177,7 @@ def attn_dispatch(
         max_kv_len = max_kv_len,
         v_dim = v_dim,
         ov = ov if q_cache is not None and ov_attend else None,
+        tq = tq,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
@@ -198,6 +204,8 @@ def attn_dispatch(
 
     if ov is not None and q_cache is not None and q_len > MAX_DRAFT:
         ov_write(ov, k, v, cache_seqlens, q_len)
+    if tq is not None:
+        o = tq.unrotate(o)
 
     # Update cache (quant-direct mode already wrote the new K/V before the attention call)
     if cache is not None and q_cache is None:

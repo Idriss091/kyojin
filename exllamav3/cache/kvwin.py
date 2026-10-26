@@ -138,6 +138,8 @@ class KVWinLayerState:
         from .quant import CacheLayer_quant
         from .qsa import QSAPlanes
         cfg = env_cfg(getattr(cache_layer, "k_bits", None), getattr(cache_layer, "v_bits", None))
+        if cfg is None and getattr(cache_layer, "tq", False) and os.environ.get("EXL3_KVWIN") is None:
+            cfg = parse_spec(DEFAULT_SPEC)      # the tq modes are the windowed ones (tq5w / tq6w) on every platform
         m = self.module
         if (cfg is None or not isinstance(cache_layer, CacheLayer_quant) or isinstance(cache_layer, QSAPlanes) or
                 cache_layer.compand_a != 0.0 or
@@ -267,12 +269,57 @@ class KVWinLayerState:
         dim = m.num_kv_heads * m.head_dim
         G = dim // 32
         rows = ring_rows(pos, cfg)
+        if getattr(cl, "tq", False):
+            for dst, x in zip((self.ov_k, self.ov_v), cl.read_rot(tok)):      # the ring holds rotated vectors
+                dst[slot].index_copy_(0, rows, x)
+            return
         for q, s, bits, dst in ((cl.qk, cl.sk, cl.k_bits, self.ov_k), (cl.qv, cl.sv, cl.v_bits, self.ov_v)):
             qr = q.reshape(-1, G * bits).index_select(0, tok).contiguous()
             sr = s.reshape(-1, G).index_select(0, tok).contiguous()
             out = torch.empty((pos.numel(), dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_cont(qr, sr, out, cl.compand_a)
             dst[slot].index_copy_(0, rows, out.view(-1, m.num_kv_heads, m.head_dim))
+
+
+class KVWinState:
+    """Job state of a model whose only recurrent layers are KVWIN rings (plain attention). No checkpoints: a job resumed
+    from cached pages (or rewound past MAX_DRAFT rows) gets a cold ring, rebuilt from the quantized pool."""
+
+    exported = False
+    guaranteed_rollback = MAX_DRAFT     # rows the positional ring can rewind in place
+
+    def __init__(self, cache, slot: int, position: int, clear: bool = True, stashed: dict = None, test_state: bool = False):
+        self.slot = slot
+        self.position = position
+        self.cache = cache
+        self.last_history = 0
+        layers = cache.get_all_recurrent_layers().values()
+        for l in layers:
+            if stashed is not None:
+                l.unstash_missing(slot)
+            elif clear:
+                l.clear(slot)
+        self.checkpoint_size = sum(l.get_checkpoint_size() for l in layers)
+
+    def free(self):
+        self.cache.release_state(self)
+
+    def rewind(self, num_tokens: int):
+        assert num_tokens <= self.rollback_capacity()
+        self.position -= num_tokens
+        self.last_history = 0
+
+    def rollback_capacity(self):
+        return min(self.position, MAX_DRAFT)
+
+    def post_advance(self):
+        pass
+
+    def tp_export(self):
+        raise NotImplementedError("EXL3_KVWIN does not support tensor parallel loading")
+
+    def reset(self):
+        self.position = 0
 
 
 def any_cold(params: dict) -> bool:

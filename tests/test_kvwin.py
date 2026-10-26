@@ -599,15 +599,46 @@ def test_ring_declines_qsa_caches(monkeypatch):
     assert st.cfg is None and getattr(cl, "kvwin", None) is None
 
 
-def test_models_without_recurrent_state_drop_ring_layers():
+def test_plain_attention_model_gets_a_ring_only_state():
     from exllamav3.model.model import Model
+    from exllamav3.cache.kvwin import KVWinState
     a = _FakeAttn()
-    other = types.SimpleNamespace(caps = {"recurrent_cache": True}, layer_state_cls = object)
-    fake = types.SimpleNamespace(recurrent_state_cls = None, __iter__ = None)
-    fake = type("M", (), {"recurrent_state_cls": None, "__iter__": lambda self: iter([a, other])})()
-    assert Model._get_recurrent_layers.func(fake) == [other]
-    fake2 = type("M", (), {"recurrent_state_cls": object, "__iter__": lambda self: iter([a, other])})()
-    assert Model._get_recurrent_layers.func(fake2) == [a, other]
+    plain = type("M", (), {"_recurrent_state_cls": None, "_get_recurrent_layers": [a]})()
+    assert Model.kvwin_ring_only(plain)
+    assert Model.recurrent_state_cls.fget(types.SimpleNamespace(_recurrent_state_cls = None, kvwin_ring_only = lambda: True)) is KVWinState
+    none = type("M", (), {"_recurrent_state_cls": None, "_get_recurrent_layers": []})()
+    assert not Model.kvwin_ring_only(none)
+    hybrid = type("M", (), {"_recurrent_state_cls": object, "_get_recurrent_layers": [a]})()
+    assert not Model.kvwin_ring_only(hybrid)
+
+
+def test_ring_only_state_lifecycle_cold_resume_and_rewind(monkeypatch):
+    from exllamav3.cache.kvwin import KVWinState, make_ctx, ensure_filled
+    cache, model, cl, st = _fake_cache(monkeypatch)
+    cache.recurrent_state_cls = KVWinState
+    state = cache.get_new_state()
+    assert isinstance(state, KVWinState) and not st.cold[state.slot]
+    k = torch.randn(1, 300, 2, 128, device = DEV).half(); v = torch.randn_like(k)
+    sl = torch.zeros(1, dtype = torch.int32, device = DEV)
+    bt = torch.tensor([[1, 4, 6, 0, 2, 3, 5, 7]], dtype = torch.int32, device = DEV)
+    cl.update_kv_direct(sl, bt[:, :5].contiguous(), k, v, 300)
+    ov_write(KVWinCtx(st, torch.tensor([state.slot], dtype = torch.int32, device = DEV)), k, v, sl, 300)
+    state.position = 300
+    state.rewind(3)
+    assert state.position == 297 and state.rollback_capacity() == kvwin.MAX_DRAFT
+    state.free()
+    # a job resumed from cached pages: cold ring, rebuilt from the pool at the first attention
+    state2 = cache.new_from_stashed({"position": 256}, 256)
+    assert state2.position == 256 and st.cold[state2.slot]
+    params = {"recurrent_states": [state2], "recurrent_slots": torch.tensor([state2.slot], dtype = torch.int32),
+              "cache_seqlens": torch.tensor([256], dtype = torch.int32)}
+    ctx = make_ctx(st, params, torch.device(DEV), 1)
+    ensure_filled(ctx, params, bt)
+    assert not st.cold[state2.slot] and st.ov_k[state2.slot].any()
+    # a new state clears its ring
+    state2.free()
+    state3 = cache.get_new_state()
+    assert not st.ov_k[state3.slot].any() and not st.cold[state3.slot]
 
 
 def test_attention_kvwin_ctx_entry(monkeypatch):

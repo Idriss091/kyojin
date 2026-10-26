@@ -49,6 +49,9 @@ typedef u32 v8u __attribute__((ext_vector_type(8)));
 #ifndef HAS_SINKS
 #define HAS_SINKS 0
 #endif
+#ifndef TQ
+#define TQ 0                          // TurboQuant cache (cache/tq.py): codebook-LUT dequant, ONE fp16 scale per head vector, rotation done outside
+#endif
 #ifndef KEY_LO
 #define KEY_LO 0                      // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
 #endif
@@ -98,6 +101,20 @@ template<int B> __device__ __forceinline__ u32 dequant2(u32 raw_m, u32 s2, u32 s
     return hfma2(hsub2(raw_m, c2<B>()), s2, s2h);
 }
 
+// TurboQuant: two raw values (fp16 pair 1024 + raw) -> half2 (codebook[raw] * scale); the codebook sits in LDS as fp16 bits
+#ifndef TQ_NOLUT
+#define TQ_NOLUT 0                    // experiment: uniform grid instead of the codebook (timing only, wrong values)
+#endif
+template<int B> __device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, const u16* cb)
+{
+#if TQ_NOLUT
+    return hmul2(hsub2(raw_m, c2<B>()), s2);
+#else
+    u32 lo = cb[raw_m & 0x3FFu], hi = cb[(raw_m >> 16) & 0x3FFu];
+    return hmul2(lo | (hi << 16), s2);
+#endif
+}
+
 // K group plane offsets (words)
 #define KO4 ((KB & 8) ? 8 : 0)
 #define KO2 (KO4 + ((KB & 4) ? 4 : 0))
@@ -135,9 +152,12 @@ qdec_split(
     const int* __restrict__ block_table, const int* __restrict__ cache_seqlens,
     float* __restrict__ partial_o, float* __restrict__ partial_ml,
     const u16* __restrict__ k_scales, const u16* __restrict__ v_scales, const u16* __restrict__ h32,
-    int split_len, int num_pages_per_seq, int num_splits)
+    int split_len, int num_pages_per_seq, int num_splits,
+    const u16* __restrict__ cbk, const u16* __restrict__ cbv)
 {
     extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ u16 cbk_s[TQ ? (1 << KB) : 1];
+    __shared__ u16 cbv_s[TQ ? (1 << VB) : 1];
     u16* Qs = (u16*) smem;
     unsigned char* scratch = smem + ((RP * QSTR * 2 + 15) / 16) * 16;
 
@@ -160,8 +180,20 @@ qdec_split(
         return;
     }
 
+    if (TQ) {
+        for (int i = tid; i < (1 << KB); i += NTHREADS) cbk_s[i] = cbk[i];
+        for (int i = tid; i < (1 << VB); i += NTHREADS) cbv_s[i] = cbv[i];
+    }
     // ---- q rows -> rotated (h32) fp16 in smem; rows >= ROWS are zero
-    {
+    if (TQ) {                                            // q arrives already rotated: plain copy
+        for (int idx = tid; idx < RP * HD; idx += NTHREADS) {
+            int r = idx / HD, d = idx % HD;
+            u16 x = 0;
+            if (r < ROWS) x = q[((size_t)((batch * QLEN + r / GROUP) * NQH + kvh * GROUP + r % GROUP)) * HD + d];
+            Qs[r * QSTR + d] = x;
+        }
+        __syncthreads();
+    } else {
         float* hs = (float*) scratch;                    // 32x32 fp32, the scratch buffer is idle until the loop
         for (int i = tid; i < 1024; i += NTHREADS) hs[i] = h2f(h32[i]);
         __syncthreads();
@@ -224,9 +256,15 @@ qdec_split(
             #pragma unroll
             for (int c = 0; c < KWW; c++) kw[c] = kp[c];
         }
-        const u16* sp = k_scales + row * GPT + kvh * G + dw * GWV;
-        #pragma unroll
-        for (int c = 0; c < GWV; c++) ksc[c] = sp[c];
+        if (TQ) {
+            u16 s1 = k_scales[row * NKV + kvh];
+            #pragma unroll
+            for (int c = 0; c < GWV; c++) ksc[c] = s1;
+        } else {
+            const u16* sp = k_scales + row * GPT + kvh * G + dw * GWV;
+            #pragma unroll
+            for (int c = 0; c < GWV; c++) ksc[c] = sp[c];
+        }
     };
 
     if (nslabs > sw) { slab_rows(0); load_k(); }
@@ -242,7 +280,7 @@ qdec_split(
             // ---- S (partial over this wave's k-steps) = Kdeq x q^T
             #pragma unroll
             for (int gl = 0; gl < GWV; gl++) {
-                u32 sc = scale2<KB>(ksc[gl]);
+                u32 sc = TQ ? ((u32) ksc[gl] * 0x10001u) : scale2<KB>(ksc[gl]);
                 u32 sch = hmul2(sc, 0x38003800u);        // 0x3800 = 0.5
                 #pragma unroll
                 for (int h = 0; h < 2; h++) {
@@ -250,7 +288,8 @@ qdec_split(
                     v8u a;
                     #pragma unroll
                     for (int i = 0; i < 8; i++)
-                        a[i] = dequant2<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, sch);
+                        a[i] = TQ ? dequant2_tq<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, cbk_s)
+                                  : dequant2<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, sch);
                     v16h af = __builtin_bit_cast(v16h, a);
                     #pragma unroll
                     for (int j = 0; j < NT; j++) {
@@ -347,7 +386,7 @@ qdec_split(
         for (int e = 0; e < 16; e++) {
             size_t row = (size_t) cur_row0 + min(e, cur_lim);
             load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
-            vsc[e] = scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
+            vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
         }
         // next slab's K (kw is dead now)
         if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
@@ -357,7 +396,8 @@ qdec_split(
             #pragma unroll
             for (int e = 0; e < 16; e++) {
                 u32 sh = hmul2(vsc[e], 0x38003800u);
-                dq[e] = dequant2<VB>(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], sh);
+                dq[e] = TQ ? dequant2_tq<VB>(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], cbv_s)
+                             : dequant2<VB>(raw_pair_m<VB>(vr[e], 2 * u, 0, RUN_W8, RUN_W8 + RUN_W4, RUN_W8 + RUN_W4 + RUN_W2), vsc[e], sh);
             }
             v8u b0, b1;
             #pragma unroll
@@ -462,7 +502,7 @@ qdec_combine(
     const int pid = blockIdx.x, r = blockIdx.y, d = threadIdx.x;
     const int batch = pid / NKV, kvh = pid % NKV;
     const int row_q = r / GROUP, hl = r % GROUP;
-    for (int i = d; i < 1024; i += HD) hs[i] = h2f(h32[i]);
+    if (!TQ) for (int i = d; i < 1024; i += HD) hs[i] = h2f(h32[i]);
 
     float M = NEG_INF;
     for (int s = 0; s < num_splits; s++) M = fmaxf(M, partial_ml[(((size_t) pid * num_splits + s) * RP + r) * 2]);
@@ -483,7 +523,10 @@ qdec_combine(
     __syncthreads();
     const int g = d >> 5, c = d & 31;
     float y = 0.f;
+    if (TQ) y = xs[d];                                   // the output is un-rotated outside
+    else {
     #pragma unroll
     for (int k = 0; k < 32; k++) y += xs[g * 32 + k] * hs[k * 32 + c];
+    }
     out[((size_t)((batch * QLEN + row_q) * NQH + kvh * GROUP + hl)) * HD + d] = __builtin_bit_cast(u16, (half_t) y);
 }

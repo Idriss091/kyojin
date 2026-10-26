@@ -715,7 +715,7 @@ class QwenEngine:
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
-                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = ""):
+                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = "", kv_mode: str = "quant"):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         import torch
@@ -769,6 +769,15 @@ class QwenEngine:
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=k_bits, v_bits=v_bits) if (k_bits and v_bits) else {}
         assert bool(k_bits) == bool(v_bits), "set both --k-bits and --v-bits (or --cache-bits)"
+        if kv_mode == "tq":
+            # TurboQuant KV pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink + window ring
+            from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+            hd = getattr(self.config, "head_dim", None)
+            assert k_bits in (4, 5, 6) and v_bits in (4, 5, 6), "--kv-mode tq needs --k-bits and --v-bits in 4..6"
+            if hd and tq_supported(hd, k_bits) and tq_supported(hd, v_bits):
+                qkw["layer_type"] = CacheLayer_tq
+            else:
+                print(f"qserve: --kv-mode tq: head_dim {hd} is not supported, keeping the quant cache", flush=True)
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
         self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
@@ -2248,12 +2257,24 @@ def load_all(args: argparse.Namespace):
     model_dir = str(Path(args.model).expanduser())
     template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
     defaults = load_defaults(model_dir, args)
+    kvp = Path(model_dir) / "kv_cache.json"      # lane preset written by tools/qualify (kv stage): used only when no KV flag is given
+    if kvp.is_file() and not (args.k_bits or args.v_bits or args.cache_bits or args.kv_mode):
+        try:
+            kvj = json.loads(kvp.read_text())
+            args.k_bits, args.v_bits, args.kv_mode = int(kvj["k_bits"]), int(kvj["v_bits"]), kvj.get("kv_mode", "quant")
+            args.kvwin = args.kvwin or kvj.get("kvwin")
+            print(f"qserve: KV cache from {kvp.name}: {args.kv_mode} k{args.k_bits}v{args.v_bits}" + (f" ring {args.kvwin}" if args.kvwin else ""), flush=True)
+        except (ValueError, KeyError, OSError) as e:
+            print(f"qserve: ignoring {kvp}: {e}", flush=True)
+    args.kv_mode = args.kv_mode or "quant"
+    if args.kvwin:
+        os.environ.setdefault("EXL3_KVWIN", args.kvwin)     # before the model is built: the attention modules declare the ring state from it
     t0 = time.time()
     print(f"qserve: starting, model={model_dir} ctx={args.ctx} sessions={args.sessions} draft_policy={args.draft_policy} "
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
                         cache_bits=args.cache_bits, sessions=args.sessions,
-                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()))
+                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode)
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2300,6 +2321,10 @@ def main() -> None:
                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
+    parser.add_argument("--kv-mode", choices=("quant", "tq"), default=None,
+                        help="KV cache format with --k-bits / --v-bits: quant = per-32 scale pages (default); tq = TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector, 4..6 bits) with the fp16 sink-4 + window-128 ring")
+    parser.add_argument("--kvwin", default=None, metavar="SINK:WINDOW",
+                        help="fp16 sink + window ring of the quantized cache (EXL3_KVWIN, e.g. 4:128; an EXL3_KVWIN already set wins); written by tools/qualify as the kw6 choice")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
