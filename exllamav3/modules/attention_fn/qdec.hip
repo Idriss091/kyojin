@@ -300,7 +300,24 @@ qdec_split(
         }
     };
 
+#if TQF
+    // TQF: the V runs of a slab are fetched together with its K (one slab ahead), so the V latency overlaps the previous slab's compute
+    const int dcol = dw * HDW + DTW * n;
+    const int gi_v = dcol >> 5, p0 = dcol & 31;
+    u32 vr[16][NRW > 0 ? NRW : 1];
+    u32 vsc[16];
+    auto load_v = [&]() {
+        #pragma unroll
+        for (int e = 0; e < 16; e++) {
+            size_t row = (size_t) row0 + min(e, lim);
+            load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
+            vsc[e] = (u32) v_scales[row * NKV + kvh] * 0x10001u;
+        }
+    };
+    if (nslabs > sw) { slab_rows(0); load_k(); load_v(); }
+#else
     if (nslabs > sw) { slab_rows(0); load_k(); }
+#endif
 
     for (int it = 0; it < iters; it++) {
         const bool active = (sw + it * NSW) < nslabs;
@@ -374,6 +391,10 @@ qdec_split(
             }
         }
         if (!active) continue;
+#if TQF
+        const bool more = it + 1 < iters && (sw + (it + 1) * NSW) < nslabs;
+        if (more) { slab_rows(it + 1); load_k(); }       // kw is dead once S is formed
+#endif
 
         // ---- online softmax (log2 domain); lane owns q row n of every tile and tokens 2r + half, r = 0..7
         const bool full = (n0 + 15 < n_end) && (n0 >= KEY_LO) && (!CAUSAL || (float)(n0 + 15) <= qmin);
@@ -427,19 +448,6 @@ qdec_split(
         }
 
         // ---- O += P x V ; lane n owns the d run d0 + DTW*n .. + DTW - 1 of each token
-        const int cur_row0 = row0, cur_lim = lim;
-        const int dcol = dw * HDW + DTW * n;
-        const int gi_v = dcol >> 5, p0 = dcol & 31;
-        u32 vr[16][NRW > 0 ? NRW : 1];
-        u32 vsc[16];
-        #pragma unroll
-        for (int e = 0; e < 16; e++) {
-            size_t row = (size_t) cur_row0 + min(e, cur_lim);
-            load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
-            vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
-        }
-        // next slab's K (kw is dead now)
-        if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
 #if TQF
         {
             u32 ze[16], zo[16], vsp[8];
@@ -447,6 +455,7 @@ qdec_split(
             for (int e = 0; e < 16; e++) zbuild<VB, 0>(vr[e][0], vr[e][1], ze[e], zo[e]);
             #pragma unroll
             for (int i = 0; i < 8; i++) vsp[i] = perm(vsc[2 * i + 1], vsc[2 * i], 0x05040100u);   // scales of tokens 2i, 2i + 1
+            if (more) load_v();                              // vr is dead: the next slab's V runs fly during the lookups below
             #pragma unroll
             for (int u = 0; u < DTW / 2; u++) {
                 v8u b0, b1;
@@ -467,6 +476,19 @@ qdec_split(
             }
         }
 #else
+        const int cur_row0 = row0, cur_lim = lim;
+        const int dcol = dw * HDW + DTW * n;
+        const int gi_v = dcol >> 5, p0 = dcol & 31;
+        u32 vr[16][NRW > 0 ? NRW : 1];
+        u32 vsc[16];
+        #pragma unroll
+        for (int e = 0; e < 16; e++) {
+            size_t row = (size_t) cur_row0 + min(e, cur_lim);
+            load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
+            vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
+        }
+        // next slab's K (kw is dead now)
+        if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
         #pragma unroll
         for (int u = 0; u < DTW / 2; u++) {
             u32 dq[16];
