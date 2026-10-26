@@ -709,18 +709,28 @@ _qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "25
 # EXL3_PF_FA2=0 restores the Triton kernel
 _pf_fa2 = os.environ.get("EXL3_PF_FA2", "1") == "1" and torch.version.hip is None
 
+# The chunk runs as sub-calls of this many query rows (each over the keys up to its own last row, same bottom-right causal
+# mask, so every row sees the same keys in the same order; whole 1024-row sub-calls match one call bit for bit, a short
+# remainder may take FA2's split-kv schedule and differ in the last bits). One FA2 call over a
+# 4096-row chunk with a long past reaches 73-78 TFLOPS on an RTX 3090, 1024-row sub-calls 92 (2048: 87, 512: 81, 256: 84).
+# 0 = one call
+_pf_fa2_rows = int(os.environ.get("EXL3_PF_FA2_ROWS", "1024"))
+
 def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     from torch.nn.attention import sdpa_kernel, SDPBackend
     from torch.nn.attention.bias import causal_lower_right
     q_len = q.shape[1]
     k1 = kd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
     v1 = vd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    step = _pf_fa2_rows if _pf_fa2_rows > 0 else q_len
     with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-        o = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k1.transpose(1, 2), v1.transpose(1, 2),
-            attn_mask = causal_lower_right(q_len, past + q_len), scale = scale, enable_gqa = True,
-        )
-    out.copy_(o.transpose(1, 2))
+        for s in range(0, q_len, step):
+            e = min(q_len, s + step)
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q[:, s:e].transpose(1, 2), k1[:, :past + e].transpose(1, 2), v1[:, :past + e].transpose(1, 2),
+                attn_mask = causal_lower_right(e - s, past + e), scale = scale, enable_gqa = True,
+            )
+            out[:, s:e].copy_(o.transpose(1, 2))
     return out
 
 def _get_h32(device):
