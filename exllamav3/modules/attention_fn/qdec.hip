@@ -142,8 +142,10 @@ __device__ __forceinline__ u32 zbyte(u32 z, int m) { return __builtin_amdgcn_ubf
 // half2 {cb[a0], cb[a1]} from two byte addresses of the u16 codebook
 __device__ __forceinline__ u32 lut2(const u16* cb, u32 a0, u32 a1)
 {
-    u16 lo = *(const u16*)((const char*) cb + a0), hi = *(const u16*)((const char*) cb + a1);
-    return (u32) lo | ((u32) hi << 16);
+    v2h r;
+    r.x = *(const half_t*)((const char*) cb + a0);
+    r.y = *(const half_t*)((const char*) cb + a1);
+    return __builtin_bit_cast(u32, r);
 }
 
 // K group plane offsets (words)
