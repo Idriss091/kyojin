@@ -76,7 +76,7 @@ def signature(device: int | None = None) -> dict:
     import torch
     d = torch.cuda.current_device() if device is None else device
     pr = torch.cuda.get_device_properties(d)
-    arch = getattr(pr, "gcnArchName", None)
+    arch = getattr(pr, "gcnArchName", None) if torch.version.hip else None      # CUDA builds expose the attribute too (device name)
     cc = arch.split(":")[0] if arch else f"sm{pr.major}{pr.minor}"
     slug = re.sub(r"[^a-z0-9]+", "-", pr.name.lower()).strip("-")
     return dict(name=pr.name, cc=cc, sms=pr.multi_processor_count, device_index=d,

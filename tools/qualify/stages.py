@@ -128,9 +128,9 @@ def job_autotune(c: Ctx) -> dict:
     if not recs:
         raise RuntimeError("autotune: the replay produced no tuning records (does this build have the GEMM autotuner?)")
     tdir.mkdir(exist_ok=True)
-    dense = scratch / "dense_gemm_tune.txt"
-    if dense.is_file() and dense.stat().st_size:
-        shutil.copy(dense, tdir / f"{sig['file']}.dense.txt")
+    dense_new = _new_dense_lines(scratch / "dense_gemm_tune.txt", Path(__file__).resolve().parents[2] / "exllamav3/model/dense_gemm_tune_seed.txt")
+    if dense_new:                                    # lines the shipped seed did not hold (serve start copies the seed into the scratch file)
+        (tdir / f"{sig['file']}.dense.txt").write_text("\n".join(dense_new) + "\n")
     tc.write_records(tdir / f"{sig['file']}.bin", recs)
     man = dict(schema=1, signature=sig, records=len(recs), records_at_load=at_load, load_s=round(load_s, 1), wall_s=round(time.time() - t0, 1),
                sessions=sessions, ctx=ctx, sweep=sweep, cmd=argv, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"))
@@ -138,6 +138,14 @@ def job_autotune(c: Ctx) -> dict:
     c.log(f"autotune: {len(recs)} records ({at_load} at load) -> {tdir / (sig['file'] + '.bin')}")
     return dict(tuning_dir=str(tdir), files=sorted(p.name for p in tdir.glob("*.bin")), records=len(recs), records_at_load=at_load,
                 plan_points=len(sweep), wall_s=man["wall_s"], sweep_failed=[s for s in sweep if not s["ok"]])
+
+
+def _new_dense_lines(tuned: Path, seed: Path) -> list:
+    key = lambda ln: tuple(ln.split()[:6])
+    have = {key(l) for l in seed.read_text().splitlines() if len(l.split()) == 7} if seed.is_file() else set()
+    if not tuned.is_file():
+        return []
+    return [l for l in tuned.read_text().splitlines() if len(l.split()) == 7 and key(l) not in have]
 
 
 def _git(repo) -> str | None:

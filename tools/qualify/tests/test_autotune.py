@@ -152,3 +152,14 @@ class TestPlan(unittest.TestCase):
         for be, want in (("cuda", "todo"), ("rocm", "todo"), ("mlx", "skip")):
             st = {s.name: s for s in planmod.build_plan(meta, dict(backend=be, sessions=[1]), {})}
             self.assertEqual(st["autotune"].status, want, be)
+
+
+class TestDenseNew(unittest.TestCase):
+    def test_only_lines_beyond_the_seed(self):
+        import stages
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "seed.txt").write_text("a 1 2 3 4 5 9\n")
+            (d / "t.txt").write_text("a 1 2 3 4 5 9\nb 1 2 3 4 5 8\n")
+            self.assertEqual(stages._new_dense_lines(d / "t.txt", d / "seed.txt"), ["b 1 2 3 4 5 8"])
+            self.assertEqual(stages._new_dense_lines(d / "none.txt", d / "seed.txt"), [])
