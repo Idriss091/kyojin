@@ -411,7 +411,7 @@ class Generator:
         if v is None:
             from ..modules.block_sparse_mlp import BlockSparseMLP
             from ..modules.sliding_attn import SlidingAttention
-            swa_only = all(isinstance(m, SlidingAttention) for m in self.model.get_recurrent_layers())
+            swa_only = all(isinstance(m, SlidingAttention) for m in self.model.get_checkpoint_layers())
             moe = not torch.version.hip and any(
                 isinstance(m, BlockSparseMLP) and getattr(m, "fused_mode_buffers", None) is not None
                 for m in self.model

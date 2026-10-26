@@ -328,6 +328,53 @@ def test_stash_restore_bitwise():
     assert ok, (err, mx)
 
 
+def test_stash_async_matches_sync():
+    """GDNState.stash(async_) needs every layer state to stash without a host sync: the ring's pinned D2H (pool reuse included)
+    reads the same bytes as the blocking stash, and the recurrent cache's finisher turns it into pageable clones."""
+    from exllamav3.cache.recurrent import RecurrentCache
+    rig = Rig(CFGS[0], slots = (1, 2), seed = 11)
+    rig.append(0, 450)
+    sync = rig.st.stash(1)
+    pool = {}
+    a = rig.st.stash_async(1, pool)
+    snap = rig.st.snapshot(1)
+    rig.st.ov_k[1].zero_()                                   # the live ring moves on after the snapshot
+    b = rig.st.stash_from_snapshot(snap, pool)
+    ev = torch.cuda.Event(); ev.record(); ev.synchronize()
+    for x in (a, b):
+        assert all(t.is_pinned() for t in x)
+        assert torch.equal(x[0], sync[0]) and torch.equal(x[1], sync[1])
+    rc = RecurrentCache.__new__(RecurrentCache)
+    rc._pin_pool = pool
+    st = {"k": a, "_ev": ev}
+    RecurrentCache._finish(rc, st)
+    assert not st["k"][0].is_pinned() and torch.equal(st["k"][0], sync[0])
+    assert len(pool[(tuple(sync[0].shape), sync[0].dtype)]) == 1       # the pinned buffers went back to the pool
+    assert rig.st.stash_async(1) is not None and KVWinLayerState(rig.st.module, 2, 0, 0).stash_async(0) is None   # inert: nothing to copy
+
+
+def test_ring_layers_do_not_change_path_eligibility(monkeypatch):
+    """A declared ring puts attention modules into get_recurrent_layers(); the checkpoint-cadence checks (GDN no-tail
+    mid-chunk checkpoints, big tail, wide prefill chunks) must see the GDN layers alone, as without the ring."""
+    from exllamav3.model.model import Model
+    from exllamav3.generator.job import Job
+    from exllamav3.modules.gated_delta_net import GatedDeltaNet
+    gdn = object.__new__(GatedDeltaNet)
+    gdn.kda = False
+    gdn.caps = {"recurrent_cache": True}
+    a = _FakeAttn()
+    plain = types.SimpleNamespace(caps = {"recurrent_cache": True}, layer_state_cls = object)
+    m = type("M", (), {"recurrent_state_cls": object, "__iter__": lambda self: iter([gdn, a, plain]),
+                       "_get_recurrent_layers": property(lambda self: Model._get_recurrent_layers.func(self))})()
+    assert Model._get_recurrent_layers.func(m) == [gdn, a, plain]
+    assert Model._get_checkpoint_layers.func(m) == [gdn, plain]
+    mm = types.SimpleNamespace(loaded_tp = False, get_checkpoint_layers = lambda: [gdn])
+    fake = types.SimpleNamespace(recurrent_state = object(), embeddings = None, generator = types.SimpleNamespace(model = mm))
+    for k, v in (("EXL3_PF_NO_TAIL", "1"), ("EXL3_GDN_FUSE", "1")):
+        monkeypatch.setenv(k, v)
+    assert Job.gdn_no_tail_enabled(fake) is True
+
+
 def test_cold_fill_from_pool():
     """A checkpoint without ring blob: fill rebuilds sinks + window from the dequantized pool (quant-level window)."""
     cfg = CFGS[0]

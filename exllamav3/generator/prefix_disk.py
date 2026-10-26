@@ -158,6 +158,7 @@ class PagedPrefixDisk:
         if tail is not None and (tail[0] < deepest or "tp_handle" in tail[1]["stashed"]):
             tail = None
         keep_depth = max(deepest, 0 if tail is None else tail[0])
+        if os.environ.get("EXL3_PD_DEBUG"): print(f"PDDBG save N={ids.shape[1]} pages={len(hashes)} stash_depths={sorted(stash_at)} tail={None if tail is None else tail[0]} keep={keep_depth}", flush=True)
         if keep_depth == 0:
             return {"saved": 0}
         want = {d for d in stash_at if d == deepest or _pow2(d) or d <= PIN_PAGES}
@@ -292,6 +293,7 @@ class PagedPrefixDisk:
             if k * PAGE_SIZE + L > tail_pos:
                 tail_ix, tail_name, tail_pos = ix, nm, k * PAGE_SIZE + L
         disk_pos = max(disk_depth * PAGE_SIZE, tail_pos)
+        if os.environ.get("EXL3_PD_DEBUG"): print(f"PDDBG restore N={N} ram_pos={ram_pos} ram_depth={ram_depth} avail={avail} disk_depth={disk_depth} tail_pos={tail_pos} disk_pos={disk_pos} stashes={len(self.stashes)} tails={len(self.tails)} rc={len(rc)}", flush=True)
         if disk_pos <= ram_pos:
             return None
         need_pages = max(disk_depth, 0 if tail_ix is None else tail_ix["pages"])
