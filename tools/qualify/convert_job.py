@@ -19,7 +19,7 @@ import pack as packmod
 
 def pack_complete(pack: str | os.PathLike) -> bool:
     p = Path(pack).expanduser()
-    return (p / "config.json").exists() and (p / "quantization_config.json").exists() and not packmod.verify_shards(p) and (p / "model.safetensors.index.json").exists()
+    return (p / "config.json").exists() and (p / "quantization_config.json").exists() and not packmod.verify_shards(p)
 
 
 def carry_template(src: Path, pack: Path) -> str | None:

@@ -45,6 +45,14 @@ class ConvertTests(unittest.TestCase):
             (p / "s.safetensors").write_bytes(b"x")
             self.assertTrue(cj.pack_complete(p))
 
+    def test_single_shard_pack_without_index_is_complete(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t)
+            (p / "config.json").write_text("{}"); (p / "quantization_config.json").write_text("{}")
+            self.assertFalse(cj.pack_complete(p))
+            (p / "model.safetensors").write_bytes(b"x")
+            self.assertTrue(cj.pack_complete(p))
+
     def test_memguard_stops_and_continues_only_its_group(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
         real = backends.mem_available_gib

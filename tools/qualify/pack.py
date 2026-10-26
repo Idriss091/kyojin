@@ -66,11 +66,18 @@ def read_pack(path: str | os.PathLike) -> dict:
         quant=qc.get("quant_method"), bpw=qc.get("bits"), head_bits=qc.get("head_bits"),
         vision=bool(fam["vision"] and cfg.get("vision_config") and not cfg.get("language_model_only")),
         mtp_layers=int(t.get("mtp_num_hidden_layers") or t.get("num_nextn_predict_layers") or 0),
-        weights_bytes=weights_dir_bytes(p), index_sha=hashlib.sha1(idx.read_bytes()).hexdigest()[:12] if idx.exists() else None,
+        weights_bytes=weights_dir_bytes(p), index_sha=_index_sha(p, idx),
         license=_license(p), template=str(p / "chat_template.jinja") if (p / "chat_template.jinja").exists() else None,
     )
     meta["problems"] = problems(meta)
     return meta
+
+
+def _index_sha(p: Path, idx: Path) -> str | None:
+    if idx.exists():
+        return hashlib.sha1(idx.read_bytes()).hexdigest()[:12]
+    one = p / "model.safetensors"      # single shard: size + mtime stand in for the index (stage keys, tuning/kv presets)
+    return hashlib.sha1(f"{one.stat().st_size}:{int(one.stat().st_mtime)}".encode()).hexdigest()[:12] if one.exists() else None
 
 
 def _license(p: Path) -> str | None:
@@ -126,8 +133,9 @@ def verify_shards(path: str | os.PathLike) -> list[str]:
     """Problems found when comparing the shard files with model.safetensors.index.json (names + existence + non-empty)."""
     p = Path(path).expanduser()
     idx = p / "model.safetensors.index.json"
-    if not idx.exists():
-        return [f"{p}: no model.safetensors.index.json"]
+    if not idx.exists():       # a small model converts to ONE shard and has no index (Qwen3.5-0.8B)
+        one = p / "model.safetensors"
+        return [] if one.exists() and one.stat().st_size else [f"{p}: no model.safetensors.index.json and no model.safetensors"]
     files = sorted(set(json.loads(idx.read_text())["weight_map"].values()))
     bad = []
     for f in files:
