@@ -12,8 +12,9 @@ The ring is per-job state with the lifecycle of the job's recurrent state: it ri
 prefix disk) and restored bitwise with them. A stash without a ring blob (written with the switch off) restores
 as "cold": the ring is rebuilt from the dequantized pool the first time the job attends (fill).
 
-EXL3_KVWIN=S:W (e.g. 4:128) turns it on for CacheLayer_quant layers of models that have recurrent state slots;
-unset / 0 / empty = off, which leaves every code path bit-identical to a build without this file.
+"Optimized Q4": with EXL3_KVWIN unset the window (4:128) is ON for CacheLayer_quant layers whose k or v bits are <= 5
+(models that have recurrent state slots) and OFF at >= 6, where every code path is bit-identical to a build without this
+file. EXL3_KVWIN=S:W forces a window at any bit width; EXL3_KVWIN=0 / off turns it off.
 """
 from __future__ import annotations
 import os
@@ -49,8 +50,18 @@ def parse_spec(spec: str | None) -> KVWinCfg | None:
     return KVWinCfg(S, W, W + MAX_DRAFT, S + W + MAX_DRAFT)
 
 
-def env_cfg() -> KVWinCfg | None:
-    return parse_spec(os.environ.get("EXL3_KVWIN"))
+DEFAULT_SPEC = "4:128"
+DEFAULT_MAX_BITS = 5    # unset switch: the window is on when k_bits or v_bits <= this
+
+
+def env_cfg(k_bits: int | None = None, v_bits: int | None = None) -> KVWinCfg | None:
+    """The EXL3_KVWIN switch; unset means DEFAULT_SPEC for a cache with k or v bits <= DEFAULT_MAX_BITS."""
+    spec = os.environ.get("EXL3_KVWIN")
+    if spec is None:
+        if k_bits is None or v_bits is None or min(k_bits, v_bits) > DEFAULT_MAX_BITS:
+            return None
+        spec = DEFAULT_SPEC
+    return parse_spec(spec)
 
 
 def ring_rows(pos: torch.Tensor, cfg: KVWinCfg) -> torch.Tensor:
@@ -107,10 +118,10 @@ class KVWinLayerState:
 
     # -- Cache.__init__ hook ---------------------------------------------------------------------------------------
     def bind(self, cache_layer):
-        """Called once the cache layer of this attention exists. Inert unless EXL3_KVWIN is set and the layer is a
-        plain quantized cache."""
+        """Called once the cache layer of this attention exists. Inert when the switch is off (see env_cfg) or the layer
+        is not a plain quantized cache."""
         from .quant import CacheLayer_quant
-        cfg = env_cfg()
+        cfg = env_cfg(getattr(cache_layer, "k_bits", None), getattr(cache_layer, "v_bits", None))
         m = self.module
         if (cfg is None or not isinstance(cache_layer, CacheLayer_quant) or cache_layer.compand_a != 0.0 or
                 m.head_dim % 32 != 0 or m.window_arg() not in (None, -1, (-1, -1)) or m.logit_softcapping):

@@ -480,7 +480,7 @@ def test_cache_binds_ring_to_recurrent_state_lifecycle(monkeypatch):
 
 def test_ring_inert_when_off_or_unsupported(monkeypatch):
     from exllamav3.cache import Cache
-    monkeypatch.delenv("EXL3_KVWIN", raising = False)
+    monkeypatch.setenv("EXL3_KVWIN", "0")
     model = _FakeModel()
     cache = Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = 4, v_bits = 4)
     st = model.attn.recurrent_layers[0]
@@ -495,6 +495,23 @@ def test_ring_inert_when_off_or_unsupported(monkeypatch):
     model2 = _FakeModel()
     Cache(model2, 8 * PAGE, layer_type = CacheLayer_fp16, max_batch_size = 2)
     assert model2.attn.recurrent_layers[0].cfg is None
+
+
+@pytest.mark.parametrize("env, bits, expect", [
+    (None, (4, 4), "4:128"), (None, (5, 5), "4:128"), (None, (6, 4), "4:128"), (None, (4, 8), "4:128"),
+    (None, (6, 6), None), (None, (8, 8), None),
+    ("0", (4, 4), None), ("off", (5, 5), None), ("", (4, 4), None),
+    ("2:64", (6, 6), "2:64"), ("2:64", (4, 4), "2:64"),
+])
+def test_default_on_for_q5_and_below(monkeypatch, env, bits, expect):
+    """Optimized Q4: unset switch = 4:128 when k or v bits <= 5, off (no ring, today's paths) at >= 6; explicit values win."""
+    from exllamav3.cache import Cache
+    if env is None: monkeypatch.delenv("EXL3_KVWIN", raising = False)
+    else: monkeypatch.setenv("EXL3_KVWIN", env)
+    model = _FakeModel()
+    Cache(model, 8 * PAGE, layer_type = CacheLayer_quant, max_batch_size = 2, k_bits = bits[0], v_bits = bits[1])
+    st = model.attn.recurrent_layers[0]
+    assert st.cfg == (parse_spec(expect) if expect else None)
 
 
 def test_models_without_recurrent_state_drop_ring_layers():

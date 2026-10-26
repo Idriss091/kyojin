@@ -157,9 +157,9 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
 
-### `EXL3_KVWIN` (default: unset = off)
+### `EXL3_KVWIN` (default: unset = `4:128` when k or v bits <= 5, off at 6 bits and above)
 
-`sink:window`, e.g. `4:128`. Keeps the first `sink` positions and the last `window` positions of every job in fp16
+`sink:window`, e.g. `4:128`; `0` / `off` disables it, an explicit value forces it at any bit width. Keeps the first `sink` positions and the last `window` positions of every job in fp16
 next to a quantized K/V cache (`--k-bits/--v-bits`): attention reads the quantized pool for everything in between
 and a small fp16 ring (`sink + window + 16` rows per layer and job) for the rest, merged exactly by the flash-decoding
 combine. Costs about 10 MiB of VRAM per job slot at `4:128` on a 16-layer, 4-kv-head, head-dim-256 model. Applies to
@@ -169,7 +169,7 @@ bit-exact (a checkpoint written without the switch rebuilds the ring from the po
 first `window` tokens). While it is on, the graph-captured decode attention (`EXL3_BC_ATTN`) and the whole-forward
 graph (`EXL3_CUDA_GRAPH`) decline, and tensor-parallel loading is not supported. Prefill chunks attend the exact
 sinks, the exact window before the chunk and all of the chunk's own rows (a superset of the per-row decode window).
-Unset or `0` leaves every code path bit-identical.
+With the window off (`0`, or unset at >= 6 bits) every code path is bit-identical to a build without it.
 
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
