@@ -50,6 +50,7 @@ EXL3_CUDA_GRAPH_MAX (6). purge() releases everything (call between harness arms 
 from __future__ import annotations
 
 import os
+import time
 import weakref
 from collections import Counter, OrderedDict
 
@@ -82,6 +83,8 @@ set_multi(os.environ.get("EXL3_CUDA_GRAPH_MULTI", "0") == "1")
 CUDA_GRAPH_CLONE = os.environ.get("EXL3_CUDA_GRAPH_CLONE", "1") != "0"
 CUDA_GRAPH_FALLBACK = os.environ.get("EXL3_CUDA_GRAPH_FALLBACK", "closed")
 CUDA_GRAPH_DEBUG = os.environ.get("EXL3_CUDA_GRAPH_DEBUG", "0") == "1"
+# EXL3_CUDA_GRAPH_DIAG=1: event-time 300 replays and print the mean GPU time per graph step and the replay-to-replay median
+_DIAG = [None] if os.environ.get("EXL3_CUDA_GRAPH_DIAG") else None
 
 # Only these params keys may be present; anything else (export_state_layers, activate_all_experts,
 # autosplit_measure, reconstruct, capture, ovr, sim_kvq, non_causal_spans, last_tokens_only, skip_logits,
@@ -379,7 +382,16 @@ class CudaGraphRunner:
                 return self._run_tail(tail, x, params)   # FALLBACK=eager decline
         try:
             with torch.cuda.device(dev):
+                if _DIAG:
+                    ev0 = torch.cuda.Event(enable_timing = True); ev1 = torch.cuda.Event(enable_timing = True); ev0.record()
                 e.graph.replay()
+                if _DIAG:
+                    ev1.record(); _DIAG.append((ev0, ev1, time.perf_counter()))
+                    if len(_DIAG) == 301:
+                        torch.cuda.synchronize(); d = _DIAG[1:]
+                        gpu = sum(a.elapsed_time(b) for a, b, _ in d)
+                        dl = sorted((y[2] - x[2]) * 1000 for x, y in zip(d, d[1:]))
+                        print(f"DIAG graph gpu {gpu / len(d):.3f} ms/step, replay-to-replay median {dl[len(dl) // 2]:.3f} ms, p10 {dl[len(dl) // 10]:.3f}", flush = True)
         except Exception:
             self._drop(key)
             self.disabled.add(key)
