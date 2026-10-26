@@ -13,6 +13,7 @@ from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
+from .draft_depth import DraftDepth
 from ..util import cuda_sync_active
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,10 @@ class Generator:
         # measured speculative rate would not beat plain decode. Opt-in: EXL3_SPEC_GATE=1
         self.spec_gate = SpecGate() if (draft_model is not None and
                                         os.environ.get("EXL3_SPEC_GATE", "0") != "0") else None
+        # acceptance-driven draft depth for the block drafter (per request, see draft_depth.py); EXL3_DFLASH_ADAPT=0 = fixed block
+        self.dflash_adapt = (draft_model is not None and draft_model.caps.get("dflash_draft", False)
+                             and os.environ.get("EXL3_DFLASH_ADAPT", "0") != "0" and self.spec_gate is None)
+        self._dflash_window = None
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -913,6 +918,8 @@ class Generator:
         if self.draft_model:
             if self.dflash_draft and self.spec_gate is not None:
                 self._iterate_gated(results, self.iterate_draftmodel_dflash_gen)
+            elif self.dflash_adapt:
+                self._iterate_depth(results, self.iterate_draftmodel_dflash_gen)
             elif self.mtp_draft and self.spec_gate is not None:
                 self._iterate_gated(results, self.iterate_draftmodel_mtp_gen)
             elif self.dflash_draft:
@@ -1427,6 +1434,34 @@ class Generator:
             gate.record_plain(dt, produced)
 
 
+    def _iterate_depth(self, results: list, draft_fn):
+        """One decode step with the per-request draft depth: the block is cut to the deepest wish of the active jobs, and no drafter
+        forward runs when every job wants plain decode (the drafter's cache catches up from the target's hidden states)."""
+        gen_jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+        if not gen_jobs:
+            self.iterate_gen(results, None)
+            return
+        for j in gen_jobs:
+            if getattr(j, "draft_depth", None) is None:
+                j.draft_depth = DraftDepth(self.num_draft_tokens)
+        wants = [j.draft_depth.want() for j in gen_jobs]
+        window = max(wants)
+        n0 = [j.new_tokens for j in gen_jobs]
+        self._dflash_window = window
+        draft_tokens = draft_fn(results) if window > 0 else None
+        self._dflash_window = None
+        if draft_tokens is None:
+            window = 0
+        self.iterate_gen(results, draft_tokens)
+        if self._dkv_pending is not None and any(j not in self.active_jobs for j in gen_jobs):
+            self._flush_dkv()
+        for j, w, n in zip(gen_jobs, wants, n0):
+            if w == 0 or window == 0:
+                j.draft_depth.record(0, 0)
+            else:
+                j.draft_depth.record(window, max(0, j.new_tokens - n - 1))
+
+
     def iterate_draftmodel_dflash_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -1446,7 +1481,7 @@ class Generator:
             return None
 
         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
-        window = self.num_draft_tokens
+        window = self.num_draft_tokens if self._dflash_window is None else min(self.num_draft_tokens, self._dflash_window)
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE

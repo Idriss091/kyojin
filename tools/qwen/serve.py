@@ -2266,8 +2266,12 @@ def main() -> None:
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
-                             "from --dflash-dir (lossless, fixed block), off = plain decode")
+                             "from --dflash-dir (lossless; see --dflash-adapt), off = plain decode")
     parser.add_argument("--dflash-dir", default="", help="DFlash2 drafter checkpoint directory (with --draft-policy dflash)")
+    parser.add_argument("--dflash-adapt", choices=("on", "off"), default="on",
+                        help="with --draft-policy dflash: cut the verified block per request from the measured acceptance (full / short / "
+                             "plain decode with periodic probes, generator/draft_depth.py), so low-acceptance chat never runs slower than plain; "
+                             "off = always the fixed block. EXL3_DFLASH_ADAPT in the environment wins")
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--default-temperature", type=float, default=None, help="when a request omits it (default: generation_config.json)")
@@ -2290,6 +2294,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.draft_policy == "dflash" and not args.dflash_dir:
         parser.error("--draft-policy dflash needs --dflash-dir")
+    if args.draft_policy == "dflash":
+        os.environ.setdefault("EXL3_DFLASH_ADAPT", "1" if args.dflash_adapt == "on" else "0")
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
     # Measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
