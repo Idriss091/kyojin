@@ -115,6 +115,37 @@ template<int B> __device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, co
 #endif
 }
 
+// TQ fast path (TQF): instead of rebuilding fp16 (1024 + raw) pairs from the bit planes, build for every 8 values a pair of index words
+// ze / zo whose byte m is the LDS byte address (2 * raw) of the value at position 2m / 2m + 1, then one bfe + one u16 table read per
+// value. Same values, same rounding (codebook entry * fp16 scale) as the generic TQ path, so the output is bit-identical.
+// Inputs: w = 4-bit plane word (value p at bits 4p), y = low plane field(s) of the same 8 values: B = 6 -> 2-bit fields, value p at
+// bits 2p + 16 * KH (KH = 1 for the upper half of a 32-bit plane word); B = 5 -> 1-bit fields, value p at bit p + 8 * KK.
+// raw = nib << (B - 4) | field, so address = nib << (B - 3) | field << 1.
+#ifndef TQF_OFF
+#define TQF_OFF 0
+#endif
+#define TQF (TQ && !TQF_OFF && (KB == 5 || KB == 6) && (VB == 5 || VB == 6) && DTW == 8)
+template<int B, int K> __device__ __forceinline__ void zbuild(u32 w, u32 y, u32& ze, u32& zo)
+{
+    if (B == 6) {
+        u32 u1 = perm(0u, y, (K & 1) ? 0x0C030C02u : 0x0C010C00u);               // bytes [y0, 0, y1, 0] of the 16-bit field word
+        u32 v = ((u1 << 4) & 0x0F000F00u) | (u1 & 0x000F000Fu);                   // nibble m (fields 2m, 2m + 1) at byte m
+        ze = (((v << 1) & 0x06060606u)) | ((w << 3) & 0x78787878u);
+        zo = (((v >> 1) & 0x06060606u)) | ((w >> 1) & 0x78787878u);
+    } else {
+        u32 t = (y >> (8 * K)) & 0xFFu;
+        ze = (((t & 0x55u) * 0x82082u) & 0x02020202u) | ((w << 2) & 0x3C3C3C3Cu);
+        zo = (((t & 0xAAu) * 0x41041u) & 0x02020202u) | ((w >> 2) & 0x3C3C3C3Cu);
+    }
+}
+__device__ __forceinline__ u32 zbyte(u32 z, int m) { return __builtin_amdgcn_ubfe(z, 8 * m, 8); }
+// half2 {cb[a0], cb[a1]} from two byte addresses of the u16 codebook
+__device__ __forceinline__ u32 lut2(const u16* cb, u32 a0, u32 a1)
+{
+    u16 lo = *(const u16*)((const char*) cb + a0), hi = *(const u16*)((const char*) cb + a1);
+    return (u32) lo | ((u32) hi << 16);
+}
+
 // K group plane offsets (words)
 #define KO4 ((KB & 8) ? 8 : 0)
 #define KO2 (KO4 + ((KB & 4) ? 4 : 0))
@@ -286,10 +317,27 @@ qdec_split(
                 for (int h = 0; h < 2; h++) {
                     const int ks = dw * KSW + gl * 2 + h;
                     v8u a;
+#if TQF
+                    {
+                        const u32* g = kw + gl * KB;
+                        u32 ze[2], zo[2];
+                        if (h == 0) {
+                            zbuild<KB, 0>(g[0], KB == 6 ? g[4] : g[4], ze[0], zo[0]);
+                            zbuild<KB, 1>(g[1], KB == 6 ? g[4] : g[4], ze[1], zo[1]);
+                        } else {
+                            zbuild<KB, 2>(g[2], KB == 6 ? g[5] : g[4], ze[0], zo[0]);
+                            zbuild<KB, 3>(g[3], KB == 6 ? g[5] : g[4], ze[1], zo[1]);
+                        }
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++)
+                            a[i] = hmul2(lut2(cbk_s, zbyte(ze[i >> 2], i & 3), zbyte(zo[i >> 2], i & 3)), sc);
+                    }
+#else
                     #pragma unroll
                     for (int i = 0; i < 8; i++)
                         a[i] = TQ ? dequant2_tq<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, cbk_s)
                                   : dequant2<KB>(raw_pair_m<KB>(kw + gl * KB, 16 * h + 2 * i, 0, KO4, KO2, KO1), sc, sch);
+#endif
                     v16h af = __builtin_bit_cast(v16h, a);
                     #pragma unroll
                     for (int j = 0; j < NT; j++) {
@@ -390,6 +438,33 @@ qdec_split(
         }
         // next slab's K (kw is dead now)
         if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
+#if TQF
+        {
+            u32 ze[16], zo[16], vsp[8];
+            #pragma unroll
+            for (int e = 0; e < 16; e++) zbuild<VB, 0>(vr[e][0], vr[e][1], ze[e], zo[e]);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) vsp[i] = perm(vsc[2 * i + 1], vsc[2 * i], 0x05040100u);   // scales of tokens 2i, 2i + 1
+            #pragma unroll
+            for (int u = 0; u < DTW / 2; u++) {
+                v8u b0, b1;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    b0[i] = hmul2(lut2(cbv_s, zbyte(ze[2 * i], u), zbyte(ze[2 * i + 1], u)), vsp[i]);   // tokens 2i, 2i + 1 at d column 2u
+                    b1[i] = hmul2(lut2(cbv_s, zbyte(zo[2 * i], u), zbyte(zo[2 * i + 1], u)), vsp[i]);   // ... at d column 2u + 1
+                }
+                #pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    v8u pv;
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) pv[i] = pa[j][i];
+                    v16h af = __builtin_bit_cast(v16h, pv);
+                    O[j][2 * u] = wmma(af, __builtin_bit_cast(v16h, b0), O[j][2 * u]);
+                    O[j][2 * u + 1] = wmma(af, __builtin_bit_cast(v16h, b1), O[j][2 * u + 1]);
+                }
+            }
+        }
+#else
         #pragma unroll
         for (int u = 0; u < DTW / 2; u++) {
             u32 dq[16];
@@ -415,6 +490,7 @@ qdec_split(
                 O[j][2 * u + 1] = wmma(af, __builtin_bit_cast(v16h, b1), O[j][2 * u + 1]);
             }
         }
+#endif
     }
 
     // ---- row sums across the two token halves
