@@ -239,7 +239,7 @@ class CliTests(unittest.TestCase):
 class KvModeRule(unittest.TestCase):
     def test_choose_kv_mode(self):
         bpv = {"k6v6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
-        # tq5 and tq6 both at or below k6v6's KL: the cheaper one wins
+        # tq5 and tq6 both within the margin (<= 0.9 x k6v6 KL): the cheaper one wins
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.004, "tq5": 0.009}, bpv), "tq5")
         # only tq6 qualifies
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.008, "tq5": 0.020}, bpv), "tq6")
@@ -249,6 +249,8 @@ class KvModeRule(unittest.TestCase):
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "tq6": 0.004, "tq5": 0.010}, bpv), "k6v6")
         # a model without tq support (head_dim not a power of two): only the baseline was measured
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")
+        # 3090 Nanbeige doc: tq5 .00456 vs k6v6 .00495 is inside the noise, only tq6 clearly beats the baseline
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.00495, "tq6": 0.00251, "tq5": 0.00456}, bpv), "tq6")
 
     def test_job_kvmode_glue(self):
         """kv stage -> job_kvmode -> kv_cache.json: the winner is written as the lane preset, serve flags follow it"""

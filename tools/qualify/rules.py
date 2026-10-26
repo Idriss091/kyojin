@@ -16,10 +16,13 @@ def choose_kv(kl_vs_k8: dict[int, float], kl_max: float = KV_KL_MAX) -> tuple[in
     return 8, 8
 
 
-def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: str = "k6v6") -> str:
-    """Q6 rule for the KV format: any candidate (e.g. tq6, tq5) whose decode-faithful KL vs k8v8 is <= the k6v6 baseline's qualifies;
+KV_MODE_MARGIN = 0.9    # one 256-step doc is noisy (two docs of one model scatter by 10-30 %): a candidate has to beat k6v6 by this factor
+
+
+def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: str = "k6v6", margin: float = KV_MODE_MARGIN) -> str:
+    """Q6 rule for the KV format: any candidate (e.g. tq6, tq5) whose decode-faithful KL vs k8v8 is <= margin x the k6v6 baseline's qualifies;
     the one with the fewest bytes per value wins (ties: lower KL), else k6v6. kl / bits_per_val: {format: value}, both holding `base`."""
-    ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= kl[base]]
+    ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= margin * kl[base]]
     # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider tq format does not is measurement noise
     ok = [n for n in ok if all(m in ok for m in kl if m != base and bits_per_val.get(m, 0) > bits_per_val[n])]
     return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base

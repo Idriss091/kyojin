@@ -224,7 +224,7 @@ def job_kv(c: Ctx) -> dict:
 
 def job_kvmode(c: Ctx, docs) -> dict:
     """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), tq6, tq5 (TurboQuant + sink/window ring).
-    Q6 rule (rules.choose_kv_mode): any tq format with KL <= k6v6's, then the fewest bytes per value; else k6v6."""
+    Q6 rule (rules.choose_kv_mode): any tq format with KL <= 0.9 x k6v6's, then the fewest bytes per value; else k6v6."""
     with c.locks():
         c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), timeout=14400)
     raw = json.loads((c.out / "kvmode_raw.json").read_text())
