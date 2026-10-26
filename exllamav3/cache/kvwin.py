@@ -54,6 +54,13 @@ DEFAULT_SPEC = "4:128"
 DEFAULT_MAX_BITS = 5    # unset switch: the window is on when k_bits or v_bits <= this
 
 
+def env_capable() -> bool:
+    """Attention modules are built before any cache exists, so they cannot know the cache bits yet: unless the switch
+    is off, they declare the ring state (inert until a cache layer binds it, see KVWinLayerState.bind)."""
+    spec = os.environ.get("EXL3_KVWIN")
+    return spec is None or parse_spec(spec) is not None
+
+
 def env_cfg(k_bits: int | None = None, v_bits: int | None = None) -> KVWinCfg | None:
     """The EXL3_KVWIN switch; unset means DEFAULT_SPEC for a cache with k or v bits <= DEFAULT_MAX_BITS."""
     spec = os.environ.get("EXL3_KVWIN")
@@ -121,9 +128,11 @@ class KVWinLayerState:
         """Called once the cache layer of this attention exists. Inert when the switch is off (see env_cfg) or the layer
         is not a plain quantized cache."""
         from .quant import CacheLayer_quant
+        from .qsa import QSAPlanes
         cfg = env_cfg(getattr(cache_layer, "k_bits", None), getattr(cache_layer, "v_bits", None))
         m = self.module
-        if (cfg is None or not isinstance(cache_layer, CacheLayer_quant) or cache_layer.compand_a != 0.0 or
+        if (cfg is None or not isinstance(cache_layer, CacheLayer_quant) or isinstance(cache_layer, QSAPlanes) or
+                cache_layer.compand_a != 0.0 or
                 m.head_dim % 32 != 0 or m.window_arg() not in (None, -1, (-1, -1)) or m.logit_softcapping):
             return
         self.cfg = cfg

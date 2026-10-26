@@ -514,6 +514,27 @@ def test_default_on_for_q5_and_below(monkeypatch, env, bits, expect):
     assert st.cfg == (parse_spec(expect) if expect else None)
 
 
+@pytest.mark.parametrize("env, capable", [(None, True), ("4:128", True), ("2:64", True), ("0", False), ("off", False), ("", False)])
+def test_attention_declares_ring_state_unless_switched_off(monkeypatch, env, capable):
+    """Attention modules are built before the cache (and its bits) exist: unless the switch is off they declare the ring state."""
+    from exllamav3.cache.kvwin import env_capable
+    if env is None: monkeypatch.delenv("EXL3_KVWIN", raising = False)
+    else: monkeypatch.setenv("EXL3_KVWIN", env)
+    assert env_capable() is capable
+
+
+def test_ring_declines_qsa_caches(monkeypatch):
+    """The sparse (QSA) decode path does not read the ring: its cache layers must not bind one."""
+    from exllamav3.cache.qsa import CacheLayer_qsa_quant
+    monkeypatch.setenv("EXL3_KVWIN", "4:32")
+    attn = types.SimpleNamespace(num_kv_heads = 2, head_dim = 128, qsa_indexer = types.SimpleNamespace(head_dim = 128, compress_ratio = 4),
+                                 window_arg = lambda: -1, logit_softcapping = 0.0)
+    cl = CacheLayer_qsa_quant(None, attn, 0, 8 * PAGE, 4, 4)
+    st = KVWinLayerState(attn, 2, 0, 0)
+    st.bind(cl)
+    assert st.cfg is None and getattr(cl, "kvwin", None) is None
+
+
 def test_models_without_recurrent_state_drop_ring_layers():
     from exllamav3.model.model import Model
     a = _FakeAttn()

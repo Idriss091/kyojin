@@ -43,7 +43,7 @@ def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
 
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
-from ..cache.kvwin import env_cfg as _kvwin_cfg, make_ctx as _kvwin_ctx, ensure_filled as _kvwin_fill, KVWinLayerState
+from ..cache.kvwin import env_capable as _kvwin_capable, make_ctx as _kvwin_ctx, ensure_filled as _kvwin_fill, KVWinLayerState
 
 """
                    
@@ -449,7 +449,7 @@ class Attention(Module):
 
         # KVWIN (EXL3_KVWIN=sink:window): the fp16 sink + window ring of a quantized cache is a per-job recurrent layer state
         self.recurrent_layers = []
-        if _kvwin_cfg() is not None and self.num_kv_heads > 0:
+        if _kvwin_capable() and self.num_kv_heads > 0:
             self.caps["recurrent_cache"] = True
             self.layer_state_cls = KVWinLayerState
 
