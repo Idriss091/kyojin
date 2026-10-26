@@ -243,6 +243,8 @@ class KvModeRule(unittest.TestCase):
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.004, "tq5": 0.009}, bpv), "tq5")
         # only tq6 qualifies
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "tq6": 0.008, "tq5": 0.020}, bpv), "tq6")
+        # tq5 below k6v6 but tq6 above it: noise, the baseline stays
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.005, "tq6": 0.0125, "tq5": 0.0048}, bpv), "k6v6")
         # none qualifies: the production format stays
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "tq6": 0.004, "tq5": 0.010}, bpv), "k6v6")
         # a model without tq support (head_dim not a power of two): only the baseline was measured

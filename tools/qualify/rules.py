@@ -20,6 +20,8 @@ def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: s
     """Q6 rule for the KV format: any candidate (e.g. tq6, tq5) whose decode-faithful KL vs k8v8 is <= the k6v6 baseline's qualifies;
     the one with the fewest bytes per value wins (ties: lower KL), else k6v6. kl / bits_per_val: {format: value}, both holding `base`."""
     ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= kl[base]]
+    # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider tq format does not is measurement noise
+    ok = [n for n in ok if all(m in ok for m in kl if m != base and bits_per_val.get(m, 0) > bits_per_val[n])]
     return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base
 
 
