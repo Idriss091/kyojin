@@ -63,4 +63,4 @@ the routing recorder callback is only a hook. `min_expert_tokens` is tested on l
 
 Write volume of the memmap design (printed by the sheet): h is rewritten each layer, X once, Y once to (topk+1) times.
 DS4.1 at 2M tokens: 246-492 GB per layer, 10-20 TB over 40 layers, footprint 246 GB. The next model trades the 117 GB RAM peak for
-a disk-write cliff (box NVMe QLC: about 140 GB sustained). Mitigation, not built: process tokens in blocks so X/Y blocks fit in RAM.
+a disk-write cliff (QLC NVMe drives: about 140 GB sustained). Mitigation, not built: process tokens in blocks so X/Y blocks fit in RAM.

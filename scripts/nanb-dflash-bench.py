@@ -6,7 +6,7 @@ and a drafted greedy decode on the same rendered prompt, then the token-by-token
 with the plain path's top-2 logit gap there (a near-tie is the documented caveat of R-row verify numerics).
 
   PYTHONPATH=$PWD python scripts/nanb-dflash-bench.py -m ~/models/nanbeige43-33b-exl3-4.0 \
-      -dm ~/models/drafters/nanb-dflash2-exl3br --template <duel chat_template.jinja> --out /tmp/nanb_dflash.json
+      -dm ~/models/drafters/nanb-dflash2-exl3br --template <chat_template.jinja> --out /tmp/nanb_dflash.json
 """
 from __future__ import annotations
 

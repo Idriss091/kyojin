@@ -10,7 +10,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-CAL_DIR = Path.home() / "hermes-work/rtx1/engine/exllamav3/conversion/standard_cal_data"
+CAL_DIR = Path(__file__).resolve().parents[2] / "exllamav3/conversion/standard_cal_data"
 CORPORA = ("c4.utf8", "wiki.utf8", "code.utf8", "technical.utf8", "multilingual.utf8")
 FR = ["Explique en quatre ou cinq phrases pourquoi le ciel est bleu, puis donne une analogie simple.",
       "Écris un court poème sur la mer en six vers, puis explique le choix des rimes.",

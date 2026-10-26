@@ -1,21 +1,24 @@
 """Backend profiles: where the python, the engine, the locks and the GPU counters live. One entry point per backend, same stages.
-MLX: add a profile with its own server/lock when the Ultra arrives (stages and report are backend-neutral)."""
+MLX: add a profile with its own server and lock (stages and report are backend-neutral)."""
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
-H = Path.home() / "hermes-work"
+REPO = Path(__file__).resolve().parents[2]
+PYTHON = os.environ.get("QUALIFY_PYTHON", sys.executable)
+ENGINE = os.environ.get("QUALIFY_ENGINE", str(REPO))
+# Optional GPU lock files (os.pathsep-separated), taken in this order before each server start
+LOCKS = [p for p in os.environ.get("QUALIFY_LOCKS", "").split(os.pathsep) if p]
 
 PROFILES = {
     "cuda": dict(
-        python=str(H / "rtx1/venv/bin/python"), engine=str(H / "rtx1/engine"),
-        locks=[str(H / "rtx1/gpu3090.lock")], env={"EXL3_CUDA_GRAPH": "1"},
-        gpu_used_mib="nvidia-smi", host_peak_note="3090 24 GiB",
+        python=PYTHON, engine=ENGINE, locks=LOCKS, env={"EXL3_CUDA_GRAPH": "1"},
+        gpu_used_mib="nvidia-smi", host_peak_note="NVIDIA device memory",
     ),
-    "rocm": dict(  # not exercised yet (iGPU busy); same stages, locks as in mu_common.md (one holder, this order)
-        python=str(H / "kyojin-rb/.venv/bin/python"), engine=str(H / "kyojin-rb"),
-        locks=[str(Path.home() / "strix-bench/gpu.lock"), str(H / "strixfix/kigpu.lock")], env={},
+    "rocm": dict(
+        python=PYTHON, engine=ENGINE, locks=LOCKS, env={},
         gpu_used_mib="/sys/class/drm/card1/device/mem_info_gtt_used", host_peak_note="Strix unified memory",
     ),
 }

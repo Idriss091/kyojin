@@ -20,7 +20,7 @@ Prior work (grep of `git log --all`, REPORT.md, pr_bundles, LEADS 26/10): the ru
 | MLX (Mac) | Metal | no: module constants (`DENSE_FUSED_MAX` 128->1024, `ROWS_NAX`, `NAX_SMALL_WEIGHTS`, `pick_cfg`, S6 tile per expert count) set per model class in macair24/26 | - | rows / expert count | Mac stage is a profile in `backends.py` when the Ultra arrives; same cache idea (file next to the pack) |
 
 Gap: the GEMM cache is **global and untied from the pack**. Every new shape is timed live (stall inside the first requests, or in graph
-capture), and there is no way to ship the result: a pack tuned on the author's box tunes again on every other box.
+capture), and there is no way to ship the result: a pack tuned on one machine tunes again on every other machine.
 
 ## 2. Design
 

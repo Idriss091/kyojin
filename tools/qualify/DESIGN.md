@@ -1,10 +1,9 @@
 # qualify — one command per backend: converted pack -> verdict + qualify.json
 
-NORTH STAR pillar 2. `python tools/qualify/qualify.py --backend cuda|rocm --pack DIR [--ref BF16_DIR]`
+`python tools/qualify/qualify.py --backend cuda|rocm --pack DIR [--ref BF16_DIR]`
 (MLX later: same stage list, another `backends.py` profile). Zero hand flags: everything comes from the pack.
-Prior work reused (copied with attribution, not redone): nanb `ref_stream/kv_kl/mk_docs/bench/agent`, rel174c3 `srch2/drv/bench_n`
-(max-ctx search, greedy sha, N=1..4), `gdrv.py` (sha set), `lane-kv-conformance.py` (template rule 1), `startup_health` (/health),
-`hermes_opt/eval` (Hermes smoke), drill 0 gap list (NORTH_STAR_ENGINE.md).
+Builds on the existing tools: streamed BF16 reference, KV KL, max-context search, greedy sha, N=1..4 bench, the template rule of
+`lane-kv-conformance.py`, `/health` start-up checks and a scripted Hermes eval suite.
 
 ## Stages (each = one resumable unit, `<out>/<stage>.json`, skipped when done and its input fingerprint is unchanged)
 | # | stage | needs GPU | what | drill-0 gap |
@@ -18,8 +17,8 @@ Prior work reused (copied with attribution, not redone): nanb `ref_stream/kv_kl/
 | 7 | `smoke` | yes (same server) | `--smoke-tasks` hermes_opt/eval tasks through the real Hermes CLI (`run_arm.sh ... --allow-local --jobs 1`); fallback: the nanb scripted tool loop (`smoke_agent.py`) when the eval suite is absent | 6 |
 | 8 | `report` | no | `REPORT.md` + `qualify.json` (schema 1) | - |
 
-Stages 6 and 7 share one server (duel rule: one load per model). Stages 3-7 are grouped in GPU **jobs** by the planner; each job takes
-the backend locks (cuda: `rtx1/gpu3090.lock`; rocm: `strix-bench/gpu.lock` then `strixfix/kigpu.lock`, one holder, flock waits), checks
+Stages 6 and 7 share one server (one load per model). Stages 3-7 are grouped in GPU **jobs** by the planner; each job takes
+the optional lock files of `QUALIFY_LOCKS` (in order, one holder, flock waits), checks
 MemAvailable >= 4 GiB (and >= the pack's stated host peak for conversions; none here), and releases between jobs. Servers are started and
 killed by PID only; readiness = `GET /health` == 200 (never a port check); the server log is scanned for OOM.
 
@@ -54,5 +53,4 @@ GDN/MoE/MLA reference adapters (only dense Llama), MLX profile, Strix real run, 
 - Servers run with `PYTHONPATH=<engine checkout>` (the built extension lives there): `--repo` is that checkout, not the qualify tree.
 - `standard_cal_data` is also the quantizer's calibration source: the domain docs use late offsets (held-out in practice, not by construction). A truly
   held-out set is a v2 item.
-- The hermes_opt/eval copy under duel_src lacks `lib/taskdefs.py`; the duel's copy (pr_bundles/duel/harness/eval) is complete and is found automatically
-  (`QUALIFY_EVAL_DIR` overrides).
+- The Hermes smoke needs an eval suite with `lib/taskdefs.py`: point `QUALIFY_EVAL_DIR` at it.

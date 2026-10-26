@@ -229,7 +229,7 @@ def write_line(s: dict, disk_free_gb: float = None) -> str:
     r = (f"capture writes {lo:.0f}-{hi:.0f} GB per layer, {lo * layers / 1000:.1f}-{hi * layers / 1000:.1f} TB over {layers} MoE layers "
          f"(footprint {cd['total_gb']:.0f} GB)")
     if hi > 140:
-        r += "; above the ~140 GB sustained-write cliff of the box NVMe (QLC): run it on a drive without that cliff or chunk X/Y rows"
+        r += "; above the ~140 GB sustained-write cliff of QLC NVMe drives: run it on a drive without that cliff or chunk X/Y rows"
     return r
 
 
