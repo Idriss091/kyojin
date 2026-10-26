@@ -144,3 +144,11 @@ class TestDense(unittest.TestCase):
             self.assertEqual(tc.merge_dense_text(d / "live.txt", d / "pack.txt"), 1)
             self.assertEqual((d / "live.txt").read_text().splitlines(), ["1 2 3 4 5 6 7", "7 7 7 7 7 7 7"])
             self.assertEqual(tc.merge_dense_text(d / "new.txt", d / "pack.txt"), 2)
+
+
+class TestPlan(unittest.TestCase):
+    def test_autotune_skipped_without_tuner_backend(self):
+        meta = dict(index_sha="x", problems=[])
+        for be, want in (("cuda", "todo"), ("rocm", "todo"), ("mlx", "skip")):
+            st = {s.name: s for s in planmod.build_plan(meta, dict(backend=be, sessions=[1]), {})}
+            self.assertEqual(st["autotune"].status, want, be)

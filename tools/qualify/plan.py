@@ -71,7 +71,9 @@ def build_plan(meta: dict, args: dict, state: dict, only: list | None = None, re
     for name in ORDER:
         t = STAGE_TABLE[name]
         st = Stage(name, t["job"], list(t["needs"]), t["est"], t["gpu"])
-        if name == "parity" and not args.get("ref"):
+        if name == "autotune" and args.get("backend") not in ("cuda", "rocm"):
+            st.status, st.note = "skip", f"no GEMM autotuner on backend {args.get('backend')}"
+        elif name == "parity" and not args.get("ref"):
             st.status, st.note = "skip", "no --ref BF16 dir: parity unmeasured"
         elif name == "parity" and not meta.get("ref_adapter"):
             st.status, st.note = "skip", f"no reference adapter for family {meta.get('family')}: parity unmeasured"
