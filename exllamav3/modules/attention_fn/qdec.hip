@@ -118,13 +118,13 @@ template<int B> __device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, co
 // TQ fast path (TQF): instead of rebuilding fp16 (1024 + raw) pairs from the bit planes, build for every 8 values a pair of index words
 // ze / zo whose byte m is the LDS byte address (2 * raw) of the value at position 2m / 2m + 1, then one bfe + one u16 table read per
 // value. Same values, same rounding (codebook entry * fp16 scale) as the generic TQ path, so the output is bit-identical.
-// Inputs: w = 4-bit plane word (value p at bits 4p), y = low plane field(s) of the same 8 values: B = 6 -> 2-bit fields, value p at
+// (DTW = 4 runs: only bytes 0, 1 of ze / zo are used.) Inputs: w = 4-bit plane word (value p at bits 4p), y = low plane field(s) of the same 8 values: B = 6 -> 2-bit fields, value p at
 // bits 2p + 16 * KH (KH = 1 for the upper half of a 32-bit plane word); B = 5 -> 1-bit fields, value p at bit p + 8 * KK.
 // raw = nib << (B - 4) | field, so address = nib << (B - 3) | field << 1.
 #ifndef TQF_OFF
 #define TQF_OFF 0
 #endif
-#define TQF (TQ && !TQF_OFF && (KB == 5 || KB == 6) && (VB == 5 || VB == 6) && DTW == 8)
+#define TQF (TQ && !TQF_OFF && (KB == 5 || KB == 6) && (VB == 5 || VB == 6) && (DTW == 8 || DTW == 4))
 template<int B, int K> __device__ __forceinline__ void zbuild(u32 w, u32 y, u32& ze, u32& zo)
 {
     if (B == 6) {
