@@ -59,21 +59,10 @@ template<int B> __device__ __forceinline__ u32 negbias2() { return (u32)(0x8000 
 __device__ __forceinline__ u32 bytesel(int b) { return (u32)b | ((u32)(4 + b) << 8); }
 
 // TurboQuant: packed raw pair (1024 + raw in each half) -> half2 (codebook[raw] * scale); the codebook sits in smem as fp16 bits
-#ifndef TQ_LUT
-#define TQ_LUT 0       // 0: u16 table in smem | 1: timing experiment, no table (wrong values) | 2: table replicated per lane (u32 slots, bank = lane)
-#endif
 __device__ __forceinline__ u32 lut2(u32 x, u32 s2, const u16* cb)
 {
-#if TQ_LUT == 1
-    return hmul2(hsub2(x, 0x64006400u), s2);
-#elif TQ_LUT == 2
-    const u32* cw = (const u32*)cb + (threadIdx.x & 31);                        // entry e of this lane's copy at word e * 32 + lane
-    u32 lo = cw[(x & 0x3FFu) << 5], hi = cw[((x >> 16) & 0x3FFu) << 5];
-    return hmul2(lo | (hi << 16), s2);
-#else
     u32 lo = cb[x & 0x3FFu], hi = cb[(x >> 16) & 0x3FFu];
     return hmul2(lo | (hi << 16), s2);
-#endif
 }
 
 struct DqK { u32 sel8, sh4, sh2, sel2[2], sh1, mu8, mu4, mu2; };
@@ -137,14 +126,8 @@ qdec_split(
     int split_len, int num_pages_per_seq, int num_splits, const float* sinks_unused,
     const u16* __restrict__ cbk, const u16* __restrict__ cbv)
 {
-#if TQ && TQ_LUT == 2
-    __shared__ __align__(16) u32 cbk_r[(1 << KB) * 32];
-    __shared__ __align__(16) u32 cbv_r[(1 << VB) * 32];
-    const u16* cbk_s = (const u16*)cbk_r; const u16* cbv_s = (const u16*)cbv_r;
-#else
     __shared__ u16 cbk_s[TQ ? (1 << KB) : 1];
     __shared__ u16 cbv_s[TQ ? (1 << VB) : 1];
-#endif
     extern __shared__ __align__(16) unsigned char smem[];
     u16* Qs = (u16*)smem;
     unsigned char* ring = smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16;
@@ -161,13 +144,8 @@ qdec_split(
 
     // ---- q rows -> rotated (h32) fp16 in smem
     if (TQ) {                                            // q arrives already rotated: plain copy (K dim order permuted like below)
-#if TQ_LUT == 2
-        for (int i = tid; i < (1 << KB) * 32; i += NTHREADS) cbk_r[i] = cbk[i >> 5];
-        for (int i = tid; i < (1 << VB) * 32; i += NTHREADS) cbv_r[i] = cbv[i >> 5];
-#else
         for (int i = tid; i < (1 << KB); i += NTHREADS) cbk_s[i] = cbk[i];
         for (int i = tid; i < (1 << VB); i += NTHREADS) cbv_s[i] = cbv[i];
-#endif
         for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
             int r = idx / HD, d = idx % HD;
             u16 x = 0;

@@ -75,7 +75,7 @@ def _compile(cfg):
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"],
                 PAGE=cfg["page"], NW=cfg["nw"], ST=cfg["st"], CAUSAL=int(cfg["causal"]), BLOCK_ROWS=cfg["block_rows"],
                 HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f", KEY_LO=cfg.get("key_lo", 0),
-                TQ=int(cfg.get("tq", False)), TQ_LUT=int(os.environ.get("EXL3_QDEC_TQ_LUT", "0")))
+                TQ=int(cfg.get("tq", False)))
     defs["L2HINT"] = int(os.environ.get("EXL3_QDEC_L2HINT", "1"))       # L2 evict_first on K/V, evict_last on the scales
     defs["FASTDQ"] = 1 if cfg.get("tq") else int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
     if os.environ.get("EXL3_QDEC_ABL"):
@@ -160,13 +160,6 @@ def rows_nw(hd):
     return int(os.environ.get("EXL3_QDEC_RNW", "0")) or (4 if (hd // 32) % 4 == 0 else 2)
 
 
-def _tq_static(cfg):
-    """static smem of the TurboQuant codebooks: 2^bits u16 each, or 2^bits x 32 u32 each with the per-lane replicated table (EXL3_QDEC_TQ_LUT=2)"""
-    if os.environ.get("EXL3_QDEC_TQ_LUT", "0") == "2":
-        return ((1 << cfg["kb"]) + (1 << cfg["vb"])) * 128 + 1024
-    return 1024
-
-
 def pick_nw_st(cfg):
     """(warps per CTA, ring depth), measured on a 3090 at 128K context (K/V bits 4/4, 6/6, 8/8): 8 x 2 for hd128 with
     narrow codes, 4 x 2 otherwise; shrinks until the shared memory fits the opt-in limit"""
@@ -181,7 +174,7 @@ def pick_nw_st(cfg):
     narrow = cfg["hd"] == 128 and cfg["kb"] + cfg["vb"] <= 8
     for nw, st in (((8, 2), (4, 2), (4, 1), (2, 2), (2, 1)) if narrow else ((4, 2), (4, 1), (2, 2), (2, 1))):
         c.update(nw=nw, st=st)
-        if geometry(c)["shared"] <= 99 * 1024 - (_tq_static(cfg) if cfg.get("tq") else 0):     # + the static codebooks
+        if geometry(c)["shared"] <= 99 * 1024 - (1024 if cfg.get("tq") else 0):     # + the static codebooks
             return nw, st
     raise QdecUnsupported("no ring configuration fits")
 
