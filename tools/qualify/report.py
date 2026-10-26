@@ -50,6 +50,9 @@ def render_md(j: dict) -> str:
     if v["unmeasured"]:
         L += ["Unmeasured (not counted as pass): " + ", ".join(v["unmeasured"])]
     L += ["", "## Stages", "| stage | status | wall s |", "|---|---|---|"] + [f"| {n} | {s['status']} | {fmt(s['wall_s'], 0)} |" for n, s in j["stages"].items()]
+    if j.get("tuning"):
+        t = j["tuning"]
+        L += ["", f"## Day-0 autotune", f"{t['records']} GEMM tuning records ({t['plan_points']} sweep points, {t['wall_s']} s on the device, lock wait excluded) in {t['tuning_dir']}: " + ", ".join(t["files"] or [])]
     par = j["quality"]["parity"]
     if par:
         L += ["", "## Parity vs streamed BF16", f"mean KL {par['kl_mean']:.4f}, top-1 {par['top1_mean']:.4f}, dNLL {par['dnll_mean']:+.4f}; SQNR: {par['sqnr']}", "",
