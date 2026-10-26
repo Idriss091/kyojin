@@ -112,3 +112,22 @@ def test_torch_grid_equals_numpy_grid(shape, grid, block):
     s = torch.from_numpy(H.f32_scale(grid, -3, 1)) if grid else torch.tensor(0.7)
     got = apply_scale_grid(w, s, block).numpy()
     assert H.same(got, vi.apply_scales(w.numpy(), s.numpy(), block))
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_gpt_oss_fused_mxfp4_experts(tmp_path, interleaved):
+    E, N, G = 3, 16, 2                                              # gate_up_proj_blocks [E, 2I... N, G, 16] -> [E, N, G*32]
+    nib = H.rng.integers(0, 16, size=(E, N, G, 32)).astype(np.uint8)
+    blk, sb = H.pack_nibbles(nib), H.rng.integers(120, 132, size=(E, N, G)).astype(np.uint8)
+    full = vi.dequant_mxfp4_blocks(blk, sb)                         # float32 [E, N, 64]
+    T = {"m.gate_up_proj_blocks": H.t("U8", blk), "m.gate_up_proj_scales": H.t("U8", sb),
+         "m.gate_up_proj_bias": H.t("F32", np.arange(E * N, dtype=np.float32).reshape(E, N))}
+    H.write_st(tmp_path / "model.safetensors", T)
+    json.dump({}, open(tmp_path / "config.json", "w"))
+    conf = types.SimpleNamespace(stc=SafetensorsCollection(str(tmp_path), load_method="python"), config_dict={})
+    I = N // 2
+    for e, (lo, hi) in ((1, (0, I)), (2, (I, N))):
+        lin = Linear(conf, "m.x", G * 32, I, fkey="m.gate_up_proj", fidx=e, frange=(lo, hi), finterleaved=interleaved, pad_to=1)
+        lin.load(torch.device("cpu"))
+        rows = full[e, 0::2] if interleaved and lo == 0 else full[e, 1::2] if interleaved else full[e, lo:hi]
+        check(lin.inner.weight, np.ascontiguousarray(rows))
