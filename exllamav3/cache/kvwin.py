@@ -281,6 +281,47 @@ class KVWinLayerState:
             dst[slot].index_copy_(0, rows, out.view(-1, m.num_kv_heads, m.head_dim))
 
 
+class KVWinState:
+    """Job state of a model whose only recurrent layers are KVWIN rings (plain attention). No checkpoints: a job resumed
+    from cached pages (or rewound past MAX_DRAFT rows) gets a cold ring, rebuilt from the quantized pool."""
+
+    exported = False
+    guaranteed_rollback = MAX_DRAFT     # rows the positional ring can rewind in place
+
+    def __init__(self, cache, slot: int, position: int, clear: bool = True, stashed: dict = None, test_state: bool = False):
+        self.slot = slot
+        self.position = position
+        self.cache = cache
+        self.last_history = 0
+        layers = cache.get_all_recurrent_layers().values()
+        for l in layers:
+            if stashed is not None:
+                l.unstash_missing(slot)
+            elif clear:
+                l.clear(slot)
+        self.checkpoint_size = sum(l.get_checkpoint_size() for l in layers)
+
+    def free(self):
+        self.cache.release_state(self)
+
+    def rewind(self, num_tokens: int):
+        assert num_tokens <= self.rollback_capacity()
+        self.position -= num_tokens
+        self.last_history = 0
+
+    def rollback_capacity(self):
+        return min(self.position, MAX_DRAFT)
+
+    def post_advance(self):
+        pass
+
+    def tp_export(self):
+        raise NotImplementedError("EXL3_KVWIN does not support tensor parallel loading")
+
+    def reset(self):
+        self.position = 0
+
+
 def any_cold(params: dict) -> bool:
     """True when a job of this call has a cold ring (restored from a checkpoint without ring blob): its rebuild from the pool is a
     host-side step, so the whole-forward graph declines that step (the eager call fills it) and replays from the next one."""
