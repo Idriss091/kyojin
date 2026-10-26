@@ -94,14 +94,18 @@ class Client:
     def near_full(self, ctx: int, slot: int, fill: float = 0.97, reply: int = 32) -> dict:
         """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx). Corpora differ in chars/token (code and CJK are denser), so a
         refused prompt (HTTP 400 context overflow) is shrunk and a short one is topped up, up to 4 times, from the server's own usage.prompt_tokens."""
-        want = int(ctx * fill) - reply
+        return self.fit(int(ctx * fill) - reply, slot, reply)
+
+    def fit(self, want: int, slot: int, reply: int, topup: bool = True) -> dict:
+        """Stream a prompt of `want` tokens: corpora differ in chars/token (46K tokens came back for a 35K ask), so on HTTP 400 the length is
+        rescaled from the server's stated count and, with topup, a short prompt is lengthened (up to 4 tries)."""
         n = want
         for _ in range(4):
             r = self.stream(self.prompt(n, slot), reply)
             if r["err"] and "400" in r["err"] and n > 256:
                 m = re.search(r"prompt is (\d+) tokens", r["err"])
                 n = int(n * want / int(m.group(1)) * 0.99) if m else int(n * 0.9)      # the server states the real count: rescale at once
-            elif not r["err"] and r["ptok"] and r["ptok"] < 0.9 * want:
+            elif topup and not r["err"] and r["ptok"] and r["ptok"] < 0.9 * want:
                 n = int(n * want / r["ptok"])
             else:
                 break
@@ -109,11 +113,10 @@ class Client:
 
     def concurrent(self, n: int, tokens: int, max_tokens: int = 128) -> dict:
         res = [None] * n
-        prompts = [self.prompt(tokens, i) for i in range(n)]
         bar = threading.Barrier(n)
 
         def run(i):
-            bar.wait(); res[i] = self.stream(prompts[i], max_tokens)
+            bar.wait(); res[i] = self.fit(tokens, i, max_tokens, topup=False)
         th = [threading.Thread(target=run, args=(i,)) for i in range(n)]
         [t.start() for t in th]; [t.join() for t in th]
         ok = [r for r in res if not r["err"] and r["dec_tps"]]
@@ -143,7 +146,7 @@ class Client:
         def worker(i):
             while time.time() < end:
                 n = pick()
-                r = self.stream(self.prompt(n, 10 + i), 48)
+                r = self.fit(n, 10 + i, 48, topup=False)
                 with lock:
                     res.append(dict(want=n, ptok=r["ptok"], err=r["err"], ttft=r["ttft"]))
                     if vram and len(res) % 5 == 0:

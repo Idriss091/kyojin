@@ -465,10 +465,10 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
             if do_serve:
                 s["conformance"] = cl.conformance()
                 s["decode_short"] = [cl.stream(cl.prompt(300, i), 256) for i in range(3)]
-                s["prefill_8k"] = [cl.stream(cl.prompt(8000, i + 3), 1) for i in range(3)]
+                s["prefill_8k"] = [cl.fit(8000, i + 3, 1, topup=False) for i in range(3)]
                 curve, t = [], 2048
                 while t <= int(ctx * 0.9):
-                    r = cl.stream(cl.prompt(t, 7), 64)
+                    r = cl.fit(t, 7, 64, topup=False)
                     curve.append(dict(prompt=r["ptok"], ttft=r["ttft"], prefill_tps=round(r["ptok"] / r["ttft"], 1) if r["ptok"] and r["ttft"] else None, dec_tps=r["dec_tps"], err=r["err"]))
                     t *= 4
                 s["curve"] = curve
