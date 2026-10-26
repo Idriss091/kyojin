@@ -60,6 +60,17 @@ def main() -> int:
         cl = load.Client(a.port)
         cl.calibrate(1000)                                   # also the very first request of the process (the cold arm pays tuning here)
         res["records_after_calibrate"] = records_in(cache)
+        # requests of the shapes a real client reaches that the first request did not: odd short prompts, tails, batched decode
+        # (each new row class is timed inside the request on a cold cache; replay.complete = non-streamed, total wall incl. 8 new tokens)
+        import replay
+        res["newshape"] = []
+        for k, (ptok, conc) in enumerate([(20, 1), (28, 1), (37, 1), (3, 1), (50, 1), (90, 1), (2048 + 5, 1), (2048 + 33, 1), (48, 2), (48, 3), (48, 4)]):
+            out = [None] * conc
+            th = [replay.threading.Thread(target=lambda j=j: out.__setitem__(j, replay.complete(a.port, replay.token_prompt(ptok, 7000 + 10 * k + j), 8, "qual"))) for j in range(conc)]
+            t1 = time.time(); [t.start() for t in th]; [t.join() for t in th]
+            res["newshape"].append(dict(ptok=ptok, conc=conc, wall_s=round(time.time() - t1, 2), ok=all(o["ok"] for o in out)))
+            print(res["newshape"][-1], flush=True)
+        res["records_after_newshape"] = records_in(cache)
         plan = [("short128", 128, 128)] * 2 + [("p1k", 1024, 192)] * 3 + [("p4k", 4096, 128)] * 4 + [("p8k", 8192, 64)] * 2
         for i, (name, ptok, new) in enumerate(plan):
             r = cl.stream(cl.prompt(ptok, i), new)
@@ -80,6 +91,8 @@ def main() -> int:
         p8k_prefill_tps_steady=med([s["ptok"] / s["ttft"] for s in by("p8k")[1:] if s["ptok"]]),
         n4_agg_steady=med([x["agg"] for x in res["n4"][1:] if x["agg"]]),
         runtime_tuned_records=res["records_end"] - res["records_after_load"],
+        newshape_wall_total_s=round(sum(x["wall_s"] for x in res["newshape"]), 2), newshape_wall_max_s=max(x["wall_s"] for x in res["newshape"]),
+        newshape_records=res["records_after_newshape"] - res["records_after_load"],
     )
     Path(a.out).write_text(json.dumps(res, indent=1))
     print(json.dumps(res["summary"]))
