@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 import sys
@@ -1326,6 +1327,16 @@ class VramHeadroomTests(unittest.TestCase):
             self.assertEqual(M.lazy_vram_bytes(mtp), 0)       # already built: it is in the measured free figure
         with unittest.mock.patch.dict(os.environ, {"EXL3_DRAFT_VOCAB": "0"}):
             self.assertEqual(M.lazy_vram_bytes(types.SimpleNamespace(__dict__={})), 0)
+
+
+class DflashFlagTests(unittest.TestCase):
+    def test_dflash_policy_needs_a_drafter_directory(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["serve.py", "--model", "m", "--draft-policy", "dflash"]), \
+                unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
+            serve.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--dflash-dir", err.getvalue())
 
 
 if __name__ == "__main__":

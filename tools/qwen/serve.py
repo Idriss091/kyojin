@@ -715,7 +715,7 @@ class QwenEngine:
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
-                 k_bits: int = 0, v_bits: int = 0):
+                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = ""):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         import torch
@@ -783,7 +783,18 @@ class QwenEngine:
         from exllamav3.modules.hyperconnections import GS_STATS
         print("qserve: hc mixer sites by code source", dict(GS_STATS), flush=True)
         self.draft_model = self.draft_cache = None
-        if draft_policy != "off":
+        if draft_policy == "dflash":
+            # DFlash2 block drafter (separate checkpoint, shares the target's embedding and head): it reads the target's hidden-state
+            # taps, drafts a block of block_size - 1 tokens that the stock accept-while-match rule verifies (lossless, greedy or sampled)
+            dconf = Config.from_directory(dflash_dir)
+            assert dconf.tap_shift == 0 and ndt == dconf.block_size - 1, f"--ndt must be {dconf.block_size - 1} for this drafter"
+            self.draft_model = Model.from_config(dconf)
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt))
+            startup_health.stage("drafter weights")
+            with Heartbeat("loading DFlash2 drafter"):
+                self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
+            self.draft_model.attach_to(self.model)
+        elif draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt), **qkw)
             startup_health.stage("drafter weights")
@@ -2211,7 +2222,7 @@ def load_all(args: argparse.Namespace):
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
                         cache_bits=args.cache_bits, sessions=args.sessions,
-                        k_bits=args.k_bits, v_bits=args.v_bits)
+                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()))
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2253,8 +2264,10 @@ def main() -> None:
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
-    parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
-                        help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
+    parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
+                        help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
+                             "from --dflash-dir (lossless, fixed block), off = plain decode")
+    parser.add_argument("--dflash-dir", default="", help="DFlash2 drafter checkpoint directory (with --draft-policy dflash)")
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--default-temperature", type=float, default=None, help="when a request omits it (default: generation_config.json)")
@@ -2275,6 +2288,8 @@ def main() -> None:
                              "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
                              "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
+    if args.draft_policy == "dflash" and not args.dflash_dir:
+        parser.error("--draft-policy dflash needs --dflash-dir")
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
     # Measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
