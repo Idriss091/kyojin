@@ -1,11 +1,12 @@
 """Pack-side GPU measurements, run with the backend python (torch + exllamav3 on PYTHONPATH). CLI only; stages parse its JSON.
   gpu_eval.py parity PACK DOCS.pt REFDIR OUT.json            KL / top-1 / dNLL per doc (fp16 KV) against the streamed reference logits
   gpu_eval.py kv     PACK DOCS.pt REFDIR OUT.json B1 B2 ...  tail KL of symmetric quantized KV (k<b>v<b>) at the long doc, vs reference and vs k8v8
-  gpu_eval.py kvmode PACK DOCS.pt OUT.json [N]               decode-faithful KL vs k8v8 at the long doc of the KV formats k6v6 (quant), tq6, tq5 (TurboQuant + sink/window ring)
+  gpu_eval.py kvmode PACK DOCS.pt OUT.json [N]               decode-faithful KL vs k8v8 at the long doc of the KV formats k6v6 (quant), kw6 (k6v6 + sink/window ring), tq6, tq5 (TurboQuant + ring)
 KL maths and the real-quantizer forward are adapted from nanb kv_kl.py (drill 0)."""
 import gc
 import json
 import sys
+import time
 
 import torch
 
@@ -91,7 +92,7 @@ def kvmode(pack, docs, out, n=256):
     e = T - n
     cfg = Config.from_directory(pack)
     hd = cfg.head_dim
-    fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
+    fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6), ("kw6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
     x = torch.tensor([ids])
     npg = (T + 256) // 256
     bt = torch.arange(npg, dtype=torch.int32)[None]
@@ -102,7 +103,7 @@ def kvmode(pack, docs, out, n=256):
         if kind == "tq":
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=tq.CacheLayer_tq, k_bits=b, v_bits=b)
         else:
-            os.environ["EXL3_KVWIN"] = "0"       # the production formats at >= 6 bits run without the window
+            os.environ["EXL3_KVWIN"] = "4:128" if name == "kw6" else "0"     # the production formats at >= 6 bits run without the window; kw6 = the same cache with the ring
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
             os.environ.pop("EXL3_KVWIN")
         m.load(progressbar=False)
@@ -116,9 +117,11 @@ def kvmode(pack, docs, out, n=256):
             for a in range(0, e, 2048):
                 m.prefill(x[:, a: min(a + 2048, e)], par(a, min(a + 2048, e) - a))
             rows = []
+            t_dec = time.time()
             for j in range(n):
                 lg = m.forward(x[:, e + j: e + j + 1], par(e + j, 1))
                 rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).half().cpu())
+            t_dec = (time.time() - t_dec) / n
             if st is not None:
                 st.free()
         lps[name] = torch.stack(rows).float()
@@ -127,7 +130,7 @@ def kvmode(pack, docs, out, n=256):
             r8 = lps["k8v8"]
             kl = (r8.exp() * (r8 - lps[name]).nan_to_num(0)).sum(-1)
             res[name] = dict(kl_vs_k8=kl.mean().item(), top1_vs_k8=(r8.argmax(-1) == lps[name].argmax(-1)).float().mean().item(),
-                             bits_per_val=(b + 0.5) if kind == "quant" else b + 16 / hd)
+                             bits_per_val=(b + 0.5) if kind == "quant" else b + 16 / hd, decode_s_per_tok=t_dec)
             print(name, res[name], flush=True)
     json.dump(res, open(out, "w"), indent=1)
 

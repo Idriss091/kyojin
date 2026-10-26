@@ -3,6 +3,7 @@ GPU stages run inside job functions that hold the backend locks; every server is
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -223,16 +224,19 @@ def job_kv(c: Ctx) -> dict:
 
 
 def job_kvmode(c: Ctx, docs) -> dict:
-    """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), tq6, tq5 (TurboQuant + sink/window ring).
-    Q6 rule (rules.choose_kv_mode): any tq format with KL <= 0.9 x k6v6's, then the fewest bytes per value; else k6v6."""
+    """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), kw6 (k6v6 + sink/window ring), tq6, tq5 (TurboQuant + ring).
+    Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's, else k6v6; the tq formats are measured and reported, opt-in only
+    (QUALIFY_KV_TQ=1 lets them win: any tq format with KL <= 0.9 x k6v6's, then the fewest bytes per value)."""
     with c.locks():
         c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), timeout=14400)
     raw = json.loads((c.out / "kvmode_raw.json").read_text())
     kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
     bpv = {n: v["bits_per_val"] for n, v in raw.items()}
-    win = rules.choose_kv_mode(kl, bpv)
+    win = rules.choose_kv_mode(kl, bpv, allowed=rules.KV_DEFAULT_FORMATS + (("tq6", "tq5") if os.environ.get("QUALIFY_KV_TQ") == "1" else ()))
     if win == "k6v6":
         return dict(modes=raw, mode="quant")
+    if win == "kw6":
+        return dict(modes=raw, mode="quant", chosen=[6, 6], kvwin=rules.KV_WIN_SPEC, rule="Q6 rule: k6v6 + sink/window ring when its KL vs k8v8 <= 0.9 x k6v6's")
     b = int(win[2:])
     return dict(modes=raw, mode="tq", chosen=[b, b], q6_equivalent=True, rule="Q6 rule: tq format with KL vs k8v8 <= k6v6's, fewest bytes per value")
 
@@ -240,7 +244,7 @@ def job_kvmode(c: Ctx, docs) -> dict:
 def write_kv_choice(c: Ctx, kv: dict) -> None:
     """The lane preset: <pack>/kv_cache.json, read by tools/qwen/serve.py when no --k-bits / --v-bits / --kv-mode is given."""
     k, v = kv["chosen"]
-    doc = dict(schema=1, kv_mode=kv.get("mode", "quant"), k_bits=k, v_bits=v, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"),
+    doc = dict(schema=1, kv_mode=kv.get("mode", "quant"), k_bits=k, v_bits=v, kvwin=kv.get("kvwin"), engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"),
                kl_vs_k8=({n: x["kl_vs_k8"] for n, x in kv["modes"].items()} if kv.get("modes") else None))
     tmp = Path(c.meta["path"]) / "kv_cache.json.tmp"
     tmp.write_text(json.dumps(doc, indent=1))
@@ -252,6 +256,10 @@ def chosen_kv(c: Ctx) -> tuple:
     return tuple(kv["chosen"]) if kv else (6, 6)     # no reference: owner's Q6 minimum
 
 
+def chosen_kvwin(c: Ctx) -> str | None:
+    return (c.data.get("kv") or {}).get("kvwin")
+
+
 def chosen_kv_mode(c: Ctx) -> str:
     return (c.data.get("kv") or {}).get("mode", "quant")
 
@@ -259,7 +267,7 @@ def chosen_kv_mode(c: Ctx) -> str:
 # ---------------------------------------------------------------- max ctx
 def start_args(c: Ctx, ctx: int, sessions: int) -> list:
     k, v = chosen_kv(c)
-    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c))
+    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c))
 
 
 def probe_factory(c: Ctx, sessions: int):

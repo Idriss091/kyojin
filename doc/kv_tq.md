@@ -30,9 +30,14 @@ The default (`--kv-mode quant` or nothing) is unchanged. A pack that went throug
   per-vector scale is folded into the scores (K) and the probabilities (V) instead of multiplying every dequantized pair. Prefill: the
   existing staging, with `tq_dequant_window` filling the fp16 scratch (rotated domain) before the fp16 attention kernel. The BC graph
   attention declines tq layers.
-* `tools/qualify` (kv stage) measures the decode-faithful 32K KL against k8v8 of k6v6, tq6 and tq5 once per model and keeps the cheapest
-  format whose KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on k6v6), and a narrower format only if every wider tq
-  format qualifies too; `--no-kv-modes` skips it.
+* `tools/qualify` (kv stage) measures the decode-faithful 32K KL against k8v8 of k6v6, kw6 (k6v6 + the fp16 sink-4 / window-128 ring) and
+  tq6 / tq5 once per model. The default format is kw6 when its KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on
+  k6v6), written to `kv_cache.json` as `kvwin: "4:128"` (`serve.py --kvwin`, sets `EXL3_KVWIN` before the model is built). tq6 / tq5 are
+  measured and reported but stay opt-in (`--kv-mode tq`); `QUALIFY_KV_TQ=1` lets them win (fewest bytes among the formats within the
+  margin, a narrower one only if every wider one qualifies). `--no-kv-modes` skips the stage. The report also lists decode s/token per format.
+
+Qualify cells, RTX 3090, one 256-step 32K doc, KL vs k8v8 (decode s/tok): Nanbeige k6v6 .00495 (.0356) | kw6 .00267 (.0361) | tq6 .00251 | tq5 .00456
+-> kw6. Qwen27 k6v6 .00515 | kw6 .0478 | tq6 .0293 | tq5 .0061 -> k6v6 (one doc, noisy: the same doc gave tq6 .0125 before the kernel change).
 
 ## Measured (Qwen3.8-27B EXL3, RTX 3090, graphs on, drafts off, decode tok/s, median of 3)
 
@@ -49,3 +54,7 @@ k6v6 .00062 / .043, tq6 .00060 / .026, tq5 .00115 / .100.
 Nanbeige (Llama arch, no recurrent slots): the sink/window ring now binds there too (KVWinState). 32K KL vs k8v8, p1 / p2: k6v6 (production, no
 window at 6 bits) .0536 / .0156, tq6 .0319 / .0088, tq5 .0544 / .0182, **k6v6 + the same ring .0216 / .0084**. Most of tq's gain over the
 production k6v6 on that model is the ring, not the codebook; k6v6 + ring is as good in KL and a little faster to decode (0.0309 vs 0.0318 s/tok).
+
+Served A/B, same session (decode tok/s, median of 3): 4K / 32K / 120K k6v6 46.29 / 44.20 / 37.45 | kw6 46.13 / 43.75 / 38.02 | tq6 45.68 / 43.33 / 37.24
+(tq6 vs kw6: -1.0 / -1.0 / -2.1 %). One 32K decode step is 27.2 ms of GPU time; tq6 adds ~0.32 ms over the same ring (q/k/v rotation 0.14, writer 0.10
+more than the quant writer, qdec 0.08), the ring itself ~0.30 ms in both kw6 and tq6.

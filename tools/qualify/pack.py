@@ -104,13 +104,15 @@ def draft_policy(meta: dict) -> str:
 
 
 def serve_flags(meta: dict, *, port: int, ctx: int, sessions: int, k_bits: int, v_bits: int, model_id: str = "qual",
-                draft: str | None = None, kv_mode: str = "quant") -> list[str]:
+                draft: str | None = None, kv_mode: str = "quant", kvwin: str | None = None) -> list[str]:
     """argv of the server (after the python executable) for this pack. No hand flags: every value is derived."""
     f = [meta["serve_entry"], "--model", meta["path"], "--port", str(port), "--model-id", model_id, "-c", str(ctx),
          "--sessions", str(sessions), "--k-bits", str(k_bits), "--v-bits", str(v_bits),
          "--draft-policy", draft or draft_policy(meta)]
     if kv_mode != "quant":
         f += ["--kv-mode", kv_mode]
+    if kvwin:
+        f += ["--kvwin", kvwin]
     if not meta["vision"]:
         f.append("--no-vision")
     if meta["template"]:
