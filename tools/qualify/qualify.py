@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import backends  # noqa: E402
+import convert_job  # noqa: E402
 import pack as packmod  # noqa: E402
 import plan as planmod  # noqa: E402
 import report  # noqa: E402
@@ -43,6 +44,14 @@ def parse(argv=None) -> dict:
     ap.add_argument("--soak-s", type=float, default=360, help="seconds of mixed agent-shaped load per session count at the max-ctx result (soak stage); on any error -c steps down 8 %% and the soak reruns")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
+    ap.add_argument("--convert-from", help="BF16 checkpoint directory: convert it into --pack first when the pack is missing/incomplete (own-PID memory guard, resume, convert.log + chat template carried into the pack)")
+    ap.add_argument("--bits", type=float, default=4.0, help="conversion bits per weight")
+    ap.add_argument("--head-bits", type=int, default=6)
+    ap.add_argument("--conv-work", help="converter work dir (default <out>/conv_work; kept until the conversion succeeds, deleted then unless --keep-work)")
+    ap.add_argument("--conv-extra", default="", help="extra converter flags, e.g. '-hq'")
+    ap.add_argument("--conv-pause-gib", type=float, default=6.0, help="SIGSTOP the converter when MemAvailable falls below this")
+    ap.add_argument("--conv-resume-gib", type=float, default=10.0)
+    ap.add_argument("--keep-work", action="store_true")
     ap.add_argument("--hf", help="HF repo to download into --pack first (license/size/disk-floor checked)")
     ap.add_argument("--conv-log", help="converter log (per-layer SQNR); default <pack>/convert.log")
     ap.add_argument("--smoke-tasks", default="", help="hermes_opt/eval task ids (default: 4 spread over the suite)")
@@ -71,6 +80,12 @@ def logger(out: Path):
 def main(argv=None) -> int:
     a = parse(argv)
     out = Path(a["out"]); out.mkdir(parents=True, exist_ok=True)
+    if a["convert_from"] and not convert_job.pack_complete(a["pack"]):
+        if a["dry_run"]:
+            print("convert stage: " + " ".join(convert_job.convert_argv(a["convert_from"], a.get("conv_work") or str(out / "conv_work"), a["pack"], a["bits"], a["head_bits"],
+                                                                     False, a["conv_extra"].split())) + f"\n(needs ~{convert_job.disk_need_gb(a['convert_from']):.0f} GB; then the plan below on the new pack)")
+            return 0
+        _convert(a, out)
     meta = packmod.read_pack(a["pack"])
     state = planmod.load_state(out)
     only = a["stage"].split(",") if a["stage"] else None
@@ -125,6 +140,18 @@ def main(argv=None) -> int:
         planmod.save_stage(out, "report", planmod.fingerprint("report", meta, a), "done", 0, dict(verdict=j["verdict"]))
         log(f"report written ({out}/REPORT.md); verdict pass={j['verdict']['pass']} reasons={j['verdict']['reasons']} unmeasured={j['verdict']['unmeasured']}; total {time.time()-t_all:.0f} s")
     return 0
+
+
+def _convert(a, out):
+    """Stage 0 (only with --convert-from and no complete pack): runs before the pack metadata exists, under the GPU locks."""
+    from locks import gpu_locks
+    log = logger(out)
+    prof = backends.profile(a["backend"], a["repo"])
+    log(f"stage convert start ({a['convert_from']} -> {a['pack']}, {a['bits']} bpw, head {a['head_bits']})")
+    with gpu_locks(prof["locks"], log):
+        r = convert_job.run_convert(prof, Path(a["repo"]), a, out, log)
+    (out / "convert.json").write_text(json.dumps(r, indent=1))
+    log(f"stage convert done in {r['wall_s']:.0f} s (paused {r['paused_s']:.0f} s, {r['pauses']} pauses, template from {r['template_from']})")
 
 
 def _split_serve(c, do_serve, do_smoke):
