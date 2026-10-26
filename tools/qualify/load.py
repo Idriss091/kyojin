@@ -8,6 +8,7 @@ import json
 import random
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -61,6 +62,8 @@ class Client:
                     s = (d.get("content") or "") + (d.get("reasoning_content") or "")
                     if s:
                         first = first or time.time(); txt.append(s)
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}: {e.read().decode(errors='replace')[:240]}"
         except Exception as e:
             err = repr(e)[:300]
         te = time.time(); ct = (usage or {}).get("completion_tokens", 0)
@@ -88,11 +91,18 @@ class Client:
         return self.cpt
 
     def near_full(self, ctx: int, slot: int, fill: float = 0.97, reply: int = 32) -> dict:
-        """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx)."""
+        """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx). Corpora differ in chars/token (code and CJK are denser), so a
+        refused prompt (HTTP 400 context overflow) is shrunk and a short one is topped up, up to 3 times, from the server's own usage.prompt_tokens."""
         want = int(ctx * fill) - reply
-        r = self.stream(self.prompt(want, slot), reply)
-        if r["ptok"] and not r["err"] and r["ptok"] < 0.9 * want:     # calibration drift: top up once
-            r = self.stream(self.prompt(int(want * want / r["ptok"]), slot), reply)
+        n = want
+        for _ in range(3):
+            r = self.stream(self.prompt(n, slot), reply)
+            if r["err"] and "400" in r["err"] and n > 256:
+                n = int(n * 0.9)
+            elif not r["err"] and r["ptok"] and r["ptok"] < 0.9 * want:
+                n = int(n * want / r["ptok"])
+            else:
+                break
         return r
 
     def concurrent(self, n: int, tokens: int, max_tokens: int = 128) -> dict:
