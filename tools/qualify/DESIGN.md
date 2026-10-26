@@ -54,3 +54,18 @@ GDN/MoE/MLA reference adapters (only dense Llama), MLX profile, Strix real run, 
 - `standard_cal_data` is also the quantizer's calibration source: the domain docs use late offsets (held-out in practice, not by construction). A truly
   held-out set is a v2 item.
 - The Hermes smoke needs an eval suite with `lib/taskdefs.py`: point `QUALIFY_EVAL_DIR` at it.
+
+## oneshot additions (feat/oneshot, 26/10): the new-model path with zero hand step
+Stage order is now `[convert] fetch meta parity kv draft autotune maxctx soak serve smoke report`.
+- `convert` (only with `--convert-from BF16_DIR` and no complete pack; `convert_job.py`): runs `convert.py -b --bits -hb --head-bits` under the GPU locks with an own-process-group
+  SIGSTOP/SIGCONT memory guard (`--conv-pause-gib 6` / `--conv-resume-gib 10`), resumes from the work dir, keeps the converter log as `<pack>/convert.log` (per-layer SQNR for `parity`),
+  carries the chat template into the pack (source `chat_template.jinja`, else the one embedded in `tokenizer_config.json`), checks the disk floor against ~0.95 x source size.
+- `backends.find_python`: the interpreter whose torch matches the backend (cuda/hip), found in the engine checkout's venv, `$VIRTUAL_ENV`, `~/hermes-work/*/{venv,.venv}`; `QUALIFY_PYTHON` overrides.
+- `kv` without a BF16 reference: the pack-only decode-faithful `kvmode` KL vs the pack's own k8v8 decides Q6 vs k8v8 and k6v6 vs kw6 (before, the stage was skipped and the lane fell back to k6v6 unmeasured).
+- `draft` (head-less packs; a pack with its own MTP head keeps `mix`): `drafter.py` finds a DFlash drafter structurally compatible with the target (local `--drafter`, `<pack>/dflash`, `~/models/drafters/*`,
+  else a HF search `<model stem> dflash`, `exllamav3` branch preferred, downloaded under the disk floor), then an ABBA plain/drafted/drafted/plain served A/B on code/chat/agentic (warm-up dropped).
+  Kept only if chat >= 0.97x and some kind >= 1.10x (`rules.choose_draft`); adaptive depth (`--dflash-adapt on`). Later stages (autotune, maxctx, soak, serve) run WITH the winner, because the drafter's VRAM changes the safe -c.
+- `soak`: for each session count, the max-ctx result is served and driven by `--soak-s` seconds of agent-shaped load (70 % short, 25 % medium, 5 % near-full share, distinct prompts); any error / OOM line steps -c down 8 % and reruns.
+  The soak value replaces the search value in `qualify.json`.
+- Report: `serve.lane.cmd` is the full command to ship (kv mode, -c, sessions, draft path, tuning cache in the pack, prefix disk env, CUDA graphs, reply budget), `serve.hermes` the provider block
+  (`model.context_length` = -c, `compression.threshold` = 0.8 of one session's share of -c).
