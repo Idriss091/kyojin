@@ -108,7 +108,8 @@ def job_autotune(c: Ctx) -> dict:
     shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
     sessions = max(c.args["sessions"])
     ctx = min(c.args.get("ctx_cap") or 16384, 16384, c.meta["max_pos"])
-    prof = {**c.prof, "env": {**c.prof["env"], "EXLLAMAV3_TUNE_CACHE": str(scratch), "EXL3_PACK_TUNE": "0"}}
+    prof = {**c.prof, "env": {**c.prof["env"], "EXLLAMAV3_TUNE_CACHE": str(scratch), "EXL3_PACK_TUNE": "0",
+                                  "EXL3_DENSE_GEMM_TUNE_FILE": str(scratch / "dense_gemm_tune.txt")}}
     k, v = chosen_kv(c)
     argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v)
     log = c.out / "srv_autotune.log"
@@ -127,6 +128,9 @@ def job_autotune(c: Ctx) -> dict:
     if not recs:
         raise RuntimeError("autotune: the replay produced no tuning records (does this build have the GEMM autotuner?)")
     tdir.mkdir(exist_ok=True)
+    dense = scratch / "dense_gemm_tune.txt"
+    if dense.is_file() and dense.stat().st_size:
+        shutil.copy(dense, tdir / f"{sig['file']}.dense.txt")
     tc.write_records(tdir / f"{sig['file']}.bin", recs)
     man = dict(schema=1, signature=sig, records=len(recs), records_at_load=at_load, load_s=round(load_s, 1), wall_s=round(time.time() - t0, 1),
                sessions=sessions, ctx=ctx, sweep=sweep, cmd=argv, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"))

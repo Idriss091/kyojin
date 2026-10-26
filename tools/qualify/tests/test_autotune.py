@@ -133,3 +133,14 @@ class TestReplay(unittest.TestCase):
             self.assertTrue(all(r["ok"] for r in res), [r for r in res if not r["ok"]][:2])
         finally:
             p.terminate(); p.wait(10)
+
+
+class TestDense(unittest.TestCase):
+    def test_dense_text_merge_keeps_live_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "live.txt").write_text("1 2 3 4 5 6 7\n")
+            (d / "pack.txt").write_text("1 2 3 4 5 6 9\n7 7 7 7 7 7 7\nbad line\n")
+            self.assertEqual(tc.merge_dense_text(d / "live.txt", d / "pack.txt"), 1)
+            self.assertEqual((d / "live.txt").read_text().splitlines(), ["1 2 3 4 5 6 7", "7 7 7 7 7 7 7"])
+            self.assertEqual(tc.merge_dense_text(d / "new.txt", d / "pack.txt"), 2)

@@ -6,7 +6,8 @@ The cooperative GEMM autotuner (exllamav3_ext/quant/coop_autotune.cu) times its 
 The qualify autotune stage runs the tuner for every shape of a pack ahead of time and ships the winners next to the pack:
 
     <pack>/tuning/<signature>.bin      same record format as the live cache (32-byte records, header EX3ATUNE)
-    <pack>/tuning/<signature>.json     manifest: device, shapes, per-shape timings, engine version
+    <pack>/tuning/<signature>.json     manifest: device, sweep, timings, engine version
+    <pack>/tuning/<signature>.dense.txt  ROCm only: dense-GEMM rocBLAS tune lines (EXL3_DENSE_GEMM_TUNE_FILE format)
 
 install_pack(model_dir) merges the file whose signature matches this device into the live cache before the first GEMM
 (records already present win; nothing is overwritten). A record is validated against the live candidates by the C++ loader
@@ -109,16 +110,41 @@ def merge_into(dst, srcs) -> int:
     return len(new)
 
 
+def dense_live_path() -> Path:
+    """ROCm dense-GEMM tune file (hgemm.cu dtune): EXL3_DENSE_GEMM_TUNE_FILE or ~/.cache/exllamav3/dense_gemm_tune.txt."""
+    o = os.environ.get("EXL3_DENSE_GEMM_TUNE_FILE")
+    return Path(o) if o else Path(os.environ.get("HOME", "/tmp")) / ".cache/exllamav3/dense_gemm_tune.txt"
+
+
+def merge_dense_text(dst, src) -> int:
+    """Append the lines of src (7 fields: key = first 6) whose key dst lacks. Same rule as dense_warmup.seed_dense_tune."""
+    key = lambda ln: tuple(ln.split()[:6])
+    dst, src = Path(dst), Path(src)
+    have = {key(l) for l in dst.read_text().splitlines() if len(l.split()) == 7} if dst.exists() else set()
+    new = [l for l in src.read_text().splitlines() if len(l.split()) == 7 and key(l) not in have]
+    if new:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "a") as f:
+            f.write("\n".join(new) + "\n")
+    return len(new)
+
+
 def install_pack(model_dir, log=print) -> int:
     """Call before the first GEMM of the process (the C++ cache is read once, lazily). Returns records added to the live cache."""
     if os.environ.get("EXL3_PACK_TUNE", "1") == "0":
         return 0
     try:
-        files = pack_files(model_dir)
-        if not files:
-            return 0
-        n = merge_into(live_cache_path(), files)
-        log(f"tune cache: {n} records from {files[0].name} merged into {live_cache_path()}")
+        sig = signature()
+        n = 0
+        files = pack_files(model_dir, sig)
+        if files:
+            n = merge_into(live_cache_path(), files)
+            log(f"tune cache: {n} records from {files[0].name} merged into {live_cache_path()}")
+        dense = Path(model_dir) / TUNING_DIR / f"{sig['file']}.dense.txt"      # ROCm rocBLAS solution per dense shape class
+        if dense.is_file():
+            m = merge_dense_text(dense_live_path(), dense)
+            log(f"tune cache: {m} dense-GEMM lines from {dense.name} merged into {dense_live_path()}")
+            n += m
         return n
     except Exception as e:   # noqa: BLE001  a bad tuning file must never stop a serve start
         log(f"tune cache: pack cache ignored ({e})")
