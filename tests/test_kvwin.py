@@ -624,3 +624,23 @@ def test_off_is_bitwise_today():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-x", "-q"] + sys.argv[1:]))
+
+
+def test_whole_forward_graph_declines_only_for_a_cold_ring(monkeypatch):
+    """A bound ring no longer blocks the whole-forward graph: only a step whose job has a cold ring (host-side fill) runs eager."""
+    from exllamav3.model.cuda_graph import CudaGraphRunner
+    cache, model, cl, st = _fake_cache(monkeypatch)
+    state = cache.get_new_state()
+    runner = object.__new__(CudaGraphRunner)
+    runner.has_gdn, runner.has_conv, runner.has_mamba, runner.has_swa = True, False, False, False
+    ids = torch.zeros((1, 1), dtype = torch.long)
+    params = {"block_table": torch.zeros((1, 4), dtype = torch.int32), "cache_seqlens": torch.full((1,), 300, dtype = torch.int32),
+              "cache": cache, "recurrent_states": [state], "recurrent_slots": torch.tensor([state.slot], dtype = torch.int32)}
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert kvwin.ANY_ACTIVE and not kvwin.any_cold(params)
+    assert runner._decline(ids, params) is None
+    st.cold[state.slot] = True
+    assert kvwin.any_cold(params) and runner._decline(ids, params) == "kvwin_cold"
+    st.cold[state.slot] = False
+    assert runner._decline(ids, params) is None
+    assert not kvwin.any_cold({}) and not kvwin.any_cold({"recurrent_states": [state]})

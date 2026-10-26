@@ -22,7 +22,7 @@ from typing import NamedTuple
 import torch
 from ..constants import PAGE_SIZE
 
-ANY_ACTIVE = False   # a bound ring exists in this process: the whole-forward graph declines (it cannot fill cold rings)
+ANY_ACTIVE = False   # a bound ring exists in this process (the whole-forward graph then checks any_cold before each replay)
 MAX_DRAFT = 16     # rows one verify step writes at once (BC_Attention MAX_QLEN, the decode kernels' q_len cap)
 
 
@@ -139,7 +139,7 @@ class KVWinLayerState:
         self.cache_layer = cache_layer
         global ANY_ACTIVE
         ANY_ACTIVE = True
-        cache_layer.kvwin = self        # BC_Attention (graph decode) and the whole-forward graph decline such layers
+        cache_layer.kvwin = self        # BC_Attention (per-layer graph decode) declines such layers: they run the Python path
 
     @property
     def active(self) -> bool:
@@ -242,6 +242,20 @@ class KVWinLayerState:
             out = torch.empty((pos.numel(), dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_cont(qr, sr, out, cl.compand_a)
             dst[slot].index_copy_(0, rows, out.view(-1, m.num_kv_heads, m.head_dim))
+
+
+def any_cold(params: dict) -> bool:
+    """True when a job of this call has a cold ring (restored from a checkpoint without ring blob): its rebuild from the pool is a
+    host-side step, so the whole-forward graph declines that step (the eager call fills it) and replays from the next one."""
+    rs, cache = params.get("recurrent_states"), params.get("cache")
+    rl = getattr(cache, "recurrent_layers", None)
+    if not rs or not rl:
+        return False
+    slots = [r.slot for r in rs]
+    for st in rl.values():
+        if getattr(st, "kvwin", False) and st.active and any(st.cold[s] for s in slots):
+            return True
+    return False
 
 
 def make_ctx(cache_layer_state: KVWinLayerState | None, params: dict, device, bsz: int) -> KVWinCtx | None:
