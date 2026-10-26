@@ -203,6 +203,29 @@ class KVWinLayerState:
             return out
         return (self.ov_k[slot].cpu(), self.ov_v[slot].cpu())
 
+    def stash_async(self, slot, pin_pool: dict = None):
+        """Non-blocking D2H of the slot's ring into pinned host tensors (reused from pin_pool, see GDNLayerState.stash_async):
+        a ring that stashed through a blocking .cpu() kept the whole checkpoint synchronous, stalling every session's decode."""
+        if not self.active:
+            return None
+        return self.stash_from_snapshot((self.ov_k[slot], self.ov_v[slot]), pin_pool)
+
+    def snapshot(self, slot):
+        if not self.active:
+            return None
+        return (self.ov_k[slot].clone(), self.ov_v[slot].clone())
+
+    def stash_from_snapshot(self, snap, pin_pool: dict = None):
+        if snap is None:
+            return None
+        out = []
+        for src in snap:
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
+
     def unstash(self, slot, stashed, position: int = 0):
         if not self.active:
             return

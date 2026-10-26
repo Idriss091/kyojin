@@ -1903,7 +1903,7 @@ class Job:
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
             from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
                 any(isinstance(m, GatedDeltaNet) for m in rl)
@@ -1924,7 +1924,7 @@ class Job:
         ok = getattr(g, "_big_tail_ok", None)
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, GatedDeltaNet) and m.kda for m in rl)
             g._big_tail_ok = ok

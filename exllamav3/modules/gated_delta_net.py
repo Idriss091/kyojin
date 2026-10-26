@@ -241,7 +241,7 @@ class GDNState:
         }
         if not self.cache.model.loaded_tp:
             layers = self.cache.get_all_recurrent_layers()
-            if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+            if async_ and all(isinstance(l, GDNLayerState) or getattr(l, "kvwin", False) for l in layers.values()):
                 if os.environ.get("EXL3_STASH_SIDE", "0") == "1" and torch.cuda.is_available():
                     # Snapshot every layer's state on the device (one D2D copy each, 153 MB at 27B: ~0.4 ms) and run the D2H
                     # on a side stream: the copies (40 ms over a x4 link) overlap the first decode steps instead of delaying
