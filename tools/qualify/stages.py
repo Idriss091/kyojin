@@ -209,16 +209,26 @@ def job_kv(c: Ctx) -> dict:
     if not d.exists():
         c.py("docs.py", "long", c.meta["path"], d)
     bits = c.args["kv_bits"]
-    with c.locks():
-        refdir = c.out / "ref_long"
-        if not (refdir / "logits_long.pt").exists():
-            run_ref(c, d, refdir, tail=1024)
-        c.py("gpu_eval.py", "kv", c.meta["path"], d, refdir, c.out / "kv_raw.json", *bits)
-    raw = json.loads((c.out / "kv_raw.json").read_text())
-    kl8 = {int(b): v["kl_vs_k8"] for b, v in raw.items() if "kl_vs_k8" in v}
-    out = dict(table=raw, chosen=list(rules.choose_kv(kl8, c.args["kv_kl_max"])), kl_max=c.args["kv_kl_max"], rule="smallest symmetric bits >= Q6 with KL vs k8v8 <= kl_max, else k8v8", mode="quant")
-    if c.args.get("kv_modes", True) and tuple(out["chosen"]) == (6, 6):
-        out.update(job_kvmode(c, d))
+    have_ref = bool(c.args.get("ref") and c.meta.get("ref_adapter"))
+    if have_ref:
+        with c.locks():
+            refdir = c.out / "ref_long"
+            if not (refdir / "logits_long.pt").exists():
+                run_ref(c, d, refdir, tail=1024)
+            c.py("gpu_eval.py", "kv", c.meta["path"], d, refdir, c.out / "kv_raw.json", *bits)
+        raw = json.loads((c.out / "kv_raw.json").read_text())
+        kl8 = {int(b): v["kl_vs_k8"] for b, v in raw.items() if "kl_vs_k8" in v}
+        out = dict(table=raw, chosen=list(rules.choose_kv(kl8, c.args["kv_kl_max"])), kl_max=c.args["kv_kl_max"], rule="smallest symmetric bits >= Q6 with KL vs k8v8 <= kl_max, else k8v8", mode="quant")
+        if c.args.get("kv_modes", True) and tuple(out["chosen"]) == (6, 6):
+            out.update(job_kvmode(c, d))
+    else:       # no BF16 reference on disk (the pack is all there is): the pack-only kvmode measure decides, KL against the pack's own k8v8
+        km = job_kvmode(c, d)
+        k6 = rules.choose_kv({6: km["modes"]["k6v6"]["kl_vs_k8"]}, c.args["kv_kl_max"])
+        out = dict(table={}, chosen=list(k6), kl_max=c.args["kv_kl_max"], mode="quant", rule="no BF16 reference: Q6 if kvmode KL(k6v6 vs k8v8) <= kl_max else k8v8; Q6 format by the kvmode rule")
+        if k6 == (6, 6):
+            out.update(km)
+        else:
+            out["modes"] = km["modes"]
     write_kv_choice(c, out)
     return out
 

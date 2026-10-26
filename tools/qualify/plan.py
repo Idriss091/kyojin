@@ -77,10 +77,11 @@ def build_plan(meta: dict, args: dict, state: dict, only: list | None = None, re
             st.status, st.note = "skip", "no --ref BF16 dir: parity unmeasured"
         elif name == "parity" and not meta.get("ref_adapter"):
             st.status, st.note = "skip", f"no reference adapter for family {meta.get('family')}: parity unmeasured"
-        elif name == "kv" and not args.get("ref"):
-            st.status, st.note = "skip", "kv KL needs the BF16 reference tail (--ref): falling back to k6v6 (Q6 rule)"
-        elif name == "kv" and not meta.get("ref_adapter"):
-            st.status, st.note = "skip", f"no reference adapter for family {meta.get('family')}: falling back to k6v6"
+        elif name == "kv" and not (args.get("ref") and meta.get("ref_adapter")):
+            if args.get("kv_modes", True):
+                st.note = "no BF16 reference (--ref / family adapter): KV format picked from the pack-only decode-faithful KL vs k8v8 (kvmode)"
+            else:
+                st.status, st.note = "skip", "kv KL needs the BF16 reference tail (--ref) or the kvmode measure: falling back to k6v6 (Q6 rule)"
         d = state.get(name)
         if st.status == "todo" and d and d.get("status") == "done" and d.get("key") == fingerprint(name, meta, args) and name not in redo:
             st.status, st.note = "done", f"resumed ({d.get('wall_s')} s)"

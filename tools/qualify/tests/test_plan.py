@@ -89,9 +89,14 @@ class PlanTests(unittest.TestCase):
     def names(self, plan, status):
         return [s.name for s in plan if s.status == status]
 
-    def test_full_plan_without_ref_skips_parity_and_kv_with_reason(self):
+    def test_full_plan_without_ref_skips_parity_but_kv_runs_pack_only(self):
         p = planmod.build_plan(self.meta(), args(), {})
         self.assertEqual([s.name for s in p], planmod.ORDER)
+        self.assertEqual(self.names(p, "skip"), ["parity"])
+        self.assertIn("kvmode", next(s for s in p if s.name == "kv").note)
+
+    def test_no_ref_and_no_kv_modes_skips_kv_with_reason(self):
+        p = planmod.build_plan(self.meta(), args(kv_modes=False), {})
         self.assertEqual(self.names(p, "skip"), ["parity", "kv"])
         self.assertIn("k6v6", next(s for s in p if s.name == "kv").note)
 
