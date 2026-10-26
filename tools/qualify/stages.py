@@ -15,6 +15,7 @@ import backends
 import docs as docs_mod
 import load
 import pack as packmod
+import drafter as drafter_mod
 import rules
 import search
 import smoke
@@ -65,17 +66,17 @@ def stage_fetch(c: Ctx) -> dict:
     return d
 
 
-def fetch_hf(repo: str, dest: str, floor_gb: float) -> dict:
+def fetch_hf(repo: str, dest: str, floor_gb: float, revision: str = "main") -> dict:
     """Download under the disk floor (drill-0 gap 1: license + size + floor were checked by hand)."""
     from huggingface_hub import HfApi, snapshot_download
-    info = HfApi().model_info(repo, files_metadata=True)
+    info = HfApi().model_info(repo, revision=revision, files_metadata=True)
     size = sum(s.size or 0 for s in info.siblings) / 1e9
     lic = next((t.split(":", 1)[1] for t in (info.tags or []) if t.startswith("license:")), None)
     free = packmod.disk_free_gb(dest)
     if free - size < floor_gb:
         raise RuntimeError(f"{repo}: {size:.1f} GB would leave {free-size:.1f} GB free < floor {floor_gb} GB")
-    snapshot_download(repo, local_dir=dest)
-    return dict(repo=repo, size_gb=round(size, 1), license=lic)
+    snapshot_download(repo, revision=revision, local_dir=dest)
+    return dict(repo=repo, revision=revision, size_gb=round(size, 1), license=lic)
 
 
 def stage_meta(c: Ctx) -> dict:
@@ -112,7 +113,8 @@ def job_autotune(c: Ctx) -> dict:
     prof = {**c.prof, "env": {**c.prof["env"], "EXLLAMAV3_TUNE_CACHE": str(scratch), "EXL3_PACK_TUNE": "0",
                                   "EXL3_DENSE_GEMM_TUNE_FILE": str(scratch / "dense_gemm_tune.txt")}}
     k, v = chosen_kv(c)
-    argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v)
+    pol, ddir = chosen_draft(c)
+    argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, draft=pol, dflash_dir=ddir)
     if "--no-vision" not in argv:
         argv.append("--no-vision")                   # the tower is another model (no GEMM autotune keys of the text path) and costs VRAM
     log = c.out / "srv_autotune.log"
@@ -266,6 +268,12 @@ def chosen_kv(c: Ctx) -> tuple:
     return tuple(kv["chosen"]) if kv else (6, 6)     # no reference: owner's Q6 minimum
 
 
+def chosen_draft(c: Ctx) -> tuple:
+    """(policy, dflash dir) the later stages serve with: the draft stage's A/B winner, else the pack's own policy (vendor MTP head or off)."""
+    d = c.data.get("draft") or {}
+    return d.get("policy") or packmod.draft_policy(c.meta), d.get("dflash_dir")
+
+
 def chosen_kvwin(c: Ctx) -> str | None:
     return (c.data.get("kv") or {}).get("kvwin")
 
@@ -274,10 +282,75 @@ def chosen_kv_mode(c: Ctx) -> str:
     return (c.data.get("kv") or {}).get("mode", "quant")
 
 
+# ---------------------------------------------------------------- draft path
+def locate_drafter(c: Ctx) -> dict:
+    """Local candidates first (--drafter, <pack>/dflash, ~/models/drafters), then one HF search by model stem (+ download under the disk floor)."""
+    d, notes = drafter_mod.find_local(c.meta, c.args.get("drafter"))
+    if d or c.args.get("no_hf_drafter"):
+        return dict(dir=d, notes=notes, source="local" if d else None)
+    repo = drafter_mod.pick_hf(drafter_mod.search_hf(c.meta))
+    if not repo:
+        return dict(dir=None, notes=notes + ["no HF repo named <model stem> + dflash"], source=None)
+    dest = drafter_mod.DRAFTER_HOME / repo.split("/", 1)[-1]
+    info = fetch_hf(repo, str(dest), c.args["disk_floor_gb"], drafter_mod.hf_revision(repo))
+    bad = drafter_mod.validate(dest, c.meta)
+    if bad:
+        return dict(dir=None, notes=notes + [f"{repo}: " + "; ".join(bad)], source=None, hf=info)
+    return dict(dir=str(dest), notes=notes, source="hf", hf=info)
+
+
+def draft_variants() -> list:
+    """ABBA: plain, drafted, drafted, plain (both orders, so a warm-up or thermal drift hits both policies equally)."""
+    return ["plain", "dflash", "dflash", "plain"]
+
+
+def speedups(runs: list) -> dict:
+    """runs: [{variant, tps: {kind: [tok/s ...]}}] -> {kind: mean drafted tok/s / mean plain tok/s} (warm-up already dropped)."""
+    out = {}
+    for kind in runs[0]["tps"]:
+        m = {v: statistics.mean(x for r in runs if r["variant"] == v for x in r["tps"][kind]) for v in ("plain", "dflash")}
+        out[kind] = round(m["dflash"] / m["plain"], 3)
+    return out
+
+
+def job_draft(c: Ctx) -> dict:
+    base = packmod.draft_policy(c.meta)
+    if base != "off" or c.meta.get("mtp_layers"):         # the pack's own MTP head is the draft path; vendor drafters are for head-less packs
+        return dict(policy=base, dflash_dir=None, reason=f"pack has {c.meta['mtp_layers']} MTP layer(s): policy {base}")
+    loc = locate_drafter(c)
+    if not loc["dir"]:
+        return dict(policy=base, dflash_dir=None, reason="no compatible drafter found", **{k: loc[k] for k in ("notes",)})
+    c.need_ram()
+    k, v = chosen_kv(c)
+    ctx = min(12288, c.meta["max_pos"])
+    runs = []
+    with c.locks():
+        for i, var in enumerate(draft_variants()):
+            argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=1, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
+                                       draft="dflash" if var == "dflash" else "off", dflash_dir=loc["dir"] if var == "dflash" else None)
+            log = c.out / f"srv_draft_{i}_{var}.log"
+            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
+                if not ok:
+                    raise RuntimeError(f"draft: {var} server did not start: " + (log.read_text(errors="replace").strip().splitlines() or [""])[-1][:200])
+                cl = load.Client(c.args["port"], "qual")
+                tps = {}
+                for kind, prompts in cl.kind_prompts().items():
+                    cl.stream(prompts[0], 64)                                     # warm-up (graphs, caches) discarded
+                    tps[kind] = [r["dec_tps"] for pr in prompts for r in [cl.stream(pr, 256) for _ in range(2)] if r["dec_tps"]]
+            runs.append(dict(variant=var, tps=tps, oom=oom_in(log)))
+            c.log(f"draft: {var}: " + ", ".join(f"{k_} {statistics.mean(x):.1f}" for k_, x in tps.items() if x) + " tok/s")
+    sp = speedups(runs)
+    use, why = rules.choose_draft(sp)
+    return dict(policy="dflash" if use else base, dflash_dir=loc["dir"] if use else None, drafter=loc["dir"], source=loc["source"], speedup=sp, reason=why, runs=runs,
+                note="adaptive depth (--dflash-adapt on)" if use else "drafter measured but not kept")
+
+
 # ---------------------------------------------------------------- max ctx
 def start_args(c: Ctx, ctx: int, sessions: int) -> list:
     k, v = chosen_kv(c)
-    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c))
+    pol, ddir = chosen_draft(c)
+    return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
+                               draft=pol, dflash_dir=ddir)
 
 
 def probe_factory(c: Ctx, sessions: int):

@@ -18,6 +18,17 @@ FR = ["Explique en quatre ou cinq phrases pourquoi le ciel est bleu, puis donne 
 NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}, "enable_thinking": False}
 
 
+# Decode-speed prompt kinds of the draft A/B (nanbdf bench kinds): drafters gain on copy-heavy agentic output, little on free chat.
+CODE_Q = "Write a Python module with an LRU cache class (get/put/evict, O(1)), type hints, docstrings and 5 pytest tests. Output only code."
+CHAT_Q = ["Raconte-moi une histoire courte sur un phare et un renard, avec des dialogues.", "Quels sont les avantages et les inconvénients du télétravail ? Réponds en un paragraphe argumenté."]
+
+
+def agentic_prompt(n_lines: int = 70) -> str:
+    """Copy-heavy turn typical of tool use: re-emit a file with two renamed identifiers (most output tokens repeat the input)."""
+    src = "\n".join(f"def handler_{i}(request, ctx):\n    value = ctx.get('key_{i}', {i})\n    return {{'id': {i}, 'ok': value is not None}}\n" for i in range(n_lines // 3))
+    return f"Voici un fichier Python.\n\n```python\n{src}```\n\nRéécris ce fichier en entier, à l'identique, mais en renommant handler_3 en process_three et handler_7 en process_seven. Donne uniquement le code."
+
+
 class Client:
     def __init__(self, port: int, model: str = "qual", corpus_dir: Path = CAL_DIR):
         self.url = f"http://127.0.0.1:{port}"
@@ -55,6 +66,9 @@ class Client:
         return dict(ptok=(usage or {}).get("prompt_tokens"), ntok=ct, ttft=round((first or te) - t0, 3), total=round(te - t0, 2),
                     dec_tps=round((ct - 1) / (te - first), 2) if first and te > first and ct > 1 else None,
                     sha=hashlib.sha1("".join(txt).encode()).hexdigest()[:10], err=err, t0=t0, first=first, end=te)
+
+    def kind_prompts(self) -> dict:
+        return dict(code=[CODE_Q], chat=CHAT_Q, agentic=[agentic_prompt()])
 
     def prompt(self, tokens: int, slot: int) -> str:
         """~tokens of corpus text, distinct for every (slot, call): fresh offsets so no prefix cache can answer."""

@@ -35,6 +35,27 @@ def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: s
     return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base
 
 
+DRAFT_CHAT_MIN = 0.97      # the adaptive policy must never leave chat slower than plain decode (box-lead 26/10 08:35 gate)
+DRAFT_GAIN_MIN = 1.10      # best kind (code / agentic) must gain at least this to justify the drafter's VRAM (2.2 GiB on the 3090)
+
+
+def choose_draft(speedup: dict[str, float], chat_min: float = DRAFT_CHAT_MIN, gain_min: float = DRAFT_GAIN_MIN) -> tuple[bool, str]:
+    """speedup: {kind: drafted tok/s / plain tok/s} (kinds code / chat / agentic). -> (use_drafter, reason)."""
+    if not speedup:
+        return False, "no measurement"
+    chat = speedup.get("chat")
+    if chat is not None and chat < chat_min:
+        return False, f"chat {chat:.2f}x < {chat_min}"
+    best = max(speedup.values())
+    if best < gain_min:
+        return False, f"best kind {best:.2f}x < {gain_min}"
+    return True, f"best {best:.2f}x, chat {fmt_x(chat)}"
+
+
+def fmt_x(x) -> str:
+    return "-" if x is None else f"{x:.2f}x"
+
+
 def verdict(q: dict, gates: dict | None = None) -> dict:
     """q: assembled qualify data. Returns {pass, reasons[], unmeasured[]}. Missing measurements are listed, never counted as pass."""
     g = dict(kl_mean=0.15, top1_min=0.75, ctx_min=32768, smoke_min=0.8)

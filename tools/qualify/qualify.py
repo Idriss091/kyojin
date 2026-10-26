@@ -38,6 +38,8 @@ def parse(argv=None) -> dict:
     ap.add_argument("--kv-kl-max", type=float, default=0.02)
     ap.add_argument("--no-kv-modes", dest="kv_modes", action="store_false", help="skip the KV format auto-select (k6v6 vs tq6 vs tq5, decode-faithful 32K KL vs k8v8) in the kv stage")
     ap.add_argument("--kvmode-steps", type=int, default=256, help="teacher-forced decode steps scored by the KV format auto-select")
+    ap.add_argument("--drafter", help="DFlash drafter directory (default: <pack>/dflash, ~/models/drafters/*, else a HF search '<model stem> dflash')")
+    ap.add_argument("--no-hf-drafter", action="store_true", help="never search / download a drafter from HF")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
     ap.add_argument("--hf", help="HF repo to download into --pack first (license/size/disk-floor checked)")
@@ -98,7 +100,7 @@ def main(argv=None) -> int:
             names = [x.name for x in todo if x.name in ("serve", "smoke")]
             runner = lambda: _split_serve(c, "serve" in names, "smoke" in names)
         else:
-            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "parity": lambda: st.job_parity(c),
+            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "draft": lambda: st.job_draft(c), "parity": lambda: st.job_parity(c),
                       "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "report": None}[s.name]
         if s.name == "report":
             continue
