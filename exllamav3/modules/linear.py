@@ -285,7 +285,8 @@ class Linear(Module):
                 elif scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
-                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True)
+                    wname = ".weight_packed" if self.config.stc.has_tensor(key + ".weight_packed") else ".weight"    # compressed-tensors / AutoRound MXFP4
+                    w_raw = self.config.stc.get_tensor(key + wname, dev, no_defer = True)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T

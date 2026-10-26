@@ -69,6 +69,14 @@ def test_fp8_per_tensor_and_channel(tmp_path):
         check(w, vi.dequant_fp8(wb, "F8_E4M3", s))
 
 
+def test_mxfp4_weight_packed_name(tmp_path):
+    """AutoRound / compressed-tensors MXFP4: `weight_packed` + U8 `weight_scale` (found on a real Qwen3-0.6B MXFP4 checkpoint)."""
+    nib = H.rng.integers(0, 16, size=(64, 128)).astype(np.uint8)
+    sb = H.rng.integers(120, 132, size=(64, 4)).astype(np.uint8)
+    w = make_linear(tmp_path, {"l.weight_packed": H.t("U8", H.pack_nibbles(nib)), "l.weight_scale": H.t("U8", sb)}, {}, "l", 64, 128)
+    check(w, vi.dequant_mxfp4_linear(H.pack_nibbles(nib), vi.e8m0_to_f32(sb)))
+
+
 def test_mxfp4_linear_u8_and_e8m0(tmp_path):
     nib = H.rng.integers(0, 16, size=(64, 128)).astype(np.uint8)
     sb = H.rng.integers(120, 132, size=(64, 4)).astype(np.uint8)
