@@ -63,6 +63,7 @@ def main() -> int:
         cl = load.Client(a.port)
         cl.calibrate(1000)                                   # also the very first request of the process (the cold arm pays tuning here)
         res["records_after_calibrate"] = records_in(cache)
+        time.sleep(12)                                       # background work after the first chat request (v1 arms: a 20-row prompt right after it took 2.8-6 s on BOTH arms, 0.3 s when first)
         # requests of the shapes a real client reaches that the first request did not: odd short prompts, tails, batched decode
         # (each new row class is timed inside the request on a cold cache; replay.complete = non-streamed, total wall incl. 8 new tokens)
         import replay
