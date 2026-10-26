@@ -715,7 +715,7 @@ class QwenEngine:
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
-                 k_bits: int = 0, v_bits: int = 0):
+                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = ""):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         import torch
@@ -774,7 +774,8 @@ class QwenEngine:
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
-        from exllamav3.util import jit_log, kernel_seed
+        from exllamav3.util import jit_log, kernel_seed, tune_cache
+        tune_cache.install_pack(model_path)   # <pack>/tuning: GEMM autotune winners from qualify --stage autotune
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
@@ -783,7 +784,18 @@ class QwenEngine:
         from exllamav3.modules.hyperconnections import GS_STATS
         print("qserve: hc mixer sites by code source", dict(GS_STATS), flush=True)
         self.draft_model = self.draft_cache = None
-        if draft_policy != "off":
+        if draft_policy == "dflash":
+            # DFlash2 block drafter (separate checkpoint, shares the target's embedding and head): it reads the target's hidden-state
+            # taps, drafts a block of block_size - 1 tokens that the stock accept-while-match rule verifies (lossless, greedy or sampled)
+            dconf = Config.from_directory(dflash_dir)
+            assert dconf.tap_shift == 0 and ndt == dconf.block_size - 1, f"--ndt must be {dconf.block_size - 1} for this drafter"
+            self.draft_model = Model.from_config(dconf)
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt))
+            startup_health.stage("drafter weights")
+            with Heartbeat("loading DFlash2 drafter"):
+                self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
+            self.draft_model.attach_to(self.model)
+        elif draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt), **qkw)
             startup_health.stage("drafter weights")
@@ -903,6 +915,26 @@ class QwenEngine:
             while self.generator.num_remaining_jobs():
                 list(self.generator.iterate())
             self.torch.cuda.synchronize()
+        self.warm_peak_mib = self.warmup_concurrent_peak() if self.draft_policy == "dflash" and self.torch.cuda.is_available() else None
+
+    def warmup_concurrent_peak(self) -> float:
+        """Transient VRAM (MiB, above what stays allocated) of one decode round of every session at once, each still prefilling a full
+        chunk: the drafter's block forward and the multi-row verify come on top of the target's prefill scratch. Measured, not modelled:
+        the post-load free figure misses all of it (Nanbeige 33B + DFlash2 at -c 45056 x 2: 2113 MiB left, 28 CUDA OOM under load)."""
+        cuda = self.torch.cuda
+        chunk = int(self.generator.max_chunk_size)
+        cuda.empty_cache()
+        cuda.reset_peak_memory_stats()
+        base = cuda.memory_allocated()
+        for i in range(self.sessions):
+            text = f"<|im_start|>user\n{i} " + "The quick brown fox jumps over the lazy dog near the river bank. " * (chunk // 6 + 64)
+            ids = self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True)[:, :chunk + 64].contiguous()
+            self.generator.enqueue(self.Job(input_ids=ids, max_new_tokens=16, sampler=self._sampler({"temperature": 0.0}),
+                                            stop_conditions=self.eos))
+        while self.generator.num_remaining_jobs():
+            list(self.generator.iterate())
+        cuda.synchronize()
+        return (cuda.max_memory_allocated() - base) / 2**20
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
@@ -1576,6 +1608,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                           f"new={int(done.get('new_tokens') or 0)} prefill_s={float(done.get('time_prefill') or 0):.3f} "
                           f"generate_s={float(done.get('time_generate') or 0):.3f} stop={done.get('eos_reason')}",
                           file=sys.stderr, flush=True)
+                    if os.environ.get("QSERVE_LOG_VRAM") and getattr(engine, "torch", None) is not None:
+                        t = engine.torch.cuda
+                        print(f"qserve: vram alloc={t.memory_allocated() >> 20} MiB peak={t.max_memory_allocated() >> 20} MiB reserved={t.memory_reserved() >> 20} MiB",
+                              file=sys.stderr, flush=True)
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
                     if getattr(engine, "prefix_disk", None) is not None:
@@ -2195,6 +2231,12 @@ def vram_headroom_problem(free_mib: float, ctx: int, kv_mib_per_token: float, se
             f"every long prompt would end in CUDA out of memory. Start with -c {fits} or fewer --sessions (each session holds its recurrent slots, about 1.1 GiB)")
 
 
+def dflash_min_free_mib(warm_peak_mib: float, ctx: int) -> float:
+    """VRAM that must stay free after load with a DFlash2 drafter: the measured concurrent warm-up peak, 256 MiB of slack and the
+    attention scratch that grows with the context (Nanbeige 33B, k6v6: +64 MiB peak from 9.7K to 19K tokens, about 8 MiB per 1K)."""
+    return warm_peak_mib + 256 + 8 * ctx / 1024
+
+
 def free_vram_mib(torch: Any) -> float:
     """VRAM the device has left once torch's cache is returned (the number the first prefill really competes for)."""
     torch.cuda.empty_cache()
@@ -2211,7 +2253,7 @@ def load_all(args: argparse.Namespace):
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
                         cache_bits=args.cache_bits, sessions=args.sessions,
-                        k_bits=args.k_bits, v_bits=args.v_bits)
+                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()))
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2231,7 +2273,13 @@ def load_all(args: argparse.Namespace):
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
         lazy = getattr(engine.draft_model, "lazy_vram_bytes", lambda: 0)() / 2**20 if engine.draft_model is not None else 0.0
         print(f"qserve: VRAM left after load: {free_mib:.0f} MiB, {lazy:.0f} MiB of it taken later by the draft-head subset (ctx={args.ctx}, sessions={args.sessions})", flush=True)
-        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB), lazy)
+        min_free = float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB)
+        warm_peak = getattr(engine, "warm_peak_mib", None)
+        if warm_peak is not None:
+            min_free = max(min_free, dflash_min_free_mib(warm_peak, args.ctx))
+            print(f"qserve: DFlash2 warm-up peak above the resident state: {warm_peak:.0f} MiB with {args.sessions} concurrent sessions; "
+                  f"{min_free:.0f} MiB must stay free (EXL3_MIN_FREE_MIB={os.environ.get('EXL3_MIN_FREE_MIB') or MIN_FREE_MIB} floor)", flush=True)
+        bad = vram_headroom_problem(free_mib, args.ctx, kv, args.sessions, min_free, lazy)
         if bad:
             raise RuntimeError(bad)
     if os.environ.get("EXL3_SWAP_IN", "1") != "0":
@@ -2253,8 +2301,14 @@ def main() -> None:
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
-    parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
-                        help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
+    parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
+                        help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
+                             "from --dflash-dir (lossless; see --dflash-adapt), off = plain decode")
+    parser.add_argument("--dflash-dir", default="", help="DFlash2 drafter checkpoint directory (with --draft-policy dflash)")
+    parser.add_argument("--dflash-adapt", choices=("on", "off"), default="on",
+                        help="with --draft-policy dflash: cut the verified block per request from the measured acceptance (full / short / "
+                             "plain decode with periodic probes, generator/draft_depth.py), so low-acceptance chat never runs slower than plain; "
+                             "off = always the fixed block. EXL3_DFLASH_ADAPT in the environment wins")
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--default-temperature", type=float, default=None, help="when a request omits it (default: generation_config.json)")
@@ -2275,6 +2329,10 @@ def main() -> None:
                              "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
                              "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
+    if args.draft_policy == "dflash" and not args.dflash_dir:
+        parser.error("--draft-policy dflash needs --dflash-dir")
+    if args.draft_policy == "dflash":
+        os.environ.setdefault("EXL3_DFLASH_ADAPT", "1" if args.dflash_adapt == "on" else "0")
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
     # Measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at

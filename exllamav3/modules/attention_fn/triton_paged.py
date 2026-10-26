@@ -709,18 +709,34 @@ _qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "25
 # EXL3_PF_FA2=0 restores the Triton kernel
 _pf_fa2 = os.environ.get("EXL3_PF_FA2", "1") == "1" and torch.version.hip is None
 
+# The chunk runs as sub-calls of this many query rows (each over the keys up to its own last row, same bottom-right causal
+# mask, so every row sees the same keys in the same order; whole 1024-row sub-calls match one call bit for bit, a short
+# remainder may take FA2's split-kv schedule and differ in the last bits). One FA2 call over a
+# 4096-row chunk with a long past reaches 73-78 TFLOPS on an RTX 3090, 1024-row sub-calls 92 (2048: 87, 512: 81, 256: 84).
+# 0 = one call
+_pf_fa2_rows = int(os.environ.get("EXL3_PF_FA2_ROWS", "1024"))
+
+# Query rows per slice of the prefill grid (single-split launches): the programs run slice by slice, each slice's rows over all heads
+# before the next slice's. 0 = one wide q-block axis (the order before this knob). Same math per program, so bit-identical output.
+# gfx1151, Qwen3.8-27B geometry (24 q / 4 kv heads, hd 256, 4096-row chunk): 1.26x at 4K past, 1.8x at 32K, 2.2x at 120K (the wide axis
+# runs 10 TFLOPS at 120K, 256-row slices 21). Default on for ROCm only (CUDA not measured)
+_pf_row_slice = int(os.environ.get("EXL3_PF_ROW_SLICE", "256" if torch.version.hip else "0"))
+
 def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     from torch.nn.attention import sdpa_kernel, SDPBackend
     from torch.nn.attention.bias import causal_lower_right
     q_len = q.shape[1]
     k1 = kd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
     v1 = vd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    step = _pf_fa2_rows if _pf_fa2_rows > 0 else q_len
     with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-        o = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k1.transpose(1, 2), v1.transpose(1, 2),
-            attn_mask = causal_lower_right(q_len, past + q_len), scale = scale, enable_gqa = True,
-        )
-    out.copy_(o.transpose(1, 2))
+        for s in range(0, q_len, step):
+            e = min(q_len, s + step)
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q[:, s:e].transpose(1, 2), k1[:, :past + e].transpose(1, 2), v1[:, :past + e].transpose(1, 2),
+                attn_mask = causal_lower_right(e - s, past + e), scale = scale, enable_gqa = True,
+            )
+            out[:, s:e].copy_(o.transpose(1, 2))
     return out
 
 def _get_h32(device):
@@ -906,6 +922,7 @@ def _paged_attn_decode_split_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KEY_LO: tl.constexpr = 0,   # KVWIN: the pool pass skips the sink positions < KEY_LO (the ring serves them)
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, h_block, kv split). GQA sibling
     q heads and query positions share the row axis so K/V tiles are read once per group."""
@@ -973,6 +990,8 @@ def _paged_attn_decode_split_kernel(
             valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
         if WINDOW_RIGHT >= 0:
             valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
+        if KEY_LO > 0:
+            valid = valid & (offs_n[None, :] >= KEY_LO)
         scores = tl.where(valid, scores, -float("inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))
@@ -1108,8 +1127,9 @@ if _QDEC_HIP_DEBUG:
 
 
 def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap, sinks, out,
-                     num_splits, max_kv_len, qc, kv_append_len, n_kv_heads):
-    """The qdec.hip path of paged_attn_triton_decode, or None when the call is outside its shapes (the Triton kernels then run it)"""
+                     num_splits, max_kv_len, qc, kv_append_len, n_kv_heads, ring = None):
+    """The qdec.hip path of paged_attn_triton_decode, or None when the call is outside its shapes (the Triton kernels then run it).
+    ring (KVWIN): the pool pass of qdec_hip over [S, q-W] plus the fp16 ring partial"""
     k_scales, v_scales, qck, qcv = qc
     why = None
     if q.dtype != torch.float16 or q.ndim != 4: why = "q dtype/rank"
@@ -1127,7 +1147,7 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     window_left, window_right = _normalize_window(window_size)
     sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
     cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
-                       window_left, window_right, softcap, kv_append_len, has_sinks)
+                       window_left, window_right, softcap, kv_append_len, has_sinks, ring.cfg.S if ring is not None else 0)
     if cfg is None:
         if _QDEC_HIP_DEBUG: _qdec_hip_note(("no", f"cfg q_len {q_len} hd {head_dim} {n_q_heads}/{n_kv_heads} bits {qck},{qcv} window {window_left},{window_right} softcap {softcap} append {kv_append_len}"))
         return None
@@ -1145,7 +1165,7 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     if out is None:
         out = torch.empty_like(q)
     with torch.cuda.device(q.device):
-        return _qh.decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_scales, _get_h32(q.device), sinks, out, max_k_len)
+        return _qh.decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_scales, _get_h32(q.device), sinks, out, max_k_len, ring)
 
 # A/B switch, read once at import: CUDA decode runs the upstream exllamav3 1.6.0 (MIT) kernels in triton_paged_cu.py;
 # EXL3_ATTN16=0 keeps the kernels in this file. ROCm always keeps them
@@ -1176,10 +1196,14 @@ def paged_attn_triton_decode(
     num_warps: int = 4,
     num_stages: int = 2,
     split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
+    ring = None,                        # KVWIN: KVWinCtx; pool pass over [S, q-W], fp16 ring partial for the sinks + window
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
     second pass. GQA sibling q heads share K/V tiles within a program."""
+    if ring is not None and (qc is None or not causal or softcap or _normalize_window(window_size)[0] >= 0
+                             or _normalize_window(window_size)[1] >= 0 or k is not None):
+        raise ValueError("KVWIN ring: quantized, causal, pre-appended, unwindowed decode only")
     if qc is not None and not os.environ.get("FLINT_ATTN_KEEP"):
         # quantized cache decode (3090, head_dim 128, k/v 4-8 bit): 64-key tiles, single stage = -15..-25 % kernel time
         # vs the 16-bit-sized default (profile at 60K ctx: kv8 2.47 -> 1.90 ms, kv4 2.22 -> 1.69 ms, 49 layers)
@@ -1196,7 +1220,7 @@ def paged_attn_triton_decode(
             _ATTN16_SEEN.add(_k); print(" -- attn16 eager decode", _k, "new" if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0) else "old", flush = True)
     if qc is not None and _QDEC_HIP and k is None:
         out_hip = _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap,
-                                   sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override)
+                                   sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override, ring)
         if out_hip is not None:
             return out_hip
     if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0):
@@ -1205,7 +1229,7 @@ def paged_attn_triton_decode(
             return paged_attn_triton_decode_cu(
                 q, k, v, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size,
                 softcap, sinks, out, block_n, num_splits, max_kv_len, qc, pre_appended_len,
-                n_kv_heads_override, num_warps, num_stages, split_batch)
+                n_kv_heads_override, num_warps, num_stages, split_batch, ring)
         except NoFittingConfig:
             if _ATTN16_DEBUG: print(" -- attn16 NoFittingConfig -> pre-1.6 kernels", flush = True)
             pass   # nothing fits this device's shared memory: the pre-1.6 kernels below
@@ -1293,9 +1317,14 @@ def paged_attn_triton_decode(
         num_splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, (4 if torch.version.hip else 1) * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
-    if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-        partial_ml = torch.empty(programs * num_splits * block_rows * 2, dtype = torch.float32, device = q.device)
+    # KVWIN: the pool pass attends [S, q-W] (its causal bound shifted by W, sinks cut by KEY_LO) and the fp16 ring pass is
+    # one more partial in the slot after the pool splits, so the combine below needs no change but its split count
+    pool_seqlens, key_lo, ns_total = cache_seqlens, 0, num_splits
+    if ring is not None:
+        pool_seqlens, key_lo, ns_total = cache_seqlens - ring.cfg.W, ring.cfg.S, num_splits + 1
+    if ns_total > 1:
+        partial_o = torch.empty(programs * ns_total * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+        partial_ml = torch.empty(programs * ns_total * block_rows * 2, dtype = torch.float32, device = q.device)
     else:
         partial_o = q   # unused
         partial_ml = q  # unused
@@ -1310,20 +1339,26 @@ def paged_attn_triton_decode(
             )
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
-            q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+            q, k_cache, v_cache, block_table, pool_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, num_splits, sinks,
+            split_len, num_pages_per_seq, ns_total, sinks,
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            num_splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
+            ns_total == 1, has_sinks, block_m, block_h, block_rows, block_n, key_lo,
             num_warps=num_warps, num_stages=num_stages,
         )
 
-        if num_splits > 1:
+        if ring is not None:
+            from .kvwin_triton import ring_split
+            ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
+                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0, 1,
+                       block_m, block_h, block_rows)
+
+        if ns_total > 1:
             _paged_attn_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, out, h32,
-                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
+                ns_total, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
                 block_m, block_h, block_rows,
                 num_warps=4, num_stages=1,
             )
@@ -1585,6 +1620,7 @@ def _paged_attn_prefill_kernel(
     WIDE_INDEX: tl.constexpr,  # int64 q/out/partial index math (element offsets past 2^31)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SLICE_BLOCKS,        # runtime: row-sliced grid (num_splits == 1), q blocks per slice, 0 = one q-block axis
 ):
     """FA2-style prefill over the paged cache: BLOCK_M query rows of one head per program;
     unmasked interior kv tiles take a maskless fast path, only the causal boundary and the
@@ -1592,6 +1628,13 @@ def _paged_attn_prefill_kernel(
     pid_m = tl.program_id(0)
     bh = tl.program_id(1)
     split = tl.program_id(2)
+    if SLICE_BLOCKS > 0:
+        # grid (SLICE_BLOCKS, heads, slices): the programs launch in the order of sequential sub-calls over SLICE_BLOCKS * BLOCK_M
+        # rows each (every program computes what it computes in one wide launch, bit for bit)
+        pid_m = pid_m + split * SLICE_BLOCKS
+        split = 0
+        if pid_m * BLOCK_M >= q_len:
+            return
     batch = bh // n_q_heads
     q_head = bh - batch * n_q_heads
     group_size = n_q_heads // n_kv_heads
@@ -1871,6 +1914,7 @@ def paged_attn_triton_prefill(
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
     v_dim: int | None = None,
+    ring = None,                        # KVWIN: KVWinCtx; the staged scratch gets exact sinks / window / chunk rows
 ) -> torch.Tensor:
     """Prefill (large q_len) attention over the paged cache.
 
@@ -1972,7 +2016,7 @@ def paged_attn_triton_prefill(
         # the allocator sees a handful of distinct sizes. Context-shaped workspaces are not
         # kept as statics: the old pool-sized static held a full fp16 copy of the cache
         # (1 GiB per 512k tokens on Qwen3.8) for the life of the process
-        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+        if (_qc_staging == 1 and q_len >= (_qc_prefill_two_pass_min_q if ring is None else min(_qc_prefill_two_pass_min_q, 17))
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
@@ -1987,6 +2031,9 @@ def paged_attn_triton_prefill(
                 k_cache, k_scales, kd, v_cache, v_scales, vd,
                 cache_seqlens, block_table, page_size, kv_append_len, 0.0,
             )
+            if ring is not None:
+                from .kvwin_triton import stage_patch
+                stage_patch(ring, kd, vd, cache_seqlens, npps_w * page_size, q_len)
             k_cache, v_cache = kd, vd
             block_table = torch.arange(bsz * npps_w, dtype = torch.int32, device = q.device).view(bsz, npps_w)
             qc = None
@@ -2092,6 +2139,13 @@ def paged_attn_triton_prefill(
         # the ROCm Triton backend has no maxnreg launch option (it raises on the unknown keyword)
         _launch_opts = {"maxnreg": _maxnreg} if _maxnreg and not torch.version.hip else {}
         grid = (q_blocks, bsz * n_q_heads, num_splits)
+        slice_blocks = 0
+        if num_splits == 1 and _pf_row_slice > 0:
+            slice_blocks = max(1, _pf_row_slice // block_m)
+            if q_blocks > slice_blocks:
+                grid = (slice_blocks, bsz * n_q_heads, triton.cdiv(q_blocks, slice_blocks))
+            else:
+                slice_blocks = 0
         # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
         # fp32 partial buffer); common geometries keep pure int32 codegen
         wide_index = max(
@@ -2108,7 +2162,7 @@ def paged_attn_triton_prefill(
                 num_pages_per_seq, page_size, head_dim, hd_pad, vd_pad, v_dim, float(softmax_scale),
                 bool(causal), int(window_left), int(window_right),
                 window_left >= 0, window_right >= 0, float(softcap or 0.0),
-                has_sinks, wide_index, block_m, block_n,
+                has_sinks, wide_index, block_m, block_n, slice_blocks,
                 num_warps=num_warps, num_stages=ns, **_launch_opts,
             )
 
@@ -2433,6 +2487,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        ring=args.ov,
     )
 
 
@@ -2467,4 +2522,5 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
         max_kv_len=args.max_kv_len,
+        ring=args.ov,
     )

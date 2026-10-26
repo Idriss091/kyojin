@@ -1903,7 +1903,7 @@ class Job:
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
             from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
                 any(isinstance(m, GatedDeltaNet) for m in rl)
@@ -1924,7 +1924,7 @@ class Job:
         ok = getattr(g, "_big_tail_ok", None)
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, GatedDeltaNet) and m.kda for m in rl)
             g._big_tail_ok = ok
@@ -2193,13 +2193,19 @@ class Job:
         seq = self.sequences[0]
         rc = self.generator.recurrent_cache
         layers = self.generator.cache.get_all_recurrent_layers()
+        # KVWIN rings are not captured mid-chunk (the ring has already advanced to the chunk end): such a checkpoint restores
+        # with a cold ring that is rebuilt from the pool (quant-level window for the first W tokens)
+        ring_layers = {k for k, l in layers.items() if getattr(l, "kvwin", False)}
         n = 0
         for r, per_layer in sorted(saved.items()):
-            if set(per_layer) != set(layers):
+            if set(per_layer) != set(layers) - ring_layers:
                 continue
             pos = prefill_start + r
             stashed = {"position": pos, "checkpoint_size": self.recurrent_state.checkpoint_size}
             for k in layers:
+                if k in ring_layers:
+                    stashed[k] = None
+                    continue
                 s, c = per_layer[k][:2]
                 if len(per_layer[k]) == 3:
                     per_layer[k][2].synchronize()  # mode 2: pinned host copies, D2H event on the side stream

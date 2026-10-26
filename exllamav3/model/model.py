@@ -69,10 +69,23 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     @cached_property
     def _get_recurrent_layers(self):
-        return [m for m in self if m.caps.get("recurrent_cache")]
+        rl = [m for m in self if m.caps.get("recurrent_cache")]
+        if self.recurrent_state_cls is None:
+            # KVWIN rings ride the job's recurrent state: a model without recurrent state slots has none
+            rl = [m for m in rl if not getattr(getattr(m, "layer_state_cls", None), "kvwin", False)]
+        return rl
 
     def get_recurrent_layers(self):
         return self._get_recurrent_layers
+
+    @cached_property
+    def _get_checkpoint_layers(self):
+        return [m for m in self._get_recurrent_layers if not getattr(getattr(m, "layer_state_cls", None), "kvwin", False)]
+    def get_checkpoint_layers(self):
+        """Recurrent layers whose state shapes the checkpoint cadence (GDN / KDA / SWA / conv): the recurrent layers without the
+        KVWIN rings, which ride the job state but are not a state kind. Path eligibility checks (GDN no-tail, big tail, wide
+        prefill chunks) must see the same layers with the ring declared as without it."""
+        return self._get_checkpoint_layers
 
     @cached_property
     def _get_prefetch_layers(self):
