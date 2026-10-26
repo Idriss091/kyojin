@@ -19,13 +19,16 @@ PAGE = 256
 needs_gpu = pytest.mark.skipif(not CPU and not torch.cuda.is_available(), reason = "needs a GPU (or TQ_TEST_CPU=1)")
 
 
-@pytest.fixture(autouse = True, params = ["legacy", "hip"])
+@pytest.fixture(autouse = True, params = ["legacy", "hip", "cu"])
 def impl(request, monkeypatch):
-    """Decode path: the Triton split kernel (any device) or qdec_hip (ROCm GPU only, the ROCm default)."""
+    """Decode path: the Triton split kernels (any device), qdec_hip (ROCm GPU only, the ROCm default) or qdec.cu (CUDA, the default there)"""
     from exllamav3.modules.attention_fn import triton_paged
     if request.param == "hip" and (CPU or not triton_paged._QDEC_HIP):
         pytest.skip("qdec_hip needs a ROCm GPU")
+    if request.param == "cu" and (CPU or torch.version.hip):
+        pytest.skip("qdec.cu needs a CUDA GPU")
     monkeypatch.setattr(triton_paged, "_QDEC_HIP", request.param == "hip")
+    monkeypatch.setattr(triton_paged, "ATTN16", request.param == "cu")
     return request.param
 
 
@@ -118,7 +121,7 @@ class Rig:
         q, k, v = self.rnd(1, n, self.qh, self.hd), self.rnd(1, n, self.kvh, self.hd), self.rnd(1, n, self.kvh, self.hd)
         sl = torch.tensor([self.len], dtype = torch.int32, device = DEV)
         o = attn_dispatch(q, k, v, cache = self.cl, causal = True, block_table = self.bt, cache_seqlens = sl,
-                          max_kv_len = self.len + n, ov = KVWinCtx(self.st, self.slots))
+                          max_kv_len = self.len, ov = KVWinCtx(self.st, self.slots))
         L = self.len
         self.K = torch.cat([self.K, k[0]]); self.V = torch.cat([self.V, v[0]]); self.len += n
         return q[0], o[0], L

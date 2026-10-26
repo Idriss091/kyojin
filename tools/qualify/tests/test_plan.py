@@ -248,6 +248,29 @@ class KvModeRule(unittest.TestCase):
         # a model without tq support (head_dim not a power of two): only the baseline was measured
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")
 
+    def test_job_kvmode_glue(self):
+        """kv stage -> job_kvmode -> kv_cache.json: the winner is written as the lane preset, serve flags follow it"""
+        import contextlib
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            out = t / "out"; out.mkdir(); (t / "pack").mkdir()
+            raw = {"tq6": dict(kl_vs_k8=0.004, top1_vs_k8=0.99, bits_per_val=6.0625), "tq5": dict(kl_vs_k8=0.020, top1_vs_k8=0.97, bits_per_val=5.0625),
+                   "k6v6": dict(kl_vs_k8=0.010, top1_vs_k8=0.98, bits_per_val=6.5)}
+            def py(script, *a, **kw):
+                self.assertEqual((script, a[0]), ("gpu_eval.py", "kvmode"))
+                (out / "kvmode_raw.json").write_text(json.dumps({k: v for k, v in raw.items()}))
+            c = SimpleNamespace(out=out, args=dict(kvmode_steps=64), meta=dict(path=str(t / "pack"), index_sha="x"), py=py, locks=contextlib.nullcontext,
+                                repo=t, data={})
+            stages._git = lambda repo: "deadbeef"
+            kv = stages.job_kvmode(c, out / "docs.pt")
+            self.assertEqual((kv["mode"], kv["chosen"]), ("tq", [6, 6]))
+            stages.write_kv_choice(c, kv)
+            j = json.loads((t / "pack" / "kv_cache.json").read_text())
+            self.assertEqual((j["kv_mode"], j["k_bits"], j["v_bits"]), ("tq", 6, 6))
+            c.data = dict(kv=kv)
+            self.assertEqual(stages.chosen_kv_mode(c), "tq")
+
     def test_serve_flags_kv_mode(self):
         meta = dict(serve_entry="tools/qwen/serve.py", path="/p", vision=False, template=None, mtp_layers=0, kv_layers=16, kv_heads=4, head_dim=256)
         f = packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=5, v_bits=5, kv_mode="tq")

@@ -1241,13 +1241,13 @@ def paged_attn_triton_decode(
                                    sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override, ring, tq)
         if out_hip is not None:
             return out_hip
-    if ATTN16 and tq is None and (qc is not None or _normalize_window(window_size)[0] >= 0):
+    if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0):
         from .triton_paged_cu import paged_attn_triton_decode_cu, NoFittingConfig
         try:
             return paged_attn_triton_decode_cu(
                 q, k, v, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size,
                 softcap, sinks, out, block_n, num_splits, max_kv_len, qc, pre_appended_len,
-                n_kv_heads_override, num_warps, num_stages, split_batch, ring)
+                n_kv_heads_override, num_warps, num_stages, split_batch, ring, tq)
         except NoFittingConfig:
             if _ATTN16_DEBUG: print(" -- attn16 NoFittingConfig -> pre-1.6 kernels", flush = True)
             pass   # nothing fits this device's shared memory: the pre-1.6 kernels below

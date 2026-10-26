@@ -700,6 +700,7 @@ def paged_attn_triton_decode_cu(
     num_stages: int | None = None,
     split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
     ring = None,                        # KVWIN: KVWinCtx; pool pass over [S, q-W], fp16 ring partial for the sinks + window
+    tq = None,                          # TurboQuant (cache.tq.TQState): CUDA qdec kernel only, NoFittingConfig for anything else
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -754,7 +755,7 @@ def paged_attn_triton_decode_cu(
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
-        h32 = _get_h32(q.device)
+        h32 = tq.eye32 if tq is not None else _get_h32(q.device)
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
@@ -798,7 +799,9 @@ def paged_attn_triton_decode_cu(
     if qc is not None and qck > 0 and qcv > 0:
         from . import qdec_cuda
         qcfg = qdec_cuda.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, page_size, causal, softmax_scale,
-                                  block_rows, window_left, window_right, softcap, kv_append_len, key_lo)
+                                  block_rows, window_left, window_right, softcap, kv_append_len, key_lo, tq is not None)
+        if tq is not None and (qcfg is None or h_blocks != 1):
+            raise NoFittingConfig("TurboQuant: qdec.cu shapes only")
         if qcfg is not None and (h_blocks == 1 or qcfg.get("rows_kernel")):
             if qcfg.get("rows_kernel"):
                 # many-row kernel (cu/qdec_rows.cu): all of a kv head's (query, head) rows in one program
@@ -818,11 +821,11 @@ def paged_attn_triton_decode_cu(
                     [q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr(), pool_seqlens.data_ptr(),
                      out.data_ptr(), partial_o.data_ptr(), partial_ml.data_ptr(), k_scales.data_ptr(), v_scales.data_ptr(),
                      h32.data_ptr()],
-                    [qsplit_len, num_pages_per_seq, ns_total])
+                    [qsplit_len, num_pages_per_seq, ns_total], tq)
                 if ring is not None:
                     from .kvwin_triton import ring_split
                     ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
-                               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, True, 0, 1, 1, block_rows)
+                               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, tq is None, 0, 1, 1, block_rows)
                 rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
                 _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                     partial_o, partial_ml, out, h32,
