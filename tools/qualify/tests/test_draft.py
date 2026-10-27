@@ -107,6 +107,18 @@ class PlanOrderTests(unittest.TestCase):
             self.assertNotIn("--dflash-dir", packmod.serve_flags(m, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
 
 
+class LockUnitTests(unittest.TestCase):
+    def test_every_lock_take_is_timed_and_released_between_units(self):
+        with tempfile.TemporaryDirectory() as t:
+            m = packmod.read_pack(fake_pack(Path(t)))
+            c = stages.Ctx(m, args(), Path(t), Path(t), {"locks": [str(Path(t) / "x.lock")]}, lambda *_: None)
+            for i in range(3):
+                with c.locks(f"unit {i}"):
+                    pass
+            self.assertEqual([h[0] for h in c.holds], ["unit 0", "unit 1", "unit 2"])
+            self.assertTrue(all(h[1] >= 0 for h in c.holds))
+
+
 class PortTests(unittest.TestCase):
     def test_pick_port_skips_a_busy_port(self):
         import socket

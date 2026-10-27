@@ -162,9 +162,9 @@ def _split_serve(c, do_serve, do_smoke):
     r = st.job_serve(c, do_serve, do_smoke)
     out = {}
     if do_serve:
-        out["serve"] = {**r["serve"], "cmd": r["cmd"]}
+        out["serve"] = {**r["serve"], "cmd": r["cmd"], "lock_hold_max_s": r.get("lock_hold_max_s")}
     if do_smoke:
-        out["smoke"] = {**(r["smoke"] or {}), "cmd": r["cmd"]}
+        out["smoke"] = {**(r["smoke"] or {}), "cmd": r.get("smoke_cmd") or r["cmd"], "lock_hold_max_s": r.get("lock_hold_max_s")}
     return out
 
 

@@ -2,6 +2,7 @@
 GPU stages run inside job functions that hold the backend locks; every server is started and killed by PID."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ class Ctx:
     prof: dict
     log: callable = print
     data: dict = field(default_factory=dict)       # stage name -> data (done in this run or resumed)
+    holds: list = field(default_factory=list)      # (label, seconds) of every GPU-lock hold of this run
 
     def py(self, script: str, *a, env_extra: dict | None = None, timeout: int = 7200) -> str:
         import os
@@ -53,8 +55,16 @@ class Ctx:
         if a < MIN_MEM_GIB:
             raise RuntimeError(f"MemAvailable {a:.1f} GiB < {MIN_MEM_GIB} GiB: not starting a GPU job")
 
-    def locks(self):
-        return gpu_locks(self.prof["locks"], self.log)
+    @contextlib.contextmanager
+    def locks(self, label: str = ""):
+        """GPU locks for ONE unit of work (a server load + its measurements, one KV format, one probe): every hold is timed in c.holds so the
+        stage data can show that none ran long while other workers queued (lead rule 27/10: no stage holds a lock for more than ~15 min)."""
+        with gpu_locks(self.prof["locks"], self.log):
+            t0 = time.time()
+            try:
+                yield
+            finally:
+                self.holds.append((label, round(time.time() - t0, 1)))
 
 
 # ---------------------------------------------------------------- cpu stages
@@ -248,8 +258,11 @@ def job_kvmode(c: Ctx, docs) -> dict:
     """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), kw6 (k6v6 + sink/window ring), tq6, tq5 (TurboQuant + ring).
     Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's, else k6v6; the tq formats are measured and reported, opt-in only
     (QUALIFY_KV_TQ=1 lets them win: any tq format with KL <= 0.9 x k6v6's, then the fewest bytes per value)."""
-    with c.locks():
-        c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), timeout=14400)
+    for f in (c.out / "kvmode_raw.json", c.out / "kvmode_raw.json.k8v8.pt"):
+        f.unlink(missing_ok=True)
+    for fmt in ("k8v8", "k6v6", "kw6", "tq6", "tq5"):       # one lock take per format (each is a model load + a 32K pass)
+        with c.locks(f"kvmode {fmt}"):
+            c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), fmt, timeout=14400)
     raw = json.loads((c.out / "kvmode_raw.json").read_text())
     kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
     bpv = {n: v["bits_per_val"] for n, v in raw.items()}
@@ -341,8 +354,8 @@ def job_draft(c: Ctx) -> dict:
     k, v = chosen_kv(c)
     ctx = min(12288, c.meta["max_pos"])
     runs = []
-    with c.locks():
-        for i, var in enumerate(draft_variants()):
+    for i, var in enumerate(draft_variants()):
+        with c.locks(f"draft {var}"):
             c.fresh_port()
             argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=1, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
                                        draft="dflash" if var == "dflash" else "off", dflash_dir=loc["dir"] if var == "dflash" else None)
@@ -363,6 +376,7 @@ def job_draft(c: Ctx) -> dict:
     sp = speedups(runs)
     use, why = rules.choose_draft(sp)
     return dict(policy="dflash" if use else base, dflash_dir=loc["dir"] if use else None, drafter=loc["dir"], source=loc["source"], speedup=sp, reason=why, runs=runs,
+                lock_hold_max_s=max((h for _, h in c.holds), default=None),
                 note="adaptive depth (--dflash-adapt on)" if use else "drafter measured but not kept")
 
 
@@ -380,6 +394,10 @@ def probe_factory(c: Ctx, sessions: int):
     state = {"cal": False}
 
     def probe(ctx: int):
+        with c.locks(f"maxctx s{sessions} c{ctx}"):            # one lock take per probe: a probe is a load + 2 near-full prompts (+ rounds)
+            return probe_locked(ctx)
+
+    def probe_locked(ctx: int):
         log = c.out / f"srv_maxctx_s{sessions}_c{ctx}.log"
         with running_server(c.prof, c.repo, start_args(c, ctx, sessions), c.args["port"], log, logf=c.log) as (p, ok):
             if not ok:
@@ -406,17 +424,18 @@ def job_maxctx(c: Ctx) -> dict:
     c.need_ram()
     out = {}
     k, v = chosen_kv(c)
-    with c.locks():
+    with c.locks("maxctx free-memory read"):          # the free-memory bound is only meaningful while nobody else holds the device
         free = backends.gpu_free_mib(c.args["backend"])
-        for s in c.args["sessions"]:
-            bpt = packmod.kv_bytes_per_token(c.meta, k, v, chosen_kv_mode(c))
-            free_b = (free * 2**20 if free else 24 * 2**30) - c.meta["weights_bytes"]
-            hi = search.upper_bound(free_b, bpt, 2.5 * 2**30, c.args.get("ctx_cap") or c.meta["max_pos"])
-            lo = min(hi, 8192)
-            c.log(f"maxctx sessions={s}: KV {bpt/1024:.1f} KB/token, search [{lo}, {hi}]")
-            r = search.bisect_max(lo, hi, probe_factory(c, s))
-            out[str(s)] = r["best"]
-            out[f"tried_s{s}"] = r["tried"]
+    for s in c.args["sessions"]:
+        bpt = packmod.kv_bytes_per_token(c.meta, k, v, chosen_kv_mode(c))
+        free_b = (free * 2**20 if free else 24 * 2**30) - c.meta["weights_bytes"]
+        hi = search.upper_bound(free_b, bpt, 2.5 * 2**30, c.args.get("ctx_cap") or c.meta["max_pos"])
+        lo = min(hi, 8192)
+        c.log(f"maxctx sessions={s}: KV {bpt/1024:.1f} KB/token, search [{lo}, {hi}]")
+        r = search.bisect_max(lo, hi, probe_factory(c, s))
+        out[str(s)] = r["best"]
+        out[f"tried_s{s}"] = r["tried"]
+    out["lock_hold_max_s"] = max((h for _, h in c.holds), default=None)
     return out
 
 
@@ -434,17 +453,18 @@ def gpu_used_mib(c: Ctx):
 
 def job_soak(c: Ctx) -> dict:
     """Mixed-load validation of each max-ctx result (drill 0 gap: synthetic probes passed, real agent load OOMed hours later). Per session count:
-    serve at the search result, run `--soak-s` seconds of load.Client.soak; any error or OOM line -> -c x 0.92 (rounded to 2048), up to 4 steps."""
+    serve at the search result, run `--soak-s` seconds of load.Client.soak; any error or OOM line -> -c x 0.92 (rounded to 2048), up to 4 steps.
+    One lock take per attempt (a load + the soak seconds)."""
     c.need_ram()
     out = dict(ctx={}, runs={})
     mc = {k: v for k, v in (c.data.get("maxctx") or {}).items() if k.isdigit() and v}
-    with c.locks():
-        for s_ in c.args["sessions"]:
-            ctx = mc.get(str(s_))
-            if not ctx:
-                continue
-            for attempt in range(4):
-                log = c.out / f"srv_soak_s{s_}_c{ctx}.log"
+    for s_ in c.args["sessions"]:
+        ctx = mc.get(str(s_))
+        if not ctx:
+            continue
+        for attempt in range(4):
+            log = c.out / f"srv_soak_s{s_}_c{ctx}.log"
+            with c.locks(f"soak s{s_} c{ctx}"):
                 with running_server(c.prof, c.repo, start_args(c, ctx, s_), c.args["port"], log, logf=c.log) as (p, ok):
                     if not ok:
                         r = dict(ok=False, why="no start")
@@ -453,14 +473,15 @@ def job_soak(c: Ctx) -> dict:
                         r = cl.soak(s_, ctx, c.args["soak_s"], vram=lambda: gpu_used_mib(c))
                         r["ok"] = not r["n_errors"] and not oom_in(log) and r["requests"] > 0
                         r["oom_log"] = oom_in(log)
-                out["runs"][f"s{s_}_c{ctx}"] = {k: v for k, v in r.items() if k != "vram_curve"} | dict(free_mib_min=min((x for x in r.get("vram_curve", []) if x is not None), default=None))
-                c.log(f"soak sessions={s_} -c {ctx}: {'ok' if r['ok'] else 'FAILED'} {out['runs'][f's{s_}_c{ctx}']}")
-                if r["ok"]:
-                    out["ctx"][str(s_)] = ctx
-                    break
-                ctx = int(ctx * 0.92) // 2048 * 2048
-            else:
-                out["ctx"][str(s_)] = None
+            out["runs"][f"s{s_}_c{ctx}"] = {k: v for k, v in r.items() if k != "vram_curve"} | dict(free_mib_min=min((x for x in r.get("vram_curve", []) if x is not None), default=None))
+            c.log(f"soak sessions={s_} -c {ctx}: {'ok' if r['ok'] else 'FAILED'} {out['runs'][f's{s_}_c{ctx}']}")
+            if r["ok"]:
+                out["ctx"][str(s_)] = ctx
+                break
+            ctx = int(ctx * 0.92) // 2048 * 2048
+        else:
+            out["ctx"][str(s_)] = None
+    out["lock_hold_max_s"] = max((h for _, h in c.holds), default=None)
     return out
 
 
@@ -477,50 +498,52 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
     import report
     ship_s, ship_c = report.served_config(c.args, mc)           # the smoke runs on the config that would ship (a real Hermes preamble is 15-30K)
     ship_s, ship_c = (ship_s, ship_c) if ship_c else (sess_eff, ctx)
-    same = (ship_s, ship_c) == (sess_eff, ctx)
-    if not do_serve:
-        sess_eff, ctx, same = ship_s, ship_c, True
     out = dict(serve={}, smoke=None)
-    with c.locks():
-        log = c.out / "srv_serve.log"
-        argv = start_args(c, ctx, sess_eff)
-        out["cmd"] = [c.prof["python"], *argv]
-        with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
-            if not ok:
-                raise RuntimeError("serve: server did not become ready; see " + str(log))
-            cl = load.Client(c.args["port"], "qual")
-            cl.calibrate()
-            s = {}
-            if do_serve:
-                s["conformance"] = cl.conformance()
-                s["decode_short"] = [cl.stream(cl.prompt(300, i), 256) for i in range(3)]
-                s["prefill_8k"] = [cl.fit(8000, i + 3, 1, topup=False) for i in range(3)]
-                curve, t = [], 2048
-                while t <= int(ctx * 0.9):
-                    r = cl.fit(t, 7, 64, topup=False)
-                    curve.append(dict(prompt=r["ptok"], ttft=r["ttft"], prefill_tps=round(r["ptok"] / r["ttft"], 1) if r["ptok"] and r["ttft"] else None, dec_tps=r["dec_tps"], err=r["err"]))
-                    t *= 4
-                s["curve"] = curve
-                s["agg"] = [cl.concurrent(n, min(4096, ctx // max(4, sess_eff) - 256), 128) for n in range(1, sess_eff + 1)]
-                a, b = cl.sha_set(), cl.sha_set()
-                s["sha"], s["sha_self_equal"] = a, [x["sha"] for x in a] == [x["sha"] for x in b]
-                s["sha_repeat"] = [x["sha"] for x in b]
-                s["sha_n_diff"] = sum(x["sha"] != y["sha"] for x, y in zip(a, b))
-                s["oom"] = oom_in(log)
-                for r in s["decode_short"] + s["prefill_8k"]:
-                    r.pop("t0", None); r.pop("first", None); r.pop("end", None)
-                s["decode_tps_median"] = statistics.median(r["dec_tps"] for r in s["decode_short"] if r["dec_tps"])
-                s["prefill_8k_tps"] = statistics.median(r["ptok"] / r["ttft"] for r in s["prefill_8k"] if r["ptok"] and r["ttft"])
-                out["serve"] = s
-            if do_smoke and same:
-                out["smoke"] = run_smoke(c)
-        if do_smoke and not same:                              # matrix config differs from the shipped one: one more load for the smoke
-            argv = start_args(c, ship_c, ship_s)
-            out["smoke_cmd"] = [c.prof["python"], *argv]
-            with running_server(c.prof, c.repo, argv, c.args["port"], c.out / "srv_smoke.log", logf=c.log) as (p, ok):
+
+    def on_server(label, ctx_, sess_, fn):
+        """One lock take = one server load + one group of measurements (bounded hold: the lead's rule, no stage holds a GPU lock for long)."""
+        with c.locks(label):
+            log = c.out / f"srv_{label}.log"
+            argv = start_args(c, ctx_, sess_)
+            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
                 if not ok:
-                    raise RuntimeError("smoke: server did not become ready; see " + str(c.out / "srv_smoke.log"))
-                out["smoke"] = run_smoke(c)
+                    raise RuntimeError(f"{label}: server did not become ready; see {log}")
+                cl = load.Client(c.args["port"], "qual")
+                cl.calibrate()
+                return fn(cl, log), [c.prof["python"], *argv]
+
+    if do_serve:
+        def quick(cl, log):
+            s = {"conformance": cl.conformance()}
+            s["decode_short"] = [cl.stream(cl.prompt(300, i), 256) for i in range(3)]
+            s["prefill_8k"] = [cl.fit(8000, i + 3, 1, topup=False) for i in range(3)]
+            a, b = cl.sha_set(), cl.sha_set()
+            s["sha"], s["sha_self_equal"] = a, [x["sha"] for x in a] == [x["sha"] for x in b]
+            s["sha_repeat"] = [x["sha"] for x in b]
+            s["sha_n_diff"] = sum(x["sha"] != y["sha"] for x, y in zip(a, b))
+            s["oom"] = oom_in(log)
+            for r in s["decode_short"] + s["prefill_8k"]:
+                r.pop("t0", None); r.pop("first", None); r.pop("end", None)
+            s["decode_tps_median"] = statistics.median(r["dec_tps"] for r in s["decode_short"] if r["dec_tps"])
+            s["prefill_8k_tps"] = statistics.median(r["ptok"] / r["ttft"] for r in s["prefill_8k"] if r["ptok"] and r["ttft"])
+            return s
+
+        def deep(cl, log):
+            curve, t = [], 2048
+            while t <= int(ctx * 0.9):
+                r = cl.fit(t, 7, 64, topup=False)
+                curve.append(dict(prompt=r["ptok"], ttft=r["ttft"], prefill_tps=round(r["ptok"] / r["ttft"], 1) if r["ptok"] and r["ttft"] else None, dec_tps=r["dec_tps"], err=r["err"]))
+                t *= 4
+            return dict(curve=curve, agg=[cl.concurrent(n, min(4096, ctx // max(4, sess_eff) - 256), 128) for n in range(1, sess_eff + 1)], oom=oom_in(log))
+        s, out["cmd"] = on_server("serve", ctx, sess_eff, quick)
+        d, _ = on_server("serve_deep", ctx, sess_eff, deep)
+        s.update(curve=d["curve"], agg=d["agg"], oom=s["oom"] or d["oom"])
+        out["serve"] = s
+    if do_smoke:                                        # always on the config that would ship, in its own load
+        out["smoke"], out["smoke_cmd"] = on_server("smoke", ship_c, ship_s, lambda cl, log: run_smoke(c))
+        if not do_serve:
+            out["cmd"] = out["smoke_cmd"]
+    out["lock_hold_max_s"] = max((h for _, h in c.holds), default=None)
     return out
 
 
