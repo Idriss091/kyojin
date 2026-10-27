@@ -504,6 +504,8 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
                 s["agg"] = [cl.concurrent(n, min(4096, ctx // max(4, sess_eff) - 256), 128) for n in range(1, sess_eff + 1)]
                 a, b = cl.sha_set(), cl.sha_set()
                 s["sha"], s["sha_self_equal"] = a, [x["sha"] for x in a] == [x["sha"] for x in b]
+                s["sha_repeat"] = [x["sha"] for x in b]
+                s["sha_n_diff"] = sum(x["sha"] != y["sha"] for x, y in zip(a, b))
                 s["oom"] = oom_in(log)
                 for r in s["decode_short"] + s["prefill_8k"]:
                     r.pop("t0", None); r.pop("first", None); r.pop("end", None)

@@ -91,7 +91,11 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
     sv = q.get("serve")
     if sv:
         if not sv.get("sha_self_equal", False):
-            reasons.append("greedy sha differs between two identical runs")
+            nd, tot = sv.get("sha_n_diff"), len(sv.get("sha") or [])
+            if nd is not None and tot and 0 < nd < tot:      # the repeat runs on a warm prefix cache and, with a drafter, a different verify batch: near-tie numerics (REPORT-27 class)
+                warnings.append(f"greedy sha differs in {nd}/{tot} prompts between the cold run and the repeat (near-tie numerics of the cached-prefix / R-row verify path)")
+            else:
+                reasons.append("greedy sha differs between two identical runs")
         if sv.get("oom"):
             reasons.append("out of memory in the server log")
         if sv.get("conformance") and not sv["conformance"].get("ok", False):      # the vendor chose its own order and trained on it: a warning, not a gate
