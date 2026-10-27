@@ -19,6 +19,21 @@ FAMILIES = {
     "Qwen3_5ForConditionalGeneration": dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=True),
     "Qwen3_5ForCausalLM": dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=False),
 }
+# Architectures not listed above resolve by the config's model_type prefix (any Qwen-family pack is served by the qwen entry:
+# Qwen4Exp / future Qwen releases need no new hard-coded name). Same prefix rule as docker/kyojin_args.TYPE_HINTS.
+FAMILY_BY_MODEL_TYPE = (
+    ("qwen", dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=True)),
+)
+
+
+def resolve_family(arch: str, cfg: dict) -> dict:
+    if arch in FAMILIES:
+        return FAMILIES[arch]
+    mt = str(cfg.get("model_type") or _text_cfg(cfg).get("model_type") or "").lower()
+    for prefix, fam in FAMILY_BY_MODEL_TYPE:
+        if mt.startswith(prefix):
+            return fam
+    return dict(family="unknown", serve=None, ref=None, vision=False)
 
 
 def _text_cfg(cfg: dict) -> dict:
@@ -50,7 +65,7 @@ def read_pack(path: str | os.PathLike) -> dict:
     cfg = json.loads((p / "config.json").read_text())
     t = _text_cfg(cfg)
     arch = (cfg.get("architectures") or ["?"])[0]
-    fam = FAMILIES.get(arch, dict(family="unknown", serve=None, ref=None, vision=False))
+    fam = resolve_family(arch, cfg)
     heads = t["num_attention_heads"]
     qc = {}
     for name in ("quantization_config.json",):

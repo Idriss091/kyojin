@@ -50,6 +50,17 @@ class PackTests(unittest.TestCase):
             self.assertEqual(f[f.index("--chat-template") + 1], str(Path(t) / "chat_template.jinja"))
             self.assertEqual(m["problems"], [])
 
+    def test_unlisted_qwen_arch_resolves_by_model_type(self):
+        qx = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 8, "num_attention_heads": 8, "num_key_value_heads": 2, "head_dim": 16,
+              "hidden_size": 128, "layer_types": ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"]}}
+        with tempfile.TemporaryDirectory() as t:
+            m = packmod.read_pack(fake_pack(Path(t), arch="Qwen4ExpForConditionalGeneration", extra=qx))
+            self.assertEqual((m["family"], m["serve_entry"], m["kv_layers"]), ("hybrid_gdn", "tools/qwen/serve.py", 2))
+            self.assertEqual(m["problems"], [])
+        with tempfile.TemporaryDirectory() as t:      # a genuinely unknown model_type still refuses
+            m = packmod.read_pack(fake_pack(Path(t), arch="FooForCausalLM", extra={"model_type": "foo"}))
+            self.assertTrue(any("no serve entry" in x for x in m["problems"]))
+
     def test_mtp_head_selects_mix(self):
         with tempfile.TemporaryDirectory() as t:
             m = packmod.read_pack(fake_pack(Path(t), mtp=1))
