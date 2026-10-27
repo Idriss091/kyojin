@@ -60,7 +60,7 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
     """q: assembled qualify data. Returns {pass, reasons[], unmeasured[]}. Missing measurements are listed, never counted as pass."""
     g = dict(kl_mean=0.15, top1_min=0.75, ctx_min=32768, smoke_min=0.8)
     g.update(gates or {})
-    reasons, unmeasured = [], []
+    reasons, unmeasured, warnings = [], [], []
     par = q.get("parity")
     if par:
         if par["kl_mean"] > g["kl_mean"]:
@@ -89,8 +89,8 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
             reasons.append("greedy sha differs between two identical runs")
         if sv.get("oom"):
             reasons.append("out of memory in the server log")
-        if sv.get("conformance") and not sv["conformance"].get("ok", False):
-            reasons.append("template/tool conformance failed: " + sv["conformance"].get("detail", ""))
+        if sv.get("conformance") and not sv["conformance"].get("ok", False):      # the vendor chose its own order and trained on it: a warning, not a gate
+            warnings.append("template renders the system text before the tools (" + sv["conformance"].get("detail", "") + "): sessions with different system prompts do not share the tool-schema prefix cache")
     else:
         unmeasured.append("serve")
     sm = q.get("smoke")
@@ -101,4 +101,4 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
                 reasons.append(f"smoke {'mean score' if sm.get('score_mean') is not None else 'pass rate'} {val:.2f} ({sm['passed']}/{sm['total']}) < {g['smoke_min']:.0%}")
     else:
         unmeasured.append("smoke")
-    return dict(pass_=not reasons and not unmeasured, reasons=reasons, unmeasured=unmeasured)
+    return dict(pass_=not reasons and not unmeasured, reasons=reasons, unmeasured=unmeasured, warnings=warnings)

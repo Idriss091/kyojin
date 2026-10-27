@@ -96,6 +96,8 @@ def render_md(j: dict) -> str:
          f"{p['arch']} ({p['family']}), {p['layers']} layers ({p['kv_layers']} with KV), {p['quant']} {p['bpw']} bpw, git {j['git']}, {j['at']}", ""]
     if v["reasons"]:
         L += ["Failed gates: " + "; ".join(v["reasons"])]
+    if v.get("warnings"):
+        L += ["Warnings: " + "; ".join(v["warnings"])]
     if v["unmeasured"]:
         L += ["Unmeasured (not counted as pass): " + ", ".join(v["unmeasured"])]
     L += ["", "## Stages", "| stage | status | wall s |", "|---|---|---|"] + [f"| {n} | {s['status']} | {fmt(s['wall_s'], 0)} |" for n, s in j["stages"].items()]
