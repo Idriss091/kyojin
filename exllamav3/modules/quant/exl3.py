@@ -237,6 +237,14 @@ EXL3_DEC = os.environ.get("EXL3_DEC", "1") != "0"
 _DEC_KB2 = (4, 5, 6, 8, 10, 12)
 # dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs); the routed-MoE kernels stop at K6
 _DEC_KB2_DENSE = _DEC_KB2 + (14,)
+# EXL3_DENSE_K8=1 enables K8 for these Qwen attention shapes only. The list is not a kernel limit (the C++ side accepts any
+# K8 mul1 matrix once the setting is on). It is every K8 non-expert matrix of the K6-routed / K8-shared Qwen3.8 Flash-Next
+# pack that was measured: k_proj / v_proj (2560, 512), linear-attention in_proj_z (2560, 6144), in_proj_qkv (2560, 10240),
+# q_proj (2560, 12288), o_proj / out_proj (6144, 2560). The shared-expert projections (2560, 640) / (640, 2560) are left out on
+# purpose: this change keeps shared-expert and routed-MoE eligibility as it was. Add a shape only together with a real-weight
+# run of tools/qwen/check_dense_k8.py.
+_DENSE_K8_SHAPES = {(2560, 512), (2560, 6144), (2560, 10240),
+                    (2560, 12288), (6144, 2560)}
 # ROCm carries 9..32 rows per exl3_dec_gemv_r call: R * kbs * N partial sums of a wide dense projection (GDN qkvz at 28+ rows) outgrow 2M floats
 DEC_SCRATCH_FLOATS = (8 << 20) if torch.version.hip else (2 << 20)
 # arrival counters: the 8-row kernels fit 4096; a 32-row GEMV of a wide N (lm_head: 32 * ceil(N / 512)) needs up to ~16k
@@ -289,7 +297,11 @@ def dec_supported(inner) -> bool:
     """True when a LinearEXL3 can run the exl3_dec kernels (mul1 codebook, supported K, shapes)."""
     return (
         EXL3_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
-        inner.mul1 and not inner.mcg and int(round(inner.K * 2)) in _DEC_KB2_DENSE and
+        inner.mul1 and not inner.mcg and (
+            int(round(inner.K * 2)) in _DEC_KB2_DENSE or
+            (inner.K == 8 and os.environ.get("EXL3_DENSE_K8") == "1" and
+             (inner.in_features, inner.out_features) in _DENSE_K8_SHAPES)
+        ) and
         inner.K * 2 == int(round(inner.K * 2)) and
         inner.in_features % 512 == 0 and inner.out_features % 128 == 0 and
         tuple(inner.trellis.shape[:2]) == (inner.in_features // 16, inner.out_features // 16) and
