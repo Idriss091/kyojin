@@ -107,6 +107,20 @@ class PlanOrderTests(unittest.TestCase):
             self.assertNotIn("--dflash-dir", packmod.serve_flags(m, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
 
 
+class KvPresetTests(unittest.TestCase):
+    def test_preset_is_written_per_backend_and_never_overwrites_another_backend(self):
+        with tempfile.TemporaryDirectory() as t:
+            m = packmod.read_pack(fake_pack(Path(t)))
+            kv = dict(chosen=[6, 6], mode="quant")
+            c1 = stages.Ctx(m, args(backend="cuda"), Path(t), Path(t), {}, print)
+            stages.write_kv_choice(c1, kv)
+            c2 = stages.Ctx(m, args(backend="rocm"), Path(t), Path(t), {}, print)
+            stages.write_kv_choice(c2, dict(chosen=[8, 8], mode="quant"))
+            self.assertEqual(json.loads((Path(t) / "kv_cache.cuda.json").read_text())["k_bits"], 6)
+            self.assertEqual(json.loads((Path(t) / "kv_cache.rocm.json").read_text())["k_bits"], 8)
+            self.assertEqual(json.loads((Path(t) / "kv_cache.json").read_text())["backend"], "cuda")      # the neutral file keeps the first writer
+
+
 class LaneTests(unittest.TestCase):
     def test_lane_command_and_hermes_block_come_from_the_measured_config(self):
         import report

@@ -258,9 +258,14 @@ def write_kv_choice(c: Ctx, kv: dict) -> None:
     k, v = kv["chosen"]
     doc = dict(schema=1, kv_mode=kv.get("mode", "quant"), k_bits=k, v_bits=v, kvwin=kv.get("kvwin"), engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"),
                kl_vs_k8=({n: x["kl_vs_k8"] for n, x in kv["modes"].items()} if kv.get("modes") else None))
-    tmp = Path(c.meta["path"]) / "kv_cache.json.tmp"
-    tmp.write_text(json.dumps(doc, indent=1))
-    tmp.replace(Path(c.meta["path"]) / "kv_cache.json")
+    be = c.args.get("backend", "cuda")
+    doc["backend"] = be
+    for name in (f"kv_cache.{be}.json", "kv_cache.json"):      # per-backend file (serve.py reads it first); the plain one stays for older servers
+        if name == "kv_cache.json" and (Path(c.meta["path"]) / name).exists() and json.loads((Path(c.meta["path"]) / name).read_text()).get("backend") not in (None, be):
+            continue                                                         # never overwrite another backend's choice
+        tmp = Path(c.meta["path"]) / (name + ".tmp")
+        tmp.write_text(json.dumps(doc, indent=1))
+        tmp.replace(Path(c.meta["path"]) / name)
 
 
 def chosen_kv(c: Ctx) -> tuple:
