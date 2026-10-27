@@ -130,13 +130,15 @@ def job_autotune(c: Ctx) -> dict:
         if oom_in(log):
             raise RuntimeError("autotune: OOM in the server log")
     recs = tc.read_records(scratch / "coop_autotune_v1.bin")
-    if not recs:
-        raise RuntimeError("autotune: the replay produced no tuning records (does this build have the GEMM autotuner?)")
     tdir.mkdir(exist_ok=True)
     dense_new = _new_dense_lines(scratch / "dense_gemm_tune.txt", Path(__file__).resolve().parents[2] / "exllamav3/model/dense_gemm_tune_seed.txt")
+    if not recs and not dense_new:
+        return dict(skipped=True, reason="the replay produced no tuning record on this backend/build (no coop GEMM autotuner call, no new dense-GEMM line): nothing to ship", plan_points=len(sweep),
+                    sweep_failed=[x for x in sweep if not x["ok"]], wall_s=round(time.time() - t0, 1))
     if dense_new:                                    # lines the shipped seed did not hold (serve start copies the seed into the scratch file)
         (tdir / f"{sig['file']}.dense.txt").write_text("\n".join(dense_new) + "\n")
-    tc.write_records(tdir / f"{sig['file']}.bin", recs)
+    if recs:                                         # ROCm serves most shapes through the dense path: no coop records there is normal
+        tc.write_records(tdir / f"{sig['file']}.bin", recs)
     man = dict(schema=1, signature=sig, records=len(recs), records_at_load=at_load, load_s=round(load_s, 1), wall_s=round(time.time() - t0, 1),
                sessions=sessions, ctx=ctx, sweep=sweep, cmd=argv, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"))
     (tdir / f"{sig['file']}.json").write_text(json.dumps(man, indent=1))

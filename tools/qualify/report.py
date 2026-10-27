@@ -32,7 +32,7 @@ def assemble(meta: dict, args: dict, stages: dict, repo: Path) -> dict:
         serve=dict(cmd=(d.get("serve") or {}).get("cmd") or (d.get("smoke") or {}).get("cmd"), kv=kv, ctx=ctxs, draft_policy=dr.get("policy") or meta.get("draft_policy"),
                    dflash_dir=dr.get("dflash_dir"), template=meta["template"], lane=lane(meta, args, ctxs, kv, d), hermes=hermes(args, ctxs)),
         draft=dr or None, soak=d.get("soak"),
-        tuning={k: (d.get("autotune") or {}).get(k) for k in ("tuning_dir", "files", "records", "plan_points", "wall_s")} if d.get("autotune") else None,
+        tuning={k: (d.get("autotune") or {}).get(k) for k in ("tuning_dir", "files", "records", "plan_points", "wall_s", "skipped", "reason")} if d.get("autotune") else None,
         quality=dict(parity=d.get("parity"), kv=d.get("kv")),
         speed={k: sv.get(k) for k in ("decode_tps_median", "prefill_8k_tps", "curve", "agg")} if sv else None,
         sha=sv.get("sha"), smoke=sm,
@@ -103,7 +103,12 @@ def render_md(j: dict) -> str:
     L += ["", "## Stages", "| stage | status | wall s |", "|---|---|---|"] + [f"| {n} | {s['status']} | {fmt(s['wall_s'], 0)} |" for n, s in j["stages"].items()]
     if j.get("tuning"):
         t = j["tuning"]
-        L += ["", f"## Day-0 autotune", f"{t['records']} GEMM tuning records ({t['plan_points']} sweep points, {t['wall_s']} s on the device, lock wait excluded) in {t['tuning_dir']}: " + ", ".join(t["files"] or [])]
+        L += ["", "## Day-0 autotune"]
+        if t.get("skipped"):
+            L += [f"skipped: {t.get('reason')}"]
+    if j.get("tuning") and not j["tuning"].get("skipped"):
+        t = j["tuning"]
+        L += [f"{t['records']} GEMM tuning records ({t['plan_points']} sweep points, {t['wall_s']} s on the device, lock wait excluded) in {t['tuning_dir']}: " + ", ".join(t["files"] or [])]
     par = j["quality"]["parity"]
     if par:
         L += ["", "## Parity vs streamed BF16", f"mean KL {par['kl_mean']:.4f}, top-1 {par['top1_mean']:.4f}, dNLL {par['dnll_mean']:+.4f}; SQNR: {par['sqnr']}", "",
