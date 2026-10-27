@@ -451,6 +451,12 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
         ctx = c.args.get("ctx_cap") or 32768
         c.log(f"serve: no max-ctx result, using {ctx}")
     sess_eff = sess if mc.get(str(sess)) else 1
+    import report
+    ship_s, ship_c = report.served_config(c.args, mc)           # the smoke runs on the config that would ship (a real Hermes preamble is 15-30K)
+    ship_s, ship_c = (ship_s, ship_c) if ship_c else (sess_eff, ctx)
+    same = (ship_s, ship_c) == (sess_eff, ctx)
+    if not do_serve:
+        sess_eff, ctx, same = ship_s, ship_c, True
     out = dict(serve={}, smoke=None)
     with c.locks():
         log = c.out / "srv_serve.log"
@@ -481,7 +487,14 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
                 s["decode_tps_median"] = statistics.median(r["dec_tps"] for r in s["decode_short"] if r["dec_tps"])
                 s["prefill_8k_tps"] = statistics.median(r["ptok"] / r["ttft"] for r in s["prefill_8k"] if r["ptok"] and r["ttft"])
                 out["serve"] = s
-            if do_smoke:
+            if do_smoke and same:
+                out["smoke"] = run_smoke(c)
+        if do_smoke and not same:                              # matrix config differs from the shipped one: one more load for the smoke
+            argv = start_args(c, ship_c, ship_s)
+            out["smoke_cmd"] = [c.prof["python"], *argv]
+            with running_server(c.prof, c.repo, argv, c.args["port"], c.out / "srv_smoke.log", logf=c.log) as (p, ok):
+                if not ok:
+                    raise RuntimeError("smoke: server did not become ready; see " + str(c.out / "srv_smoke.log"))
                 out["smoke"] = run_smoke(c)
     return out
 
