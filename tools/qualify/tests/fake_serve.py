@@ -40,4 +40,6 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + json.dumps({"choices": [], "usage": {"prompt_tokens": pt, "completion_tokens": min(mt, 20)}}).encode() + b"\n\ndata: [DONE]\n\n")
 
 
-ThreadingHTTPServer(("127.0.0.1", a.port), H).serve_forever()
+srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
+print(f"qserve: READY on http://127.0.0.1:{a.port}  model=fake", flush=True)
+srv.serve_forever()

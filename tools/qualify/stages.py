@@ -138,7 +138,7 @@ def job_autotune(c: Ctx) -> dict:
     with c.locks():
         sig = json.loads(c.py("autotune.py", "--signature").strip().splitlines()[-1])
         t0 = time.time()
-        with running_server(prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
+        with running_server(prof, c.repo, argv, c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
             if not ok:
                 raise RuntimeError("autotune: server did not start: " + (log.read_text(errors="replace").strip().splitlines() or [""])[-1][:200])
             load_s = time.time() - t0
@@ -360,7 +360,7 @@ def job_draft(c: Ctx) -> dict:
             argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=1, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
                                        draft="dflash" if var == "dflash" else "off", dflash_dir=loc["dir"] if var == "dflash" else None)
             log = c.out / f"srv_draft_{i}_{var}.log"
-            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
+            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
                 if not ok:
                     raise RuntimeError(f"draft: {var} server did not start: " + (log.read_text(errors="replace").strip().splitlines() or [""])[-1][:200])
                 cl = load.Client(c.args["port"], "qual")
@@ -399,7 +399,7 @@ def probe_factory(c: Ctx, sessions: int):
 
     def probe_locked(ctx: int):
         log = c.out / f"srv_maxctx_s{sessions}_c{ctx}.log"
-        with running_server(c.prof, c.repo, start_args(c, ctx, sessions), c.args["port"], log, logf=c.log) as (p, ok):
+        with running_server(c.prof, c.repo, start_args(c, ctx, sessions), c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
             if not ok:
                 tail = log.read_text(errors="replace").strip().splitlines()[-1:] or [""]
                 return False, "no start: " + tail[0][:160]
@@ -465,7 +465,7 @@ def job_soak(c: Ctx) -> dict:
         for attempt in range(4):
             log = c.out / f"srv_soak_s{s_}_c{ctx}.log"
             with c.locks(f"soak s{s_} c{ctx}"):
-                with running_server(c.prof, c.repo, start_args(c, ctx, s_), c.args["port"], log, logf=c.log) as (p, ok):
+                with running_server(c.prof, c.repo, start_args(c, ctx, s_), c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
                     if not ok:
                         r = dict(ok=False, why="no start")
                     else:
@@ -505,7 +505,7 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
         with c.locks(label):
             log = c.out / f"srv_{label}.log"
             argv = start_args(c, ctx_, sess_)
-            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log) as (p, ok):
+            with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
                 if not ok:
                     raise RuntimeError(f"{label}: server did not become ready; see {log}")
                 cl = load.Client(c.args["port"], "qual")
