@@ -70,8 +70,10 @@ def lane(meta: dict, args: dict, ctxs: dict, kv: list, d: dict) -> dict | None:
     argv = packmod.serve_flags(meta, port=8000, ctx=ctx, sessions=sess, k_bits=kv[0], v_bits=kv[1], draft=dr.get("policy"), dflash_dir=dr.get("dflash_dir"),
                                kv_mode=kvd.get("mode", "quant"), kvwin=kvd.get("kvwin")) + ["--default-max-tokens", str(LANE_MAX_TOKENS)]
     env = {**(LANE_ENV_CUDA if args["backend"] == "cuda" else {}), "EXL3_PREFIX_DISK_DIR": f"~/cache/prefix-{meta['name']}"}
-    return dict(sessions=sess, ctx=ctx, env=env, argv=argv,
-                cmd="env " + " ".join(f"{k}={v}" for k, v in env.items()) + " python -u " + " ".join(argv))
+    py = (d.get("serve") or {}).get("cmd", [None])[0] or "python"
+    repo = str(args.get("repo") or ".")
+    return dict(sessions=sess, ctx=ctx, env=env, argv=argv, python=py, repo=repo,
+                cmd=f"cd {repo} && env PYTHONPATH={repo} " + " ".join(f"{k}={v}" for k, v in env.items()) + f" {py} -u " + " ".join(argv))
 
 
 def hermes(args: dict, ctxs: dict) -> dict | None:
@@ -106,8 +108,10 @@ def render_md(j: dict) -> str:
               "| domain | KL | top-1 | dNLL |", "|---|---|---|---|"] + [f"| {d} | {x['kl']:.4f} | {x['top1']:.4f} | {x['dnll']:+.4f} |" for d, x in par["by_domain"].items()]
     kv = j["quality"]["kv"]
     if kv:
-        L += ["", f"## KV (chosen k{kv['chosen'][0]}v{kv['chosen'][1]}; {kv['rule']}, kl_max {kv['kl_max']})", "| bits | KL vs ref | top-1 vs ref | KL vs k8v8 |", "|---|---|---|---|"]
-        L += [f"| k{b}v{b} | {x['kl_ref']:.4f} | {x['top1_ref']:.4f} | {fmt(x.get('kl_vs_k8'), 4)} |" for b, x in kv["table"].items()]
+        L += ["", f"## KV (chosen k{kv['chosen'][0]}v{kv['chosen'][1]}; {kv['rule']}, kl_max {kv['kl_max']})"]
+        if kv["table"]:
+            L += ["| bits | KL vs ref | top-1 vs ref | KL vs k8v8 |", "|---|---|---|---|"]
+            L += [f"| k{b}v{b} | {x['kl_ref']:.4f} | {x['top1_ref']:.4f} | {fmt(x.get('kl_vs_k8'), 4)} |" for b, x in kv["table"].items()]
         if kv.get("modes"):
             L += ["", f"KV format (decode-faithful 32K, KL vs k8v8; Q6 rule: kw6 if KL <= 0.9 x k6v6, tq opt-in): **{kv.get('mode', 'quant')}{' + ring ' + kv['kvwin'] if kv.get('kvwin') else ''}**",
                   "| format | KL vs k8v8 | top-1 vs k8v8 | bits/value | decode s/tok |", "|---|---|---|---|---|"]
