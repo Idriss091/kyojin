@@ -87,6 +87,8 @@ def main(argv=None) -> int:
                                                                      False, a["conv_extra"].split())) + f"\n(needs ~{convert_job.disk_need_gb(a['convert_from']):.0f} GB; then the plan below on the new pack)")
             return 0
         _convert(a, out)
+    if a["ctx_cap"] is None:
+        a["ctx_cap"] = backends.PROFILES[a["backend"]].get("ctx_cap_default")
     meta = packmod.read_pack(a["pack"])
     state = planmod.load_state(out)
     only = a["stage"].split(",") if a["stage"] else None

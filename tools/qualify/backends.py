@@ -20,6 +20,7 @@ PROFILES = {
     "rocm": dict(
         python=None, engine=ENGINE, locks=LOCKS, env={},
         gpu_used_mib="/sys/class/drm/card1/device/mem_info_gtt_used", host_peak_note="Strix unified memory",
+        ctx_cap_default=65536,      # ~120 GB of unified memory: the free-memory bound is ~1M tokens and a near-full probe at 500K would run for hours; --ctx-cap raises it
     ),
 }
 
