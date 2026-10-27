@@ -144,6 +144,84 @@ affects quantized caches.
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
+### `EXL3_CK_PAGEDKV` (default: unset) -- EXPERIMENTAL
+
+Experimental, default-off, approximate Composable Kernel sparse prefill for the MiMo
+global-attention shape on gfx1151 ROCm. Skipping past pages changes attention output and
+therefore later layers' K/V. This is research functionality, not a general quality-adoption
+recommendation. Set to `sparse` before importing the engine to register handlers for fp16 and
+8-bit KV caches when the optional library is available. The handlers own only batch-one,
+causal Q/K=192, 64-query-head/4-KV-head, V=128 prefill chunks; unsupported shapes, decode,
+SWA and unaligned past lengths fall back to the normal backend.
+
+Build the required MIT-licensed CK specialization with local `git`, `cmake`, `nm`,
+`/usr/bin/python3`, and an already-expanded ROCm SDK (including `lib/llvm/bin/clang{,++}`):
+
+```bash
+export EXL3_CK_SOURCE=/path/to/local/composable_kernel
+export EXL3_ROCM_SDK=/path/to/already-expanded/rocm-sdk
+export EXL3_CK_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv"
+tools/strix_halo/build_ck_pagedkv.sh
+```
+
+`EXL3_CK_SOURCE` is a read-only local Git donor containing commit
+`6f44fdf90f69adee742ec3660b95d32963b9bd2d`. The builder ignores its current HEAD and dirty
+worktree, stages that exact commit in the cache, and patches only the staged copy. It never
+fetches implicitly or sources `env.sh`. `EXL3_CK_CACHE` must be disjoint from the donor (neither
+may contain the other): choose a nonexistent directory on first use, or reuse a cache with a
+matching builder/patch/shim/SDK/commit ownership record. Existing unowned or incompatible
+caches are refused.
+
+The output is `$EXL3_CK_CACHE/libck_pagedkv.so` with a digest-bound `receipt.json`. The default
+cache is `${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv`; when choosing a different cache,
+set `EXL3_CK_PAGEDKV_SO="$EXL3_CK_CACHE/libck_pagedkv.so"` before importing the engine. Build
+success proves source compilation/linking and export checks only, not native loading or
+numerical correctness. The first implementation stages all used K and V pages from an 8-bit
+cache; selected-V-only staging is not implemented yet.
+
+A missing/unloadable optional library or missing entry point warns once and leaves the normal
+handlers in place for the process. An explicit kernel rejection (`-1`) declines for that chunk;
+other invalid results and execution errors are not treated as unsupported shapes. Restart after
+building or replacing an unavailable library.
+
+The 8-bit staging pair grows in 32-page steps, capped by the packed cache's physical capacity,
+and is reused within each step. A width/bound change retires incompatible scratch; replacements
+retire the old pair first under the engine's single-stream, fully-overwritten-scratch contract.
+
+Sparse mode, retention and minimum length are frozen together at import time. Use a new process
+to change them. Sparse page hashes, disk-prefix namespaces and saved sessions are isolated from
+ordinary mode and from other sparse policies, including fallback requests in a sparse process.
+Ordinary session formats 1/2 remain readable in ordinary mode. Sparse sessions use incompatible
+formats 3/4 so older ordinary readers reject them too; current readers check the exact policy
+before restoring any pages, stash or rootless tail. The MiMo server's `+ck-sparse` model tag is
+retained as an additional separation layer.
+
+Focused CPU tests need no Torch, Triton, native extension or CUDA/HIP toolchain. Run each directly
+from the repository root to avoid package initialization:
+
+```bash
+python3 -I -S -B tests/test_ck_pagedkv_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_fallback_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_admission_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_sparse_memory_cpu.py -v
+python3 -I -S -B tests/test_ck_sparse_cache_cpu.py -v
+python3 -I -S -B tests/test_ck_dispatch_mode_cpu.py -v
+```
+
+### `EXL3_CK_SPARSE_RETAIN` (default: `0.5`)
+
+Nominal fraction of total pages (past plus current chunk) retained by the optional CK selector.
+Current-chunk and sink pages are always kept, even if they exceed that budget; the most-recent
+past pages are not forced. Read once before engine import and included in the sparse cache
+identity. This is a quality/performance knob; evaluate it with the same model and context before
+changing the default.
+
+### `EXL3_CK_MIN_SK` (default: `0`)
+
+Experimental minimum total KV length for sparse selection in the fp16 and packed8 handlers.
+Calls below it use the ordinary backend. Frozen at import time and included in the sparse cache
+identity. It does not enable CK for otherwise unsupported shapes.
+
 ### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than

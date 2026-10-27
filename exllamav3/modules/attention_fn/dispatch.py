@@ -1,4 +1,7 @@
+import os
+
 import torch
+from ...util.attention_mode import CK_SPARSE_ENABLED
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from ...cache.kvwin import MAX_DRAFT
@@ -215,3 +218,19 @@ def attn_dispatch(
             cache.update_layer(cache_idx, cache_seqlens, block_table, k_cache, v_cache, q_len, cache_instance)
 
     return o
+
+
+# Optional MiMo sparse prefill. Kept import-time gated because dispatch caches the
+# chosen handler per layer: installing after the first call would not be reliable.
+# `sparse` installs both the fp16 and packed-8-bit KV handlers; every unsupported
+# shape returns None and retains the normal Triton fallback.
+# A missing or unloadable library leaves the normal handlers untouched (one warning, no error).
+if CK_SPARSE_ENABLED:
+    from .ck_pagedkv import _kernel
+
+    if _kernel() is not None:
+        from .ck_pagedkv_sparse_engine import install_sparse_engine
+        from .ck_pagedkv_sparse_qc import install_sparse_qc
+
+        install_sparse_engine(attn_fns)
+        install_sparse_qc(_fns_qc)
