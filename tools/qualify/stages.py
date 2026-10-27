@@ -320,11 +320,13 @@ def draft_variants() -> list:
 
 
 def speedups(runs: list) -> dict:
-    """runs: [{variant, tps: {kind: [tok/s ...]}}] -> {kind: mean drafted tok/s / mean plain tok/s} (warm-up already dropped)."""
+    """runs: [{variant, tps: {kind: [tok/s ...]}}] -> {kind: mean drafted tok/s / mean plain tok/s} (warm-up already dropped).
+    A kind with no data point in some variant (a request that returned no decode rate) is left out, not fatal."""
     out = {}
     for kind in runs[0]["tps"]:
-        m = {v: statistics.mean(x for r in runs if r["variant"] == v for x in r["tps"][kind]) for v in ("plain", "dflash")}
-        out[kind] = round(m["dflash"] / m["plain"], 3)
+        m = {v: [x for r in runs if r["variant"] == v for x in r["tps"].get(kind, [])] for v in ("plain", "dflash")}
+        if m["plain"] and m["dflash"]:
+            out[kind] = round(statistics.mean(m["dflash"]) / statistics.mean(m["plain"]), 3)
     return out
 
 
@@ -349,12 +351,15 @@ def job_draft(c: Ctx) -> dict:
                 if not ok:
                     raise RuntimeError(f"draft: {var} server did not start: " + (log.read_text(errors="replace").strip().splitlines() or [""])[-1][:200])
                 cl = load.Client(c.args["port"], "qual")
-                tps = {}
+                tps, errs = {}, {}
                 for kind, prompts in cl.kind_prompts().items():
                     cl.stream(prompts[0], 64)                                     # warm-up (graphs, caches) discarded
-                    tps[kind] = [r["dec_tps"] for pr in prompts for r in [cl.stream(pr, 256) for _ in range(2)] if r["dec_tps"]]
-            runs.append(dict(variant=var, tps=tps, oom=oom_in(log)))
-            c.log(f"draft: {var}: " + ", ".join(f"{k_} {statistics.mean(x):.1f}" for k_, x in tps.items() if x) + " tok/s")
+                    rs = [cl.stream(pr, 256) for pr in prompts for _ in range(2)]
+                    tps[kind] = [r["dec_tps"] for r in rs if r["dec_tps"]]
+                    if len(tps[kind]) < len(rs):
+                        errs[kind] = [r["err"] or f"ntok={r['ntok']}" for r in rs if not r["dec_tps"]][:2]
+            runs.append(dict(variant=var, tps=tps, errs=errs, oom=oom_in(log)))
+            c.log(f"draft: {var}: " + ", ".join(f"{k_} {statistics.mean(x):.1f}" for k_, x in tps.items() if x) + " tok/s" + (f"; unmeasured {errs}" if errs else ""))
     sp = speedups(runs)
     use, why = rules.choose_draft(sp)
     return dict(policy="dflash" if use else base, dflash_dir=loc["dir"] if use else None, drafter=loc["dir"], source=loc["source"], speedup=sp, reason=why, runs=runs,
