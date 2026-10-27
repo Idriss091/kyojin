@@ -62,7 +62,8 @@ def parse(argv=None) -> dict:
     a = vars(ap.parse_args(argv))
     a["sessions"] = sorted({int(x) for x in a["sessions"].split(",")})
     a["kv_bits"] = [int(x) for x in a["kv_bits"].split(",")]
-    a["pack"] = str(Path(a["pack"]).expanduser())
+    a["pack"] = str(Path(a["pack"]).expanduser().resolve())
+    a["repo"] = str(Path(a["repo"]).expanduser().resolve())
     if a["ref"]:
         a["ref"] = str(Path(a["ref"]).expanduser())
     a["out"] = str(Path(a["out"]).expanduser() if a["out"] else Path(a["repo"]) / "qualify_out" / Path(a["pack"]).name / a["backend"])

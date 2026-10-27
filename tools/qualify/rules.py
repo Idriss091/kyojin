@@ -95,8 +95,10 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
         unmeasured.append("serve")
     sm = q.get("smoke")
     if sm:
-        if sm["total"] and sm["passed"] / sm["total"] < g["smoke_min"]:
-            reasons.append(f"smoke {sm['passed']}/{sm['total']} < {g['smoke_min']:.0%}")
+        if sm["total"]:       # graded suite: the mean score decides (a partial 0.4 on a trap task is not a failure of the lane); scripted fallback: pass rate
+            val = sm["score_mean"] if sm.get("score_mean") is not None else sm["passed"] / sm["total"]
+            if val < g["smoke_min"]:
+                reasons.append(f"smoke {'mean score' if sm.get('score_mean') is not None else 'pass rate'} {val:.2f} ({sm['passed']}/{sm['total']}) < {g['smoke_min']:.0%}")
     else:
         unmeasured.append("smoke")
     return dict(pass_=not reasons and not unmeasured, reasons=reasons, unmeasured=unmeasured)
