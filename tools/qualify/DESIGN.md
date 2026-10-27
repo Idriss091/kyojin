@@ -60,7 +60,7 @@ Stage order is now `[convert] fetch meta parity kv draft autotune maxctx soak se
 - `convert` (only with `--convert-from BF16_DIR` and no complete pack; `convert_job.py`): runs `convert.py -b --bits -hb --head-bits` under the GPU locks with an own-process-group
   SIGSTOP/SIGCONT memory guard (`--conv-pause-gib 6` / `--conv-resume-gib 10`), resumes from the work dir, keeps the converter log as `<pack>/convert.log` (per-layer SQNR for `parity`),
   carries the chat template into the pack (source `chat_template.jinja`, else the one embedded in `tokenizer_config.json`), checks the disk floor against ~0.95 x source size.
-- `backends.find_python`: the interpreter whose torch matches the backend (cuda/hip), found in the engine checkout's venv, `$VIRTUAL_ENV`, `~/hermes-work/*/{venv,.venv}`; `QUALIFY_PYTHON` overrides.
+- `backends.find_python`: the interpreter whose torch matches the backend (cuda/hip), found in the engine checkout's venv, `$VIRTUAL_ENV`, `$QUALIFY_WORK_ROOT/*/{venv,.venv}`; `QUALIFY_PYTHON` overrides.
 - `kv` without a BF16 reference: the pack-only decode-faithful `kvmode` KL vs the pack's own k8v8 decides Q6 vs k8v8 and k6v6 vs kw6 (before, the stage was skipped and the lane fell back to k6v6 unmeasured).
 - `draft` (head-less packs; a pack with its own MTP head keeps `mix`): `drafter.py` finds a DFlash drafter structurally compatible with the target (local `--drafter`, `<pack>/dflash`, `~/models/drafters/*`,
   else a HF search `<model stem> dflash`, `exllamav3` branch preferred, downloaded under the disk floor), then an ABBA plain/drafted/drafted/plain served A/B on code/chat/agentic (warm-up dropped).

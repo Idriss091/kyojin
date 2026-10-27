@@ -14,11 +14,14 @@ import urllib.request
 from pathlib import Path
 
 def _eval_dirs() -> list:
-    """QUALIFY_EVAL_DIR, then the known homes of the suite (no env var needed: drill 0 found the right copy by hand, the duel_src one lacks lib/taskdefs.py)."""
+    """QUALIFY_EVAL_DIR, then the suite's usual places under $QUALIFY_WORK_ROOT (if set)."""
     import glob
-    home = os.path.expanduser("~/hermes-work")
     found = [Path(os.environ["QUALIFY_EVAL_DIR"])] if os.environ.get("QUALIFY_EVAL_DIR") else []
-    for pat in ("leadk/fleet/pr_bundles/*/harness/eval", "*/hermes_opt/eval", "*/harness/eval"):
+    root = os.environ.get("QUALIFY_WORK_ROOT")
+    if not root:
+        return found
+    home = os.path.expanduser(root)
+    for pat in ("*/*/*/*/harness/eval", "*/hermes_opt/eval", "*/harness/eval"):
         found += [Path(x) for x in sorted(glob.glob(f"{home}/{pat}"))]
     return found
 
