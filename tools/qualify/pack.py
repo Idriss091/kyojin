@@ -19,6 +19,21 @@ FAMILIES = {
     "Qwen3_5ForConditionalGeneration": dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=True),
     "Qwen3_5ForCausalLM": dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=False),
 }
+# Architectures not listed above resolve by the config's model_type prefix (any Qwen-family pack is served by the qwen entry:
+# Qwen4Exp / future Qwen releases need no new hard-coded name). Same prefix rule as docker/kyojin_args.TYPE_HINTS.
+FAMILY_BY_MODEL_TYPE = (
+    ("qwen", dict(family="hybrid_gdn", serve="tools/qwen/serve.py", ref=None, vision=True)),
+)
+
+
+def resolve_family(arch: str, cfg: dict) -> dict:
+    if arch in FAMILIES:
+        return FAMILIES[arch]
+    mt = str(cfg.get("model_type") or _text_cfg(cfg).get("model_type") or "").lower()
+    for prefix, fam in FAMILY_BY_MODEL_TYPE:
+        if mt.startswith(prefix):
+            return fam
+    return dict(family="unknown", serve=None, ref=None, vision=False)
 
 
 def _text_cfg(cfg: dict) -> dict:
@@ -50,7 +65,7 @@ def read_pack(path: str | os.PathLike) -> dict:
     cfg = json.loads((p / "config.json").read_text())
     t = _text_cfg(cfg)
     arch = (cfg.get("architectures") or ["?"])[0]
-    fam = FAMILIES.get(arch, dict(family="unknown", serve=None, ref=None, vision=False))
+    fam = resolve_family(arch, cfg)
     heads = t["num_attention_heads"]
     qc = {}
     for name in ("quantization_config.json",):
@@ -66,11 +81,18 @@ def read_pack(path: str | os.PathLike) -> dict:
         quant=qc.get("quant_method"), bpw=qc.get("bits"), head_bits=qc.get("head_bits"),
         vision=bool(fam["vision"] and cfg.get("vision_config") and not cfg.get("language_model_only")),
         mtp_layers=int(t.get("mtp_num_hidden_layers") or t.get("num_nextn_predict_layers") or 0),
-        weights_bytes=weights_dir_bytes(p), index_sha=hashlib.sha1(idx.read_bytes()).hexdigest()[:12] if idx.exists() else None,
+        weights_bytes=weights_dir_bytes(p), index_sha=_index_sha(p, idx),
         license=_license(p), template=str(p / "chat_template.jinja") if (p / "chat_template.jinja").exists() else None,
     )
     meta["problems"] = problems(meta)
     return meta
+
+
+def _index_sha(p: Path, idx: Path) -> str | None:
+    if idx.exists():
+        return hashlib.sha1(idx.read_bytes()).hexdigest()[:12]
+    one = p / "model.safetensors"      # single shard: size + mtime stand in for the index (stage keys, tuning/kv presets)
+    return hashlib.sha1(f"{one.stat().st_size}:{int(one.stat().st_mtime)}".encode()).hexdigest()[:12] if one.exists() else None
 
 
 def _license(p: Path) -> str | None:
@@ -104,11 +126,13 @@ def draft_policy(meta: dict) -> str:
 
 
 def serve_flags(meta: dict, *, port: int, ctx: int, sessions: int, k_bits: int, v_bits: int, model_id: str = "qual",
-                draft: str | None = None, kv_mode: str = "quant", kvwin: str | None = None) -> list[str]:
+                draft: str | None = None, kv_mode: str = "quant", kvwin: str | None = None, dflash_dir: str | None = None) -> list[str]:
     """argv of the server (after the python executable) for this pack. No hand flags: every value is derived."""
     f = [meta["serve_entry"], "--model", meta["path"], "--port", str(port), "--model-id", model_id, "-c", str(ctx),
          "--sessions", str(sessions), "--k-bits", str(k_bits), "--v-bits", str(v_bits),
          "--draft-policy", draft or draft_policy(meta)]
+    if dflash_dir and (draft or "") == "dflash":
+        f += ["--dflash-dir", dflash_dir]
     if kv_mode != "quant":
         f += ["--kv-mode", kv_mode]
     if kvwin:
@@ -124,8 +148,9 @@ def verify_shards(path: str | os.PathLike) -> list[str]:
     """Problems found when comparing the shard files with model.safetensors.index.json (names + existence + non-empty)."""
     p = Path(path).expanduser()
     idx = p / "model.safetensors.index.json"
-    if not idx.exists():
-        return [f"{p}: no model.safetensors.index.json"]
+    if not idx.exists():       # a small model converts to ONE shard and has no index (Qwen3.5-0.8B)
+        one = p / "model.safetensors"
+        return [] if one.exists() and one.stat().st_size else [f"{p}: no model.safetensors.index.json and no model.safetensors"]
     files = sorted(set(json.loads(idx.read_text())["weight_map"].values()))
     bad = []
     for f in files:

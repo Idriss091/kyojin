@@ -13,7 +13,20 @@ import time
 import urllib.request
 from pathlib import Path
 
-EVAL_DIRS = [Path(os.environ["QUALIFY_EVAL_DIR"])] if os.environ.get("QUALIFY_EVAL_DIR") else []
+def _eval_dirs() -> list:
+    """QUALIFY_EVAL_DIR, then the suite's usual places under $QUALIFY_WORK_ROOT (if set)."""
+    import glob
+    found = [Path(os.environ["QUALIFY_EVAL_DIR"])] if os.environ.get("QUALIFY_EVAL_DIR") else []
+    root = os.environ.get("QUALIFY_WORK_ROOT")
+    if not root:
+        return found
+    home = os.path.expanduser(root)
+    for pat in ("*/*/*/*/harness/eval", "*/hermes_opt/eval", "*/harness/eval"):
+        found += [Path(x) for x in sorted(glob.glob(f"{home}/{pat}"))]
+    return found
+
+
+EVAL_DIRS = _eval_dirs()
 DEFAULT_TASKS = ""        # filled by pick_tasks from the suite's own task list
 
 
@@ -25,17 +38,28 @@ def find_eval() -> Path | None:
     return None
 
 
-def run_hermes_eval(eval_dir: Path, port: int, model: str, tasks: str, arm: str, timeout: int = 3600) -> dict:
+def run_hermes_eval(eval_dir: Path, port: int, model: str, tasks: str, arm: str, timeout: int = 3600, keep: Path | None = None) -> dict:
     env = {**os.environ, "EVAL_API_KEY": "x"}
     cmd = ["bash", str(eval_dir / "run_arm.sh"), arm, "-", f"http://127.0.0.1:{port}/v1", model, "1", "--allow-local", "--jobs", "1"] + (["--tasks", tasks] if tasks else [])
     r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
     f = eval_dir / "runs" / arm / "rep1.json"
     if not f.exists():
         return dict(kind="hermes_eval", total=0, passed=0, error=(r.stdout + r.stderr)[-400:])
-    data = json.loads(f.read_text())
-    rows = data if isinstance(data, list) else data.get("results") or data.get("tasks") or []
-    ok = [x for x in rows if isinstance(x, dict) and x.get("success")]
-    return dict(kind="hermes_eval", total=len(rows), passed=len(ok), tasks=[{k: x.get(k) for k in ("id", "task", "score", "success", "tool_calls")} for x in rows])
+    res = parse_eval(json.loads(f.read_text()))
+    keep = (keep or Path(tempfile.gettempdir())) / f"smoke_{arm}"      # the suite writes its runs inside its own checkout: move them out
+    shutil.rmtree(keep, ignore_errors=True)
+    shutil.move(str(f.parent), str(keep))
+    res["runs_dir"] = str(keep)
+    return res
+
+
+def parse_eval(data) -> dict:
+    """run_suite.py's rep json: {"arm", "cells": [{task, status, score, success, wall_s, tool_calls, ...}]} (older shapes: a bare list / results / tasks)."""
+    rows = data if isinstance(data, list) else data.get("cells") or data.get("results") or data.get("tasks") or []
+    rows = [x for x in rows if isinstance(x, dict)]
+    ok = [x for x in rows if x.get("success")]
+    return dict(kind="hermes_eval", total=len(rows), passed=len(ok), score_mean=round(sum(x.get("score") or 0 for x in rows) / len(rows), 3) if rows else None,
+                tasks=[{k: x.get(k) for k in ("task", "id", "score", "success", "wall_s", "tool_calls", "api_turns", "notes")} for x in rows])
 
 
 _BUGGY = '''def parse_line(line):

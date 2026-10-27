@@ -14,11 +14,13 @@ from pathlib import Path
 STAGE_TABLE = {
     "fetch":   dict(job="cpu",    needs=[],                         est=60,    gpu=False),
     "meta":    dict(job="cpu",    needs=["fetch"],                  est=5,     gpu=False),
-    "autotune": dict(job="autotune", needs=["meta"],                est=180,   gpu=True),
     "parity":  dict(job="parity", needs=["meta"],                   est=900,   gpu=True),
     "kv":      dict(job="kv",     needs=["meta", "parity"],         est=900,   gpu=True),
-    "maxctx":  dict(job="maxctx", needs=["meta", "kv"],             est=1500,  gpu=True),
-    "serve":   dict(job="serve",  needs=["meta", "kv", "maxctx"],   est=1500,  gpu=True),
+    "draft":   dict(job="draft",  needs=["meta", "kv"],             est=600,   gpu=True),
+    "autotune": dict(job="autotune", needs=["meta", "draft"],       est=180,   gpu=True),
+    "maxctx":  dict(job="maxctx", needs=["meta", "kv", "draft"],    est=1500,  gpu=True),
+    "soak":    dict(job="soak",   needs=["meta", "maxctx"],         est=900,   gpu=True),
+    "serve":   dict(job="serve",  needs=["meta", "kv", "maxctx", "soak"],   est=1500,  gpu=True),
     "smoke":   dict(job="serve",  needs=["serve"],                  est=900,   gpu=True),
     "report":  dict(job="cpu",    needs=["meta"],                   est=2,     gpu=False),
 }
@@ -37,8 +39,8 @@ class Stage:
     cmd: list = field(default_factory=list)
 
 
-RELEVANT = {"fetch": ("ref",), "meta": (), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits", "kv_modes", "kvmode_steps"), "maxctx": ("sessions", "ctx_cap"),
-            "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
+RELEVANT = {"fetch": ("ref",), "meta": (), "draft": ("drafter", "no_hf_drafter"), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits", "kv_modes", "kvmode_steps"), "maxctx": ("sessions", "ctx_cap"),
+            "soak": ("sessions", "soak_s"), "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
 
 
 def fingerprint(stage: str, meta: dict, args: dict) -> str:
@@ -77,10 +79,11 @@ def build_plan(meta: dict, args: dict, state: dict, only: list | None = None, re
             st.status, st.note = "skip", "no --ref BF16 dir: parity unmeasured"
         elif name == "parity" and not meta.get("ref_adapter"):
             st.status, st.note = "skip", f"no reference adapter for family {meta.get('family')}: parity unmeasured"
-        elif name == "kv" and not args.get("ref"):
-            st.status, st.note = "skip", "kv KL needs the BF16 reference tail (--ref): falling back to k6v6 (Q6 rule)"
-        elif name == "kv" and not meta.get("ref_adapter"):
-            st.status, st.note = "skip", f"no reference adapter for family {meta.get('family')}: falling back to k6v6"
+        elif name == "kv" and not (args.get("ref") and meta.get("ref_adapter")):
+            if args.get("kv_modes", True):
+                st.note = "no BF16 reference (--ref / family adapter): KV format picked from the pack-only decode-faithful KL vs k8v8 (kvmode)"
+            else:
+                st.status, st.note = "skip", "kv KL needs the BF16 reference tail (--ref) or the kvmode measure: falling back to k6v6 (Q6 rule)"
         d = state.get(name)
         if st.status == "todo" and d and d.get("status") == "done" and d.get("key") == fingerprint(name, meta, args) and name not in redo:
             st.status, st.note = "done", f"resumed ({d.get('wall_s')} s)"

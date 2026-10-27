@@ -50,6 +50,17 @@ class PackTests(unittest.TestCase):
             self.assertEqual(f[f.index("--chat-template") + 1], str(Path(t) / "chat_template.jinja"))
             self.assertEqual(m["problems"], [])
 
+    def test_unlisted_qwen_arch_resolves_by_model_type(self):
+        qx = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 8, "num_attention_heads": 8, "num_key_value_heads": 2, "head_dim": 16,
+              "hidden_size": 128, "layer_types": ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"]}}
+        with tempfile.TemporaryDirectory() as t:
+            m = packmod.read_pack(fake_pack(Path(t), arch="Qwen4ExpForConditionalGeneration", extra=qx))
+            self.assertEqual((m["family"], m["serve_entry"], m["kv_layers"]), ("hybrid_gdn", "tools/qwen/serve.py", 2))
+            self.assertEqual(m["problems"], [])
+        with tempfile.TemporaryDirectory() as t:      # a genuinely unknown model_type still refuses
+            m = packmod.read_pack(fake_pack(Path(t), arch="FooForCausalLM", extra={"model_type": "foo"}))
+            self.assertTrue(any("no serve entry" in x for x in m["problems"]))
+
     def test_mtp_head_selects_mix(self):
         with tempfile.TemporaryDirectory() as t:
             m = packmod.read_pack(fake_pack(Path(t), mtp=1))
@@ -89,9 +100,14 @@ class PlanTests(unittest.TestCase):
     def names(self, plan, status):
         return [s.name for s in plan if s.status == status]
 
-    def test_full_plan_without_ref_skips_parity_and_kv_with_reason(self):
+    def test_full_plan_without_ref_skips_parity_but_kv_runs_pack_only(self):
         p = planmod.build_plan(self.meta(), args(), {})
         self.assertEqual([s.name for s in p], planmod.ORDER)
+        self.assertEqual(self.names(p, "skip"), ["parity"])
+        self.assertIn("kvmode", next(s for s in p if s.name == "kv").note)
+
+    def test_no_ref_and_no_kv_modes_skips_kv_with_reason(self):
+        p = planmod.build_plan(self.meta(), args(kv_modes=False), {})
         self.assertEqual(self.names(p, "skip"), ["parity", "kv"])
         self.assertIn("k6v6", next(s for s in p if s.name == "kv").note)
 
@@ -240,6 +256,13 @@ class CliTests(unittest.TestCase):
 class KvModeRule(unittest.TestCase):
     BPV = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
     TQ = ("k6v6", "kw6", "tq6", "tq5")
+
+    def test_kv_mode_refuses_a_format_with_a_slower_decode_step(self):
+        bpv = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.06, "tq5": 5.06}
+        kl = {"k6v6": 0.0007, "kw6": 0.00035, "tq6": 0.0004, "tq5": 0.0009}
+        self.assertEqual(rules.choose_kv_mode(kl, bpv), "kw6")
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")      # ROCm 0.8B: ring +32 %
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0071}), "kw6")
 
     def test_choose_kv_mode(self):
         bpv = self.BPV

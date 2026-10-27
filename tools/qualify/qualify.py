@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import backends  # noqa: E402
+import convert_job  # noqa: E402
 import pack as packmod  # noqa: E402
 import plan as planmod  # noqa: E402
 import report  # noqa: E402
@@ -38,8 +39,20 @@ def parse(argv=None) -> dict:
     ap.add_argument("--kv-kl-max", type=float, default=0.02)
     ap.add_argument("--no-kv-modes", dest="kv_modes", action="store_false", help="skip the KV format auto-select (k6v6 vs tq6 vs tq5, decode-faithful 32K KL vs k8v8) in the kv stage")
     ap.add_argument("--kvmode-steps", type=int, default=256, help="teacher-forced decode steps scored by the KV format auto-select")
+    ap.add_argument("--drafter", help="DFlash drafter directory (default: <pack>/dflash, ~/models/drafters/*, else a HF search '<model stem> dflash')")
+    ap.add_argument("--no-hf-drafter", action="store_true", help="never search / download a drafter from HF")
+    ap.add_argument("--soak-s", type=float, default=360, help="seconds of mixed agent-shaped load per session count at the max-ctx result (soak stage); on any error -c steps down 8 %% and the soak reruns")
+    ap.add_argument("--min-share", type=int, default=24576, help="tokens one session must get for the shipped session count (default 24,576: Hermes' live preamble is 15-30K)")
     ap.add_argument("--ctx-cap", type=int, help="cap of the max-ctx search (default: the model's max_position_embeddings)")
     ap.add_argument("--disk-floor-gb", type=float, default=40)
+    ap.add_argument("--convert-from", help="BF16 checkpoint directory: convert it into --pack first when the pack is missing/incomplete (own-PID memory guard, resume, convert.log + chat template carried into the pack)")
+    ap.add_argument("--bits", type=float, default=4.0, help="conversion bits per weight")
+    ap.add_argument("--head-bits", type=int, default=6)
+    ap.add_argument("--conv-work", help="converter work dir (default <out>/conv_work; kept until the conversion succeeds, deleted then unless --keep-work)")
+    ap.add_argument("--conv-extra", default="", help="extra converter flags, e.g. '-hq'")
+    ap.add_argument("--conv-pause-gib", type=float, default=6.0, help="SIGSTOP the converter when MemAvailable falls below this")
+    ap.add_argument("--conv-resume-gib", type=float, default=10.0)
+    ap.add_argument("--keep-work", action="store_true")
     ap.add_argument("--hf", help="HF repo to download into --pack first (license/size/disk-floor checked)")
     ap.add_argument("--conv-log", help="converter log (per-layer SQNR); default <pack>/convert.log")
     ap.add_argument("--smoke-tasks", default="", help="hermes_opt/eval task ids (default: 4 spread over the suite)")
@@ -49,7 +62,8 @@ def parse(argv=None) -> dict:
     a = vars(ap.parse_args(argv))
     a["sessions"] = sorted({int(x) for x in a["sessions"].split(",")})
     a["kv_bits"] = [int(x) for x in a["kv_bits"].split(",")]
-    a["pack"] = str(Path(a["pack"]).expanduser())
+    a["pack"] = str(Path(a["pack"]).expanduser().resolve())
+    a["repo"] = str(Path(a["repo"]).expanduser().resolve())
     if a["ref"]:
         a["ref"] = str(Path(a["ref"]).expanduser())
     a["out"] = str(Path(a["out"]).expanduser() if a["out"] else Path(a["repo"]) / "qualify_out" / Path(a["pack"]).name / a["backend"])
@@ -68,6 +82,14 @@ def logger(out: Path):
 def main(argv=None) -> int:
     a = parse(argv)
     out = Path(a["out"]); out.mkdir(parents=True, exist_ok=True)
+    if a["convert_from"] and not convert_job.pack_complete(a["pack"]):
+        if a["dry_run"]:
+            print("convert stage: " + " ".join(convert_job.convert_argv(a["convert_from"], a.get("conv_work") or str(out / "conv_work"), a["pack"], a["bits"], a["head_bits"],
+                                                                     False, a["conv_extra"].split())) + f"\n(needs ~{convert_job.disk_need_gb(a['convert_from']):.0f} GB; then the plan below on the new pack)")
+            return 0
+        _convert(a, out)
+    if a["ctx_cap"] is None:
+        a["ctx_cap"] = backends.PROFILES[a["backend"]].get("ctx_cap_default")
     meta = packmod.read_pack(a["pack"])
     state = planmod.load_state(out)
     only = a["stage"].split(",") if a["stage"] else None
@@ -98,8 +120,8 @@ def main(argv=None) -> int:
             names = [x.name for x in todo if x.name in ("serve", "smoke")]
             runner = lambda: _split_serve(c, "serve" in names, "smoke" in names)
         else:
-            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "parity": lambda: st.job_parity(c),
-                      "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "report": None}[s.name]
+            runner = {"fetch": lambda: st.stage_fetch(c), "meta": lambda: st.stage_meta(c), "autotune": lambda: st.job_autotune(c), "draft": lambda: st.job_draft(c), "parity": lambda: st.job_parity(c),
+                      "kv": lambda: st.job_kv(c), "maxctx": lambda: st.job_maxctx(c), "soak": lambda: st.job_soak(c), "report": None}[s.name]
         if s.name == "report":
             continue
         t0 = time.time(); log(f"stage {s.name} start")
@@ -124,13 +146,25 @@ def main(argv=None) -> int:
     return 0
 
 
+def _convert(a, out):
+    """Stage 0 (only with --convert-from and no complete pack): runs before the pack metadata exists, under the GPU locks."""
+    from locks import gpu_locks
+    log = logger(out)
+    prof = backends.profile(a["backend"], a["repo"])
+    log(f"stage convert start ({a['convert_from']} -> {a['pack']}, {a['bits']} bpw, head {a['head_bits']})")
+    with gpu_locks(prof["locks"], log):
+        r = convert_job.run_convert(prof, Path(a["repo"]), a, out, log)
+    (out / "convert.json").write_text(json.dumps(r, indent=1))
+    log(f"stage convert done in {r['wall_s']:.0f} s (paused {r['paused_s']:.0f} s, {r['pauses']} pauses, template from {r['template_from']})")
+
+
 def _split_serve(c, do_serve, do_smoke):
     r = st.job_serve(c, do_serve, do_smoke)
     out = {}
     if do_serve:
-        out["serve"] = {**r["serve"], "cmd": r["cmd"]}
+        out["serve"] = {**r["serve"], "cmd": r["cmd"], "lock_hold_max_s": r.get("lock_hold_max_s")}
     if do_smoke:
-        out["smoke"] = {**(r["smoke"] or {}), "cmd": r["cmd"]}
+        out["smoke"] = {**(r["smoke"] or {}), "cmd": r.get("smoke_cmd") or r["cmd"], "lock_hold_max_s": r.get("lock_hold_max_s")}
     return out
 
 

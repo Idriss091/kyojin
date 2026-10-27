@@ -14,7 +14,7 @@ synthetic data once; each sequence owns its pages, at position --depth.
   --exact    compare the logits of every sequence in the batched step with the same sequence decoded alone with the same W
              rows (W <= 8: the exact paths), and row 0 with the plain one-token decode; bitwise (torch.equal) and max |diff|
   --kernels  stamp a time window around 4 steps of each config (tools/depth/kernels.py joins them with a rocprofv3 trace)
-Output JSON is rewritten after every config. Run through ~/hermes-work/bin/gpurun (needs ~110 GiB free for GLM).
+Output JSON is rewritten after every config. Needs ~110 GiB free for GLM.
 """
 import argparse, ast, json, os, sys, time
 

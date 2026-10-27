@@ -2257,7 +2257,12 @@ def load_all(args: argparse.Namespace):
     model_dir = str(Path(args.model).expanduser())
     template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
     defaults = load_defaults(model_dir, args)
-    kvp = Path(model_dir) / "kv_cache.json"      # lane preset written by tools/qualify (kv stage): used only when no KV flag is given
+    # lane preset written by tools/qualify (kv stage): used only when no KV flag is given. One file per backend (the CUDA and ROCm
+    # runs of the same pack choose independently), kv_cache.json as the backend-neutral fallback
+    import torch
+    kvp = Path(model_dir) / f"kv_cache.{'rocm' if torch.version.hip else 'cuda'}.json"
+    if not kvp.is_file():
+        kvp = Path(model_dir) / "kv_cache.json"
     if kvp.is_file() and not (args.k_bits or args.v_bits or args.cache_bits or args.kv_mode):
         try:
             kvj = json.loads(kvp.read_text())

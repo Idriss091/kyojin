@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+import re
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -16,6 +19,17 @@ FR = ["Explique en quatre ou cinq phrases pourquoi le ciel est bleu, puis donne 
       "Écris un court poème sur la mer en six vers, puis explique le choix des rimes.",
       "Décris les étapes pour préparer une bonne pâte à crêpes, avec les quantités pour six personnes."]
 NOTHINK = {"chat_template_kwargs": {"enable_thinking": False}, "enable_thinking": False}
+
+
+# Decode-speed prompt kinds of the draft A/B (nanbdf bench kinds): drafters gain on copy-heavy agentic output, little on free chat.
+CODE_Q = "Write a Python module with an LRU cache class (get/put/evict, O(1)), type hints, docstrings and 5 pytest tests. Output only code."
+CHAT_Q = ["Raconte-moi une histoire courte sur un phare et un renard, avec des dialogues.", "Quels sont les avantages et les inconvénients du télétravail ? Réponds en un paragraphe argumenté."]
+
+
+def agentic_prompt(n_lines: int = 70) -> str:
+    """Copy-heavy turn typical of tool use: re-emit a file with two renamed identifiers (most output tokens repeat the input)."""
+    src = "\n".join(f"def handler_{i}(request, ctx):\n    value = ctx.get('key_{i}', {i})\n    return {{'id': {i}, 'ok': value is not None}}\n" for i in range(n_lines // 3))
+    return f"Voici un fichier Python.\n\n```python\n{src}```\n\nRéécris ce fichier en entier, à l'identique, mais en renommant handler_3 en process_three et handler_7 en process_seven. Donne uniquement le code."
 
 
 class Client:
@@ -49,12 +63,17 @@ class Client:
                     s = (d.get("content") or "") + (d.get("reasoning_content") or "")
                     if s:
                         first = first or time.time(); txt.append(s)
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}: {e.read().decode(errors='replace')[:240]}"
         except Exception as e:
             err = repr(e)[:300]
         te = time.time(); ct = (usage or {}).get("completion_tokens", 0)
         return dict(ptok=(usage or {}).get("prompt_tokens"), ntok=ct, ttft=round((first or te) - t0, 3), total=round(te - t0, 2),
                     dec_tps=round((ct - 1) / (te - first), 2) if first and te > first and ct > 1 else None,
                     sha=hashlib.sha1("".join(txt).encode()).hexdigest()[:10], err=err, t0=t0, first=first, end=te)
+
+    def kind_prompts(self) -> dict:
+        return dict(code=[CODE_Q], chat=CHAT_Q, agentic=[agentic_prompt()])
 
     def prompt(self, tokens: int, slot: int) -> str:
         """~tokens of corpus text, distinct for every (slot, call): fresh offsets so no prefix cache can answer."""
@@ -73,26 +92,69 @@ class Client:
         return self.cpt
 
     def near_full(self, ctx: int, slot: int, fill: float = 0.97, reply: int = 32) -> dict:
-        """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx)."""
-        want = int(ctx * fill) - reply
-        r = self.stream(self.prompt(want, slot), reply)
-        if r["ptok"] and not r["err"] and r["ptok"] < 0.9 * want:     # calibration drift: top up once
-            r = self.stream(self.prompt(int(want * want / r["ptok"]), slot), reply)
+        """One request whose prompt is `fill` of -c (rounded down so prompt + reply < ctx). Corpora differ in chars/token (code and CJK are denser), so a
+        refused prompt (HTTP 400 context overflow) is shrunk and a short one is topped up, up to 4 times, from the server's own usage.prompt_tokens."""
+        return self.fit(int(ctx * fill) - reply, slot, reply)
+
+    def fit(self, want: int, slot: int, reply: int, topup: bool = True) -> dict:
+        """Stream a prompt of `want` tokens: corpora differ in chars/token (46K tokens came back for a 35K ask), so on HTTP 400 the length is
+        rescaled from the server's stated count and, with topup, a short prompt is lengthened (up to 4 tries)."""
+        n = want
+        for _ in range(4):
+            r = self.stream(self.prompt(n, slot), reply)
+            if r["err"] and "400" in r["err"] and n > 256:
+                m = re.search(r"prompt is (\d+) tokens", r["err"])
+                n = int(n * want / int(m.group(1)) * 0.99) if m else int(n * 0.9)      # the server states the real count: rescale at once
+            elif topup and not r["err"] and r["ptok"] and r["ptok"] < 0.9 * want:
+                n = int(n * want / r["ptok"])
+            else:
+                break
         return r
 
     def concurrent(self, n: int, tokens: int, max_tokens: int = 128) -> dict:
         res = [None] * n
-        prompts = [self.prompt(tokens, i) for i in range(n)]
         bar = threading.Barrier(n)
 
         def run(i):
-            bar.wait(); res[i] = self.stream(prompts[i], max_tokens)
+            bar.wait(); res[i] = self.fit(tokens, i, max_tokens, topup=False)
         th = [threading.Thread(target=run, args=(i,)) for i in range(n)]
         [t.start() for t in th]; [t.join() for t in th]
         ok = [r for r in res if not r["err"] and r["dec_tps"]]
         span = (max(r["end"] for r in ok) - min(r["first"] for r in ok)) if ok else 0
         return dict(n=n, ptok=[r["ptok"] for r in res], ttft=[r["ttft"] for r in res], dec_tps=[r["dec_tps"] for r in res],
                     agg_dec_tps=round(sum(r["ntok"] - 1 for r in ok) / span, 1) if span > 0 else None, errors=[r["err"] for r in res if r["err"]])
+
+    def soak(self, sessions: int, ctx: int, seconds: float, seed: int = 7, vram=None) -> dict:
+        """Agent-shaped load against a running server: `sessions` workers loop for `seconds` over a mixed prompt-length distribution
+        (70 % short 200-3K, 25 % medium up to half a share, 5 % a near-full share), short replies, so every size follows every other.
+        Drill 0: the synthetic near-full probes passed, the real agent mix OOMed 1-3 h later (duel: Nanbeige -c 73,728 x3 -> 61,440 x2 -> 57,344)."""
+        share = max(1024, ctx // sessions - 512)
+        rng = random.Random(seed)
+        lock = threading.Lock()
+        res, curve = [], []
+        end = time.time() + seconds
+
+        def pick():
+            with lock:
+                u = rng.random()
+                if u < 0.70:
+                    return rng.randint(200, min(3000, share))
+                if u < 0.95:
+                    return rng.randint(min(3000, share), max(3000, share // 2))
+                return int(share * 0.95)
+
+        def worker(i):
+            while time.time() < end:
+                n = pick()
+                r = self.fit(n, 10 + i, 48, topup=False)
+                with lock:
+                    res.append(dict(want=n, ptok=r["ptok"], err=r["err"], ttft=r["ttft"]))
+                    if vram and len(res) % 5 == 0:
+                        curve.append(vram())
+        th = [threading.Thread(target=worker, args=(i,)) for i in range(sessions)]
+        [t.start() for t in th]; [t.join() for t in th]
+        errs = [r["err"] for r in res if r["err"]]
+        return dict(requests=len(res), errors=errs[:3], n_errors=len(errs), ptok_max=max((r["ptok"] or 0) for r in res), vram_curve=curve, seconds=seconds)
 
     def sha_set(self) -> list:
         return [{k: r[k] for k in ("sha", "ntok", "dec_tps", "err")} for r in (self.stream(p, 256) for p in FR)]
