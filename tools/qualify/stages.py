@@ -150,7 +150,7 @@ def job_autotune(c: Ctx) -> dict:
                sessions=sessions, ctx=ctx, sweep=sweep, cmd=argv, engine_git=_git(c.repo), pack_index_sha=c.meta.get("index_sha"))
     (tdir / f"{sig['file']}.json").write_text(json.dumps(man, indent=1))
     c.log(f"autotune: {len(recs)} records ({at_load} at load) -> {tdir / (sig['file'] + '.bin')}")
-    return dict(tuning_dir=str(tdir), files=sorted(p.name for p in tdir.glob("*.bin")), records=len(recs), records_at_load=at_load,
+    return dict(tuning_dir=str(tdir), files=sorted(p.name for p in tdir.glob(f"{sig['file']}*")), records=len(recs), records_at_load=at_load, dense_lines=len(dense_new),
                 plan_points=len(sweep), wall_s=man["wall_s"], sweep_failed=[s for s in sweep if not s["ok"]])
 
 
@@ -253,7 +253,8 @@ def job_kvmode(c: Ctx, docs) -> dict:
     raw = json.loads((c.out / "kvmode_raw.json").read_text())
     kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
     bpv = {n: v["bits_per_val"] for n, v in raw.items()}
-    win = rules.choose_kv_mode(kl, bpv, allowed=rules.KV_DEFAULT_FORMATS + (("tq6", "tq5") if os.environ.get("QUALIFY_KV_TQ") == "1" else ()))
+    dec = {n: v.get("decode_s_per_tok") for n, v in raw.items()}
+    win = rules.choose_kv_mode(kl, bpv, dec_s=dec, allowed=rules.KV_DEFAULT_FORMATS + (("tq6", "tq5") if os.environ.get("QUALIFY_KV_TQ") == "1" else ()))
     if win == "k6v6":
         return dict(modes=raw, mode="quant")
     if win == "kw6":

@@ -23,8 +23,11 @@ KV_DEFAULT_FORMATS = ("k6v6", "kw6")    # tq6 / tq5 are measured and reported bu
 KV_WIN_SPEC = "4:128"                   # kw6 = k6v6 + the fp16 sink-4 / window-128 ring
 
 
+KV_MODE_MAX_SLOWDOWN = 1.10    # a format whose decode step is > 10 % slower than k6v6's is not a free quality win (Qwen3.5-0.8B on ROCm: kw6 0.0090 vs 0.0068 s/tok)
+
+
 def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: str = "k6v6", margin: float = KV_MODE_MARGIN,
-                   allowed: tuple = KV_DEFAULT_FORMATS) -> str:
+                   allowed: tuple = KV_DEFAULT_FORMATS, dec_s: dict | None = None, max_slowdown: float = KV_MODE_MAX_SLOWDOWN) -> str:
     """Q6 rule for the KV format: any candidate (kw6, and with `allowed` extended tq6, tq5) whose decode-faithful KL vs k8v8 is <= margin x the
     k6v6 baseline's qualifies; the one with the fewest bytes per value wins (ties: lower KL), else k6v6. kl / bits_per_val: {format: value},
     both holding `base`. The wider-must-qualify check looks at every measured format, `allowed` or not."""
@@ -32,6 +35,8 @@ def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: s
     # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider tq format does not is measurement noise
     ok = [n for n in ok if all(m in ok for m in kl if m != base and bits_per_val.get(m, 0) > bits_per_val[n])]
     ok = [n for n in ok if n in allowed]
+    if dec_s and dec_s.get(base):
+        ok = [n for n in ok if not dec_s.get(n) or dec_s[n] <= max_slowdown * dec_s[base]]
     return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base
 
 

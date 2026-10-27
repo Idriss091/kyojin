@@ -246,6 +246,13 @@ class KvModeRule(unittest.TestCase):
     BPV = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
     TQ = ("k6v6", "kw6", "tq6", "tq5")
 
+    def test_kv_mode_refuses_a_format_with_a_slower_decode_step(self):
+        bpv = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.06, "tq5": 5.06}
+        kl = {"k6v6": 0.0007, "kw6": 0.00035, "tq6": 0.0004, "tq5": 0.0009}
+        self.assertEqual(rules.choose_kv_mode(kl, bpv), "kw6")
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")      # ROCm 0.8B: ring +32 %
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0071}), "kw6")
+
     def test_choose_kv_mode(self):
         bpv = self.BPV
         # tq opt-in (default): tq6 / tq5 never win, kw6 does when it beats k6v6 by the margin
