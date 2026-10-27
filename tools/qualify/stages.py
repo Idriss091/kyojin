@@ -20,7 +20,7 @@ import drafter as drafter_mod
 import rules
 import search
 import smoke
-from locks import MIN_MEM_GIB, gpu_locks
+from locks import LIGHT_GIB, MIN_MEM_GIB, gpu_locks
 from server import oom_in, pick_port, running_server
 
 
@@ -55,11 +55,20 @@ class Ctx:
         if a < MIN_MEM_GIB:
             raise RuntimeError(f"MemAvailable {a:.1f} GiB < {MIN_MEM_GIB} GiB: not starting a GPU job")
 
+    def light_gib(self, ctx: int) -> float:
+        """Upper bound of the device memory a server of this pack needs at -c ctx: weights + the k8v8 cache (the widest default) + 1 GiB of runtime."""
+        return (self.meta["weights_bytes"] + packmod.kv_bytes_per_token(self.meta, 8, 8) * ctx) / 2**30 + 1.0
+
     @contextlib.contextmanager
-    def locks(self, label: str = ""):
+    def locks(self, label: str = "", light_ctx: int | None = None):
         """GPU locks for ONE unit of work (a server load + its measurements, one KV format, one probe): every hold is timed in c.holds so the
-        stage data can show that none ran long while other workers queued (lead rule 27/10: no stage holds a lock for more than ~15 min)."""
-        with gpu_locks(self.prof["locks"], self.log):
+        stage data can show that none ran long while other workers queued (lead rule 27/10: no stage holds a lock for more than ~15 min).
+        light_ctx = the unit is not a timed measurement (agent-bound smoke) and its server is small (light_gib < LIGHT_GIB): it runs WITHOUT the
+        exclusive GPU locks, so a 0 %-GPU step never queues another worker's cell (box-lead 27/10 08:18)."""
+        light = light_ctx is not None and self.light_gib(light_ctx) < LIGHT_GIB
+        if light:
+            self.log(f"light step '{label}': est. {self.light_gib(light_ctx):.1f} GiB < {LIGHT_GIB:.0f} GiB, not timed: no exclusive GPU lock")
+        with (contextlib.nullcontext() if light else gpu_locks(self.prof["locks"], self.log)):
             t0 = time.time()
             try:
                 yield
@@ -500,9 +509,10 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
     ship_s, ship_c = (ship_s, ship_c) if ship_c else (sess_eff, ctx)
     out = dict(serve={}, smoke=None)
 
-    def on_server(label, ctx_, sess_, fn):
-        """One lock take = one server load + one group of measurements (bounded hold: the lead's rule, no stage holds a GPU lock for long)."""
-        with c.locks(label):
+    def on_server(label, ctx_, sess_, fn, light=False):
+        """One lock take = one server load + one group of measurements (bounded hold: the lead's rule, no stage holds a GPU lock for long).
+        light=True: a small model's untimed step (the Hermes smoke) takes no exclusive lock (Ctx.locks)."""
+        with c.locks(label, light_ctx=ctx_ if light else None):
             log = c.out / f"srv_{label}.log"
             argv = start_args(c, ctx_, sess_)
             with running_server(c.prof, c.repo, argv, c.args["port"], log, logf=c.log, args=c.args) as (p, ok):
@@ -540,7 +550,7 @@ def job_serve(c: Ctx, do_serve: bool, do_smoke: bool) -> dict:
         s.update(curve=d["curve"], agg=d["agg"], oom=s["oom"] or d["oom"])
         out["serve"] = s
     if do_smoke:                                        # always on the config that would ship, in its own load
-        out["smoke"], out["smoke_cmd"] = on_server("smoke", ship_c, ship_s, lambda cl, log: run_smoke(c))
+        out["smoke"], out["smoke_cmd"] = on_server("smoke", ship_c, ship_s, lambda cl, log: run_smoke(c), light=True)
         if not do_serve:
             out["cmd"] = out["smoke_cmd"]
     out["lock_hold_max_s"] = max((h for _, h in c.holds), default=None)

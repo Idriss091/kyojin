@@ -119,6 +119,32 @@ class LockUnitTests(unittest.TestCase):
             self.assertTrue(all(h[1] >= 0 for h in c.holds))
 
 
+    def test_light_untimed_step_takes_no_exclusive_lock_but_a_big_model_does(self):
+        import fcntl
+        import os
+        with tempfile.TemporaryDirectory() as t:
+            lk = str(Path(t) / "x.lock")
+            m = packmod.read_pack(fake_pack(Path(t)))
+            logs = []
+            c = stages.Ctx(m, args(), Path(t), Path(t), {"locks": [lk]}, logs.append)
+            fd = os.open(lk, os.O_RDWR | os.O_CREAT, 0o644); fcntl.flock(fd, fcntl.LOCK_EX)       # another worker's cell holds the device
+            try:
+                m["weights_bytes"] = 1 << 30
+                with c.locks("smoke", light_ctx=8192):                                          # would block forever if it took the lock
+                    pass
+                self.assertTrue(any("no exclusive GPU lock" in x for x in logs))
+                self.assertEqual(c.holds[0][0], "smoke")
+                m["weights_bytes"] = 8 << 30                                                    # not light: the unit goes through the lock path
+                self.assertGreater(c.light_gib(8192), stages.LIGHT_GIB)
+                m["weights_bytes"] = 1 << 30
+                self.assertLess(c.light_gib(8192), stages.LIGHT_GIB)
+            finally:
+                os.close(fd)
+            with c.locks("timed"):                                                              # no light_ctx: always locked (lock free again here)
+                pass
+            self.assertTrue(any("lock held" in x for x in logs))
+
+
 class PortTests(unittest.TestCase):
     def test_pick_port_skips_a_busy_port(self):
         import socket

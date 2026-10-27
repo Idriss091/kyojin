@@ -8,6 +8,7 @@ import signal
 import time
 
 MIN_MEM_GIB = 4.0
+LIGHT_GIB = 4.0     # an untimed step whose server needs less device memory than this takes no exclusive GPU lock
 
 
 def _blocking_flock(fd: int, wait_s: float, path: str) -> None:
