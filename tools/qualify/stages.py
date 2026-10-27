@@ -20,7 +20,7 @@ import rules
 import search
 import smoke
 from locks import MIN_MEM_GIB, gpu_locks
-from server import oom_in, running_server
+from server import oom_in, pick_port, running_server
 
 
 @dataclass
@@ -41,6 +41,12 @@ class Ctx:
         if r.returncode:
             raise RuntimeError(f"{script} rc={r.returncode}: {(r.stderr or r.stdout)[-600:]}")
         return r.stdout
+
+    def fresh_port(self) -> int:
+        """Re-pick the server port before every start (kept in args['port']; the first value asked for stays the search base)."""
+        base = self.args.setdefault("port0", self.args["port"])
+        self.args["port"] = pick_port(base)
+        return self.args["port"]
 
     def need_ram(self):
         a = backends.mem_available_gib()
@@ -114,6 +120,7 @@ def job_autotune(c: Ctx) -> dict:
                                   "EXL3_DENSE_GEMM_TUNE_FILE": str(scratch / "dense_gemm_tune.txt")}}
     k, v = chosen_kv(c)
     pol, ddir = chosen_draft(c)
+    c.fresh_port()
     argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, draft=pol, dflash_dir=ddir)
     if "--no-vision" not in argv:
         argv.append("--no-vision")                   # the tower is another model (no GEMM autotune keys of the text path) and costs VRAM
@@ -333,6 +340,7 @@ def job_draft(c: Ctx) -> dict:
     runs = []
     with c.locks():
         for i, var in enumerate(draft_variants()):
+            c.fresh_port()
             argv = packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=1, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
                                        draft="dflash" if var == "dflash" else "off", dflash_dir=loc["dir"] if var == "dflash" else None)
             log = c.out / f"srv_draft_{i}_{var}.log"
@@ -354,6 +362,7 @@ def job_draft(c: Ctx) -> dict:
 
 # ---------------------------------------------------------------- max ctx
 def start_args(c: Ctx, ctx: int, sessions: int) -> list:
+    c.fresh_port()
     k, v = chosen_kv(c)
     pol, ddir = chosen_draft(c)
     return packmod.serve_flags(c.meta, port=c.args["port"], ctx=ctx, sessions=sessions, k_bits=k, v_bits=v, kv_mode=chosen_kv_mode(c), kvwin=chosen_kvwin(c),
@@ -370,6 +379,7 @@ def probe_factory(c: Ctx, sessions: int):
             if not ok:
                 tail = log.read_text(errors="replace").strip().splitlines()[-1:] or [""]
                 return False, "no start: " + tail[0][:160]
+            cl.url = f"http://127.0.0.1:{c.args['port']}"
             if not state["cal"]:
                 cl.calibrate(); state["cal"] = True
             for slot in (0, 1):                                  # 2 distinct near-full prompts back to back

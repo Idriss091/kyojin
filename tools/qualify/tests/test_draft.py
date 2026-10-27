@@ -107,6 +107,16 @@ class PlanOrderTests(unittest.TestCase):
             self.assertNotIn("--dflash-dir", packmod.serve_flags(m, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
 
 
+class PortTests(unittest.TestCase):
+    def test_pick_port_skips_a_busy_port(self):
+        import socket
+        import server
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0)); busy = s.getsockname()[1]
+            s.listen(1)
+            self.assertNotEqual(server.pick_port(busy), busy)
+
+
 class KvPresetTests(unittest.TestCase):
     def test_preset_is_written_per_backend_and_never_overwrites_another_backend(self):
         with tempfile.TemporaryDirectory() as t:

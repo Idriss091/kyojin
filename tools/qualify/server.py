@@ -22,6 +22,20 @@ def health(port: int) -> int:
         return 0
 
 
+def pick_port(preferred: int, span: int = 200) -> int:
+    """First port >= preferred that nothing listens on (other workers' servers run on 859x too: a fixed port made a soak 'not start')."""
+    import socket
+    for p in range(preferred, preferred + span):
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    raise RuntimeError(f"no free port in {preferred}..{preferred + span}")
+
+
 def oom_in(log: Path) -> bool:
     try:
         t = log.read_text(errors="replace").lower()
