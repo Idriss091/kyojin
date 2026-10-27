@@ -134,7 +134,8 @@ def render_md(j: dict) -> str:
     if j["sha"]:
         L += ["", "Greedy sha: " + ", ".join(x["sha"] for x in j["sha"])]
     if j["smoke"]:
-        L += ["", f"## Hermes smoke ({j['smoke']['kind']}): {j['smoke']['passed']}/{j['smoke']['total']} passed"]
+        L += ["", f"## Hermes smoke ({j['smoke']['kind']}): {j['smoke']['passed']}/{j['smoke']['total']} passed" + (f", mean score {j['smoke']['score_mean']}" if j['smoke'].get('score_mean') is not None else "")]
+        L += [f"- {t.get('task') or t.get('id')}: score {t.get('score')}, {t.get('wall_s')} s, {t.get('tool_calls')} tool calls, {t.get('notes')}" for t in j["smoke"].get("tasks") or []]
     ln = j["serve"].get("lane")
     if ln:
         L += ["", f"## Ship this (sessions {ln['sessions']}, -c {ln['ctx']}, kv k{j['serve']['kv'][0]}v{j['serve']['kv'][1]}, draft {j['serve']['draft_policy']})", "```", ln["cmd"], "```"]

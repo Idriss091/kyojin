@@ -515,7 +515,7 @@ def run_smoke(c: Ctx) -> dict:
     ev = smoke.find_eval()
     if ev:
         tasks = c.args.get("smoke_tasks") or pick_tasks(ev, 4)
-        res = smoke.run_hermes_eval(ev, c.args["port"], "qual", tasks, f"qualify_{c.meta['name']}")
+        res = smoke.run_hermes_eval(ev, c.args["port"], "qual", tasks, f"qualify_{c.meta['name']}", keep=c.out)
         if res["total"]:
             return res
         c.log("smoke: hermes eval gave no result, falling back to the scripted tool loop: " + str(res.get("error"))[:200])

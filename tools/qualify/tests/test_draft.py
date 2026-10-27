@@ -121,6 +121,16 @@ class KvPresetTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(t) / "kv_cache.json").read_text())["backend"], "cuda")      # the neutral file keeps the first writer
 
 
+class SmokeParseTests(unittest.TestCase):
+    def test_run_suite_rep_json_cells(self):
+        import smoke
+        d = {"arm": "a", "cells": [dict(task="fix_bug_py", score=1.0, success=True, wall_s=69.0, tool_calls=7, notes="+hidden5/5"),
+                                   dict(task="trap_readonly", score=0.2, success=False, wall_s=39.0, tool_calls=3, notes="-tree_unchanged")]}
+        r = smoke.parse_eval(d)
+        self.assertEqual((r["total"], r["passed"], r["score_mean"]), (2, 1, 0.6))
+        self.assertEqual(smoke.parse_eval([])["total"], 0)
+
+
 class LaneTests(unittest.TestCase):
     def test_lane_command_and_hermes_block_come_from_the_measured_config(self):
         import report
