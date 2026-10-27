@@ -16,6 +16,25 @@ def choose_kv(kl_vs_k8: dict[int, float], kl_max: float = KV_KL_MAX) -> tuple[in
     return 8, 8
 
 
+KV_MODE_MARGIN = 0.9    # one 256-step doc is noisy (two docs of one model scatter by 10-30 %): a candidate has to beat k6v6 by this factor
+
+
+KV_DEFAULT_FORMATS = ("k6v6", "kw6")    # tq6 / tq5 are measured and reported but stay opt-in (--kv-mode tq) in 1.8.1
+KV_WIN_SPEC = "4:128"                   # kw6 = k6v6 + the fp16 sink-4 / window-128 ring
+
+
+def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: str = "k6v6", margin: float = KV_MODE_MARGIN,
+                   allowed: tuple = KV_DEFAULT_FORMATS) -> str:
+    """Q6 rule for the KV format: any candidate (kw6, and with `allowed` extended tq6, tq5) whose decode-faithful KL vs k8v8 is <= margin x the
+    k6v6 baseline's qualifies; the one with the fewest bytes per value wins (ties: lower KL), else k6v6. kl / bits_per_val: {format: value},
+    both holding `base`. The wider-must-qualify check looks at every measured format, `allowed` or not."""
+    ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= margin * kl[base]]
+    # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider tq format does not is measurement noise
+    ok = [n for n in ok if all(m in ok for m in kl if m != base and bits_per_val.get(m, 0) > bits_per_val[n])]
+    ok = [n for n in ok if n in allowed]
+    return min(ok, key=lambda n: (bits_per_val[n], kl[n])) if ok else base
+
+
 def verdict(q: dict, gates: dict | None = None) -> dict:
     """q: assembled qualify data. Returns {pass, reasons[], unmeasured[]}. Missing measurements are listed, never counted as pass."""
     g = dict(kl_mean=0.15, top1_min=0.75, ctx_min=32768, smoke_min=0.8)
@@ -32,7 +51,7 @@ def verdict(q: dict, gates: dict | None = None) -> dict:
         unmeasured.append("parity")
     kv = q.get("kv")
     if kv:
-        if min(kv["chosen"]) < KV_MIN_BITS:
+        if min(kv["chosen"]) < KV_MIN_BITS and not kv.get("q6_equivalent"):
             reasons.append(f"KV below Q6: {kv['chosen']}")
     else:
         unmeasured.append("kv")

@@ -37,7 +37,7 @@ class Stage:
     cmd: list = field(default_factory=list)
 
 
-RELEVANT = {"fetch": ("ref",), "meta": (), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits"), "maxctx": ("sessions", "ctx_cap"),
+RELEVANT = {"fetch": ("ref",), "meta": (), "autotune": ("sessions", "ctx_cap"), "parity": ("ref",), "kv": ("ref", "kv_kl_max", "kv_bits", "kv_modes", "kvmode_steps"), "maxctx": ("sessions", "ctx_cap"),
             "serve": ("sessions", "ctx_cap"), "smoke": ("smoke_tasks",), "report": ()}
 
 

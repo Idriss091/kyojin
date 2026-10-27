@@ -369,6 +369,13 @@ class Generator:
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
             self.recurrent_cache = None
+        # Plain-attention model with a bound KVWIN ring: jobs carry a ring-only state (no checkpoints, prefix reuse stays
+        # page-hash based; a restored prefix has a cold ring that is rebuilt from the quantized pool)
+        self.ring_states = self.recurrent_cache is None and self.model.kvwin_ring_only() and \
+            any(getattr(l, "cfg", None) is not None for l in cache.recurrent_layers.values())
+        if self.ring_states:
+            cache.reset_states()
+            self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
@@ -1727,7 +1734,7 @@ class Generator:
         # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
         # the model can advance or rewind it consistently with accepted draft tokens.
         batch_states = None
-        if self.recurrent_cache is not None:
+        if self.recurrent_cache is not None or self.ring_states:
             batch_states = [job.recurrent_state for job in batch_jobs]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background

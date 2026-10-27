@@ -757,6 +757,10 @@ def build_bc_attn(module, layer):
         # KVWIN: the graph writes the pool inside the captured block and would leave the fp16 ring stale
         _trace_build(m, None, "attn")
         return None
+    if getattr(layer, "tq", False):
+        # TurboQuant: rotation + codebook reads live in the Triton path
+        _trace_build(m, None, "attn")
+        return None
     qsa_idx = getattr(m, "qsa_indexer", None)
     if not (
         _module_eligible(m) and

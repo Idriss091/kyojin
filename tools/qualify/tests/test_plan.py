@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -233,6 +234,69 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("serve command", buf.getvalue())
             self.assertEqual([p.name for p in (Path(t) / "o").iterdir()], [])
+
+
+
+class KvModeRule(unittest.TestCase):
+    BPV = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
+    TQ = ("k6v6", "kw6", "tq6", "tq5")
+
+    def test_choose_kv_mode(self):
+        bpv = self.BPV
+        # tq opt-in (default): tq6 / tq5 never win, kw6 does when it beats k6v6 by the margin
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.0536, "kw6": 0.0216, "tq6": 0.0319, "tq5": 0.0544}, bpv), "kw6")      # Nanbeige 32K p1
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.004, "tq5": 0.009}, bpv), "k6v6")       # kw6 inside the noise
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")                                         # nothing else measured
+        # with tq allowed (QUALIFY_KV_TQ=1): the old rule, fewest bytes among the qualifying formats
+        kw = dict(allowed=self.TQ)
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.004, "tq5": 0.009}, bpv, **kw), "tq5")
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.008, "tq5": 0.020}, bpv, **kw), "tq6")
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.005, "kw6": 0.006, "tq6": 0.0125, "tq5": 0.0048}, bpv, **kw), "k6v6")
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "kw6": 0.0021, "tq6": 0.004, "tq5": 0.010}, bpv, **kw), "k6v6")
+
+    def test_job_kvmode_glue(self):
+        """kv stage -> job_kvmode -> kv_cache.json: the winner is written as the lane preset, serve flags follow it"""
+        import contextlib
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            out = t / "out"; out.mkdir(); (t / "pack").mkdir()
+            raw = {"tq6": dict(kl_vs_k8=0.004, top1_vs_k8=0.99, bits_per_val=6.0625), "tq5": dict(kl_vs_k8=0.020, top1_vs_k8=0.97, bits_per_val=5.0625),
+                   "kw6": dict(kl_vs_k8=0.006, top1_vs_k8=0.99, bits_per_val=6.5), "k6v6": dict(kl_vs_k8=0.010, top1_vs_k8=0.98, bits_per_val=6.5)}
+            def py(script, *a, **kw):
+                self.assertEqual((script, a[0]), ("gpu_eval.py", "kvmode"))
+                (out / "kvmode_raw.json").write_text(json.dumps({k: v for k, v in raw.items()}))
+            c = SimpleNamespace(out=out, args=dict(kvmode_steps=64), meta=dict(path=str(t / "pack"), index_sha="x", serve_entry="tools/qwen/serve.py", vision=False,
+                                template=None, mtp_layers=0), py=py, locks=contextlib.nullcontext, repo=t, data={})
+            stages._git = lambda repo: "deadbeef"
+            # default: tq stays opt-in, kw6 wins (6 <= 0.9 x 10)
+            kv = stages.job_kvmode(c, out / "docs.pt")
+            self.assertEqual((kv["mode"], kv["chosen"], kv["kvwin"]), ("quant", [6, 6], "4:128"))
+            stages.write_kv_choice(c, kv)
+            j = json.loads((t / "pack" / "kv_cache.json").read_text())
+            self.assertEqual((j["kv_mode"], j["k_bits"], j["v_bits"], j["kvwin"]), ("quant", 6, 6, "4:128"))
+            c.data = dict(kv=kv)
+            self.assertEqual((stages.chosen_kv_mode(c), stages.chosen_kvwin(c)), ("quant", "4:128"))
+            f = packmod.serve_flags(c.meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6, kvwin=stages.chosen_kvwin(c))
+            self.assertEqual(f[f.index("--kvwin") + 1], "4:128")
+            # QUALIFY_KV_TQ=1: tq6 wins the same table (fewer bytes than kw6; tq5 fails the margin)
+            os.environ["QUALIFY_KV_TQ"] = "1"
+            try:
+                kv = stages.job_kvmode(c, out / "docs.pt")
+            finally:
+                del os.environ["QUALIFY_KV_TQ"]
+            self.assertEqual((kv["mode"], kv["chosen"]), ("tq", [6, 6]))
+            stages.write_kv_choice(c, kv)
+            self.assertEqual(json.loads((t / "pack" / "kv_cache.json").read_text())["kv_mode"], "tq")
+            c.data = dict(kv=kv)
+            self.assertEqual(stages.chosen_kv_mode(c), "tq")
+
+    def test_serve_flags_kv_mode(self):
+        meta = dict(serve_entry="tools/qwen/serve.py", path="/p", vision=False, template=None, mtp_layers=0, kv_layers=16, kv_heads=4, head_dim=256)
+        f = packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=5, v_bits=5, kv_mode="tq")
+        self.assertEqual(f[f.index("--kv-mode") + 1], "tq")
+        self.assertNotIn("--kv-mode", packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
+        self.assertLess(packmod.kv_bytes_per_token(meta, 5, 5, "tq"), packmod.kv_bytes_per_token(meta, 6, 6))
 
 
 if __name__ == "__main__":
