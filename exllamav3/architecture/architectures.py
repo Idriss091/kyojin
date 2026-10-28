@@ -10,6 +10,7 @@ from .deepseek_v41 import DeepseekV41Model
 from .dflash import DFlashModel
 from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
+from .eagle3 import Eagle3Model
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -84,6 +85,7 @@ ARCHITECTURES = {
         DFlashModel,
         DFlash2Model,
         DFlashLagunaModel,
+        Eagle3Model,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,

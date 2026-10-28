@@ -1681,7 +1681,7 @@ class Job:
                     )
                 elif self.generator.draft_model:
                     if self.generator.mtp_draft:
-                        target_hidden = params.get("export_states")[-1]
+                        target_hidden = self.generator.draft_target_hidden(params.get("export_states"))
                         carry_hidden = seq.mtp_carry_hidden
                         if carry_hidden is None:
                             carry_hidden = torch.zeros_like(target_hidden[:, :1, :])

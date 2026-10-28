@@ -715,7 +715,7 @@ class QwenEngine:
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1,
-                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = "", kv_mode: str = "quant"):
+                 k_bits: int = 0, v_bits: int = 0, dflash_dir: str = "", kv_mode: str = "quant", eagle_dir: str = ""):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         import torch
@@ -797,13 +797,22 @@ class QwenEngine:
             # DFlash2 block drafter (separate checkpoint, shares the target's embedding and head): it reads the target's hidden-state
             # taps, drafts a block of block_size - 1 tokens that the stock accept-while-match rule verifies (lossless, greedy or sampled)
             dconf = Config.from_directory(dflash_dir)
-            assert dconf.tap_shift == 0 and ndt == dconf.block_size - 1, f"--ndt must be {dconf.block_size - 1} for this drafter"
+            from exllamav3.architecture.dflash2 import DFlash2Config
+            assert ndt == dconf.block_size - 1, f"--ndt must be {dconf.block_size - 1} for this drafter"
+            assert dconf.tap_shift == 0 or not isinstance(dconf, DFlash2Config), "DFlash2 drafters use raw tap ids (tap_shift 0)"
             self.draft_model = Model.from_config(dconf)
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt))
             startup_health.stage("drafter weights")
             with Heartbeat("loading DFlash2 drafter"):
                 self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
             self.draft_model.attach_to(self.model)
+        elif draft_policy == "eagle":
+            # Public EAGLE-3 drafter (--draft eagle:<dir>): one midlayer on three tapped target states, chain drafting on the MTP path
+            from exllamav3.generator.draft_models import load_draft_model
+            startup_health.stage("drafter weights")
+            with Heartbeat("loading EAGLE-3 drafter"):
+                self.draft_model, self.draft_cache = load_draft_model(
+                    "eagle", eagle_dir, self.model, ctx, ndt, callback=startup_health.load_callback(), **qkw)
         elif draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt), **qkw)
@@ -2279,7 +2288,8 @@ def load_all(args: argparse.Namespace):
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
                         cache_bits=args.cache_bits, sessions=args.sessions,
-                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode)
+                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode,
+                        eagle_dir=str(Path(args.eagle_dir).expanduser()) if args.eagle_dir else "")
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2331,9 +2341,12 @@ def main() -> None:
     parser.add_argument("--kvwin", default=None, metavar="SINK:WINDOW",
                         help="fp16 sink + window ring of the quantized cache (EXL3_KVWIN, e.g. 4:128; an EXL3_KVWIN already set wins); written by tools/qualify as the kw6 choice")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
-    parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
+    parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "eagle", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
                              "from --dflash-dir (lossless; see --dflash-adapt), off = plain decode")
+    parser.add_argument("--draft", default=None, metavar="KIND[:DIR]",
+                        help="drafter shortcut: mtp | dflash:<dir> | eagle:<dir> (public DFlash / EAGLE-3 checkpoints, doc/draft_models.md); "
+                             "sets --draft-policy and the directory, and the draft width for the kind unless --ndt is given")
     parser.add_argument("--dflash-dir", default="", help="DFlash2 drafter checkpoint directory (with --draft-policy dflash)")
     parser.add_argument("--dflash-adapt", choices=("on", "off"), default="on",
                         help="with --draft-policy dflash: cut the verified block per request from the measured acceptance (full / short / "
@@ -2359,6 +2372,25 @@ def main() -> None:
                              "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
                              "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
+    args.eagle_dir = ""
+    if args.draft:
+        from exllamav3.generator.draft_models import parse_draft_spec, read_dflash_meta
+        kind, path = parse_draft_spec(args.draft)
+        if kind is None:
+            from exllamav3.generator.draft_models import detect_kind
+            kind = detect_kind(str(Path(path).expanduser()))
+        explicit_ndt = any(a == "--ndt" or a.startswith("--ndt=") for a in sys.argv)
+        if kind == "mtp":
+            args.draft_policy = "mtp"
+        elif kind == "dflash":
+            args.draft_policy, args.dflash_dir = "dflash", path
+            if not explicit_ndt:
+                with open(Path(path).expanduser() / "config.json") as f:
+                    args.ndt = read_dflash_meta(json.load(f)).block_size - 1
+        else:
+            args.draft_policy, args.eagle_dir = "eagle", path
+            if not explicit_ndt:
+                args.ndt = 3
     if args.draft_policy == "dflash" and not args.dflash_dir:
         parser.error("--draft-policy dflash needs --dflash-dir")
     if args.draft_policy == "dflash":

@@ -365,6 +365,27 @@ def load_reference_drafter(kind: str, directory: str, embed: torch.Tensor, lm_he
     raise ValueError(kind)
 
 
+def load_draft_model(kind: str, directory: str, target, ctx: int, ndt: int, callback = None, **cache_kwargs):
+    """Engine drafter for `--draft dflash:<dir>` / `--draft eagle:<dir>`: (draft_model, draft_cache), loaded and attached to `target`.
+    The draft cache has the target cache's token capacity (the Generator asserts it); MTP is loaded from the target pack, not here."""
+    from ..model import Model
+    from ..model.config import Config
+    from ..cache import Cache
+    kind = kind or detect_kind(directory)
+    if kind == "eagle":
+        from ..architecture.eagle3 import Eagle3Config
+        conf = Eagle3Config(directory)
+    elif kind == "dflash":
+        conf = Config.from_directory(directory)
+    else:
+        raise ValueError(f"load_draft_model: kind {kind!r} (mtp heads come with the target)")
+    model = Model.from_config(conf)
+    cache = Cache(model, max_num_tokens = ctx, max_history = max(3, ndt), **cache_kwargs)
+    model.load(progressbar = False, callback = callback)
+    model.attach_to(target)
+    return model, cache
+
+
 # ---- reference speculative loop ---------------------------------------------------------------------------------------
 
 @dataclass

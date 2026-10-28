@@ -392,6 +392,8 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        # Public EAGLE-3 drafter (--draft eagle:<dir>): the MTP draft path with the drafter's own head and several tapped target states
+        self.eagle_draft = self.draft_model is not None and self.draft_model.caps.get("eagle_draft", False)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -1278,8 +1280,9 @@ class Generator:
             batch_state = self.draft_model.forward(first_ids if idx == 0 else batch_ids, params)
             if idx == 0 and n_pend:
                 batch_state = batch_state[:, -1:, :]
-            lm_head = self.model.modules[self.model.logit_layer_idx]
-            batch_state = lm_head.prepare_for_device(batch_state, params)
+            if not self.eagle_draft:
+                lm_head = self.model.modules[self.model.logit_layer_idx]
+                batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             if spec_prm is not None:
                 dl = params.pop("draft_logits", None)
@@ -1312,6 +1315,12 @@ class Generator:
             }
 
         return self.draft_ids_pinned[:, :window]
+
+
+    def draft_target_hidden(self, export_states):
+        """Target state a draft step is paired with: the last exported state (MTP), or what the drafter builds from all taps (EAGLE-3)."""
+        fn = getattr(self.draft_model, "target_hidden_from_states", None)
+        return fn(export_states) if fn else export_states[-1]
 
 
     def _flush_mtp_pending(self, job):
@@ -2126,7 +2135,7 @@ class Generator:
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
-            target_hidden = p_export_states[-1]
+            target_hidden = self.draft_target_hidden(p_export_states)
             accepted_idx = 0
             for job in batch_jobs:
                 self._flush_mtp_pending(job)
